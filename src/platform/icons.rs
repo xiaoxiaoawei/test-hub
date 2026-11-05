@@ -1,7 +1,7 @@
 //! Small runtime icons rendered with native GDI and a premultiplied alpha mask.
 //! The executable's on-disk resource icon is deliberately left untouched.
 
-use crate::config::IconStyle;
+use crate::config::{IconShape, IconStyle};
 use std::{ffi::c_void, mem::zeroed, ptr};
 use windows_sys::Win32::{
     Graphics::Gdi::*,
@@ -10,23 +10,46 @@ use windows_sys::Win32::{
 
 const SUPERSAMPLE: usize = 4;
 
-/// Owns the handles used by tray and window icons. Keep this value alive until
-/// those windows have received their replacement handles.
+/// Premultiplied, top-down BGRA pixels, suitable for `UpdateLayeredWindow` with
+/// `AC_SRC_ALPHA`. They contain the icon only: no background plate or shadow.
+pub(crate) struct IconPixels {
+    pub width: i32,
+    pub height: i32,
+    pub pixels: Vec<u8>,
+}
+
+/// Owns the handles used by tray, window and selection icons. Keep this value
+/// alive until every native user has received its replacement handles.
 pub(crate) struct IconSet {
     small: OwnedIcon,
     large: OwnedIcon,
+    chip: OwnedIcon,
+    chip_size: i32,
 }
 
 impl IconSet {
-    pub(crate) fn new(style: IconStyle, color: u32, dpi: u32) -> Result<Self, String> {
-        if color > 0xFF_FF_FF {
-            return Err("图标颜色必须是有效的 RGB 颜色。".into());
-        }
-        // Bound work and memory even if a caller supplies a malformed DPI.
-        let dpi = dpi.clamp(96, 384);
-        let small = render_icon(style, color, scale(16, dpi))?;
-        let large = render_icon(style, color, scale(32, dpi))?;
-        Ok(Self { small, large })
+    pub(crate) fn new(
+        style: IconStyle,
+        color: u32,
+        shape: IconShape,
+        logical_size: u32,
+        dpi: u32,
+    ) -> Result<Self, String> {
+        validate(color, logical_size)?;
+        // Tray and caption icons keep their normal system sizes. The user's
+        // choice controls the selection icon, without enlarging title bars.
+        let small_pixels = render_pixels(style, color, shape, 16, dpi)?;
+        let large_pixels = render_pixels(style, color, shape, 32, dpi)?;
+        let chip_pixels = render_pixels(style, color, shape, logical_size, dpi)?;
+        let small = render_icon(&small_pixels)?;
+        let large = render_icon(&large_pixels)?;
+        let chip = render_icon(&chip_pixels)?;
+        Ok(Self {
+            small,
+            large,
+            chip,
+            chip_size: chip_pixels.width,
+        })
     }
 
     pub(crate) fn small(&self) -> HICON {
@@ -35,6 +58,14 @@ impl IconSet {
 
     pub(crate) fn large(&self) -> HICON {
         self.large.0
+    }
+
+    pub(crate) fn chip(&self) -> HICON {
+        self.chip.0
+    }
+
+    pub(crate) fn chip_size(&self) -> i32 {
+        self.chip_size
     }
 }
 
@@ -132,8 +163,9 @@ fn scale(logical: u32, dpi: u32) -> usize {
     ((logical * dpi + 48) / 96) as usize
 }
 
-fn render_icon(style: IconStyle, color: u32, size: usize) -> Result<OwnedIcon, String> {
-    let pixels = render_pixels(style, color, size)?;
+fn render_icon(raster: &IconPixels) -> Result<OwnedIcon, String> {
+    let size = raster.width as usize;
+    let pixels = &raster.pixels;
     let bitmap = Bitmap::new(size)?;
     unsafe { ptr::copy_nonoverlapping(pixels.as_ptr(), bitmap.pixels, pixels.len()) };
 
@@ -168,7 +200,17 @@ fn render_icon(style: IconStyle, color: u32, size: usize) -> Result<OwnedIcon, S
     Ok(OwnedIcon(icon))
 }
 
-fn render_pixels(style: IconStyle, color: u32, size: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn render_pixels(
+    style: IconStyle,
+    color: u32,
+    shape: IconShape,
+    logical_size: u32,
+    dpi: u32,
+) -> Result<IconPixels, String> {
+    validate(color, logical_size)?;
+    // A malformed DPI cannot cause unbounded pixel allocations. Supporting up
+    // to 400% still permits high-density rendering on normal desktop displays.
+    let size = scale(logical_size, dpi.clamp(96, 384));
     let side = size * SUPERSAMPLE;
     let glyph = match style {
         IconStyle::Leaf => leaf_mask(side),
@@ -199,7 +241,7 @@ fn render_pixels(style: IconStyle, color: u32, size: usize) -> Result<Vec<u8>, S
                 for dx in 0..SUPERSAMPLE {
                     let sx = x * SUPERSAMPLE + dx;
                     let sy = y * SUPERSAMPLE + dy;
-                    if !rounded_background(sx, sy, side) {
+                    if !shape_covers(shape, sx, sy, side) {
                         continue;
                     }
                     let ink = f64::from(glyph[sy * side + sx]) / 255.0;
@@ -216,7 +258,21 @@ fn render_pixels(style: IconStyle, color: u32, size: usize) -> Result<Vec<u8>, S
             }
         }
     }
-    Ok(output)
+    Ok(IconPixels {
+        width: size as i32,
+        height: size as i32,
+        pixels: output,
+    })
+}
+
+fn validate(color: u32, logical_size: u32) -> Result<(), String> {
+    if color > 0xFF_FF_FF {
+        return Err("图标颜色必须是有效的 RGB 颜色。".into());
+    }
+    if !(16..=64).contains(&logical_size) {
+        return Err("图标大小必须为 16–64 像素。".into());
+    }
+    Ok(())
 }
 
 fn relative_luminance(bgr: [f64; 3]) -> f64 {
@@ -235,14 +291,19 @@ fn contrast(left: f64, right: f64) -> f64 {
     (left.max(right) + 0.05) / (left.min(right) + 0.05)
 }
 
-fn rounded_background(x: usize, y: usize, side: usize) -> bool {
+fn shape_covers(shape: IconShape, x: usize, y: usize, side: usize) -> bool {
     let x = (x as f64 + 0.5) / side as f64;
     let y = (y as f64 + 0.5) / side as f64;
-    let inset = 0.045;
-    let radius = 0.19;
-    let nearest_x = x.clamp(inset + radius, 1.0 - inset - radius);
-    let nearest_y = y.clamp(inset + radius, 1.0 - inset - radius);
-    (x - nearest_x).powi(2) + (y - nearest_y).powi(2) <= radius * radius
+    match shape {
+        IconShape::Square => true,
+        IconShape::Circle => (x - 0.5).powi(2) + (y - 0.5).powi(2) <= 0.25,
+        IconShape::Rounded => {
+            let radius = 0.22;
+            let nearest_x = x.clamp(radius, 1.0 - radius);
+            let nearest_y = y.clamp(radius, 1.0 - radius);
+            (x - nearest_x).powi(2) + (y - nearest_y).powi(2) <= radius * radius
+        }
+    }
 }
 
 fn leaf_mask(side: usize) -> Vec<u8> {
@@ -331,38 +392,140 @@ fn text_mask(text: &str, side: usize) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetIconInfo;
+
+    fn alpha(raster: &IconPixels, x: usize, y: usize) -> u8 {
+        raster.pixels[(y * raster.width as usize + x) * 4 + 3]
+    }
 
     #[test]
-    fn rasterized_icons_have_transparent_corners_and_premultiplied_edges() {
+    fn transparent_edges_have_zero_rgb_and_are_premultiplied_once() {
         for style in [IconStyle::Leaf, IconStyle::Translate, IconStyle::Letter] {
-            let pixels = render_pixels(style, 0xD6_A5_75, 32).unwrap();
-            assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
-            assert_eq!(pixels[(16 * 32 + 16) * 4 + 3], 255);
-            assert!(pixels
-                .chunks_exact(4)
-                .any(|pixel| (1..255).contains(&pixel[3])));
-            for pixel in pixels.chunks_exact(4) {
-                assert!(pixel[..3].iter().all(|&channel| channel <= pixel[3]));
+            for shape in [IconShape::Rounded, IconShape::Circle] {
+                let raster = render_pixels(style, 0xD6_A5_75, shape, 32, 96).unwrap();
+                assert_eq!(&raster.pixels[..4], &[0, 0, 0, 0]);
+                assert_eq!(alpha(&raster, 16, 16), 255);
+                assert!(raster
+                    .pixels
+                    .chunks_exact(4)
+                    .any(|pixel| (1..255).contains(&pixel[3])));
+                for pixel in raster.pixels.chunks_exact(4) {
+                    assert!(pixel[..3].iter().all(|&channel| channel <= pixel[3]));
+                    if pixel[3] == 0 {
+                        assert_eq!(pixel, &[0, 0, 0, 0]);
+                    }
+                }
             }
         }
     }
 
     #[test]
-    fn styles_colors_and_native_handles_are_distinct_and_valid() {
+    fn shape_and_size_match_the_requested_visible_area_without_a_shadow_plate() {
+        let square = render_pixels(IconStyle::Leaf, 0xC8_78_5A, IconShape::Square, 32, 96).unwrap();
+        let rounded =
+            render_pixels(IconStyle::Leaf, 0xC8_78_5A, IconShape::Rounded, 32, 96).unwrap();
+        let circle = render_pixels(IconStyle::Leaf, 0xC8_78_5A, IconShape::Circle, 32, 96).unwrap();
+        assert!(square.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert_eq!(alpha(&rounded, 0, 16), 255);
+        assert_eq!(alpha(&rounded, 0, 0), 0);
+        assert_eq!(alpha(&circle, 0, 0), 0);
+        assert_eq!(alpha(&circle, 3, 3), 0);
+        let coverage = |raster: &IconPixels| -> u64 {
+            raster
+                .pixels
+                .chunks_exact(4)
+                .map(|pixel| u64::from(pixel[3]))
+                .sum()
+        };
+        assert!(coverage(&circle) < coverage(&rounded));
+        assert!(coverage(&rounded) < coverage(&square));
+        // A background shadow or offset silhouette would change alpha when the
+        // foreground glyph or chosen color changes. They must share one mask.
+        let alternate =
+            render_pixels(IconStyle::Letter, 0x12_34_56, IconShape::Circle, 32, 96).unwrap();
+        assert!(circle
+            .pixels
+            .chunks_exact(4)
+            .zip(alternate.pixels.chunks_exact(4))
+            .all(|(a, b)| a[3] == b[3]));
+        for (logical, dpi, physical) in [(16, 96, 16), (32, 144, 48), (64, 192, 128)] {
+            let raster =
+                render_pixels(IconStyle::Leaf, 0x00_00_00, IconShape::Square, logical, dpi)
+                    .unwrap();
+            assert_eq!((raster.width, raster.height), (physical, physical));
+            assert_eq!(
+                raster.pixels.len(),
+                physical as usize * physical as usize * 4
+            );
+        }
+    }
+
+    #[test]
+    fn styles_colors_and_native_icon_sizes_are_independent() {
         assert_ne!(
-            render_pixels(IconStyle::Leaf, 0xD6_A5_75, 32).unwrap(),
-            render_pixels(IconStyle::Letter, 0xD6_A5_75, 32).unwrap()
+            render_pixels(IconStyle::Leaf, 0xD6_A5_75, IconShape::Rounded, 32, 96)
+                .unwrap()
+                .pixels,
+            render_pixels(IconStyle::Letter, 0xD6_A5_75, IconShape::Rounded, 32, 96)
+                .unwrap()
+                .pixels
         );
         assert_ne!(
-            render_pixels(IconStyle::Leaf, 0xD6_A5_75, 32).unwrap(),
-            render_pixels(IconStyle::Leaf, 0x35_68_90, 32).unwrap()
+            render_pixels(IconStyle::Leaf, 0xD6_A5_75, IconShape::Rounded, 32, 96)
+                .unwrap()
+                .pixels,
+            render_pixels(IconStyle::Leaf, 0x35_68_90, IconShape::Rounded, 32, 96)
+                .unwrap()
+                .pixels
         );
         for style in [IconStyle::Leaf, IconStyle::Translate, IconStyle::Letter] {
-            let icons = IconSet::new(style, 0x12_34_56, 144).unwrap();
+            let icons = IconSet::new(style, 0x12_34_56, IconShape::Circle, 64, 144).unwrap();
             assert!(!icons.small().is_null());
             assert!(!icons.large().is_null());
+            assert!(!icons.chip().is_null());
             assert_ne!(icons.small(), icons.large());
+            assert_ne!(icons.large(), icons.chip());
+            assert_eq!(icons.chip_size(), 96);
+            for (icon, expected) in [(icons.small(), 24), (icons.large(), 48), (icons.chip(), 96)] {
+                let mut info: ICONINFO = unsafe { zeroed() };
+                assert_ne!(unsafe { GetIconInfo(icon, &mut info) }, 0);
+                let mut bitmap: BITMAP = unsafe { zeroed() };
+                let queried = unsafe {
+                    GetObjectW(
+                        info.hbmColor,
+                        std::mem::size_of::<BITMAP>() as i32,
+                        (&mut bitmap as *mut BITMAP).cast(),
+                    )
+                };
+                unsafe {
+                    DeleteObject(info.hbmColor);
+                    DeleteObject(info.hbmMask);
+                }
+                assert!(queried > 0);
+                assert_eq!((bitmap.bmWidth, bitmap.bmHeight), (expected, expected));
+            }
         }
-        assert!(IconSet::new(IconStyle::Leaf, 0x0100_0000, 96).is_err());
+    }
+
+    #[test]
+    fn invalid_size_or_color_is_rejected_and_dpi_is_bounded() {
+        for logical in [0, 15, 65, u32::MAX] {
+            assert!(
+                render_pixels(IconStyle::Leaf, 0x12_34_56, IconShape::Square, logical, 96).is_err()
+            );
+        }
+        assert!(IconSet::new(IconStyle::Leaf, 0x0100_0000, IconShape::Rounded, 32, 96).is_err());
+        assert_eq!(
+            render_pixels(IconStyle::Leaf, 0x12_34_56, IconShape::Square, 16, 0)
+                .unwrap()
+                .width,
+            16
+        );
+        assert_eq!(
+            render_pixels(IconStyle::Leaf, 0x12_34_56, IconShape::Square, 64, u32::MAX)
+                .unwrap()
+                .width,
+            256
+        );
     }
 }

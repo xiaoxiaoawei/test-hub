@@ -20,14 +20,38 @@ pub enum IconStyle {
     Letter,
 }
 
+/// Shape of the floating selection icon, independent of its glyph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IconShape {
+    #[default]
+    Rounded,
+    Square,
+    Circle,
+}
+
+/// Action taken after selecting text while automatic selection is enabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionMode {
+    #[default]
+    Click,
+    Direct,
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub base_url: String,
     pub model: String,
     pub timeout_seconds: u32,
     pub api_key: String,
+    /// Overall switch for automatic text-selection translation.
     pub selection_button: bool,
+    pub selection_mode: SelectionMode,
     pub icon_style: IconStyle,
+    pub icon_shape: IconShape,
+    /// Floating icon size in logical pixels, before per-monitor DPI scaling.
+    pub icon_size: u32,
     /// RGB color in the portable 0xRRGGBB representation, not Win32 COLORREF.
     pub icon_color: u32,
 }
@@ -40,7 +64,10 @@ impl Default for Settings {
             timeout_seconds: 20,
             api_key: String::new(),
             selection_button: true,
+            selection_mode: SelectionMode::default(),
             icon_style: IconStyle::default(),
+            icon_shape: IconShape::default(),
+            icon_size: default_icon_size(),
             icon_color: default_icon_color(),
         }
     }
@@ -63,7 +90,10 @@ impl fmt::Debug for Settings {
                 },
             )
             .field("selection_button", &self.selection_button)
+            .field("selection_mode", &self.selection_mode)
             .field("icon_style", &self.icon_style)
+            .field("icon_shape", &self.icon_shape)
+            .field("icon_size", &self.icon_size)
             .field("icon_color", &format_args!("#{:06X}", self.icon_color))
             .finish()
     }
@@ -98,6 +128,9 @@ impl Settings {
         if self.icon_color > 0xFF_FF_FF {
             return Err("图标颜色必须是有效的 RGB 颜色（#000000–#FFFFFF）。".into());
         }
+        if !(16..=64).contains(&self.icon_size) {
+            return Err("图标大小必须为 16–64 像素。".into());
+        }
         Ok(())
     }
 }
@@ -120,6 +153,9 @@ fn default_selection_button() -> bool {
 fn default_icon_color() -> u32 {
     0xD6_A5_75
 }
+fn default_icon_size() -> u32 {
+    32
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoredSettings {
@@ -134,7 +170,13 @@ struct StoredSettings {
     #[serde(default = "default_selection_button")]
     selection_button: bool,
     #[serde(default)]
+    selection_mode: SelectionMode,
+    #[serde(default)]
     icon_style: IconStyle,
+    #[serde(default)]
+    icon_shape: IconShape,
+    #[serde(default = "default_icon_size")]
+    icon_size: u32,
     #[serde(default = "default_icon_color")]
     icon_color: u32,
     #[serde(default)]
@@ -149,7 +191,10 @@ impl StoredSettings {
             model: settings.model.trim().to_owned(),
             timeout_seconds: settings.timeout_seconds,
             selection_button: settings.selection_button,
+            selection_mode: settings.selection_mode,
             icon_style: settings.icon_style,
+            icon_shape: settings.icon_shape,
+            icon_size: settings.icon_size,
             icon_color: settings.icon_color,
             api_key_encrypted: encrypted_key,
         }
@@ -164,7 +209,10 @@ impl StoredSettings {
             model: self.model,
             timeout_seconds: self.timeout_seconds,
             selection_button: self.selection_button,
+            selection_mode: self.selection_mode,
             icon_style: self.icon_style,
+            icon_shape: self.icon_shape,
+            icon_size: self.icon_size,
             icon_color: self.icon_color,
             api_key,
         };
@@ -602,7 +650,10 @@ mod tests {
         let decoded = legacy.into_settings(String::new()).unwrap();
         assert!(decoded.selection_button);
         assert_eq!(decoded.timeout_seconds, 20);
+        assert_eq!(decoded.selection_mode, SelectionMode::Click);
         assert_eq!(decoded.icon_style, IconStyle::Translate);
+        assert_eq!(decoded.icon_shape, IconShape::Rounded);
+        assert_eq!(decoded.icon_size, 32);
         assert_eq!(decoded.icon_color, 0xD6_A5_75);
         let settings = Settings {
             selection_button: false,
@@ -629,30 +680,113 @@ mod tests {
         assert_eq!(settings.model, "deepseek-chat");
         assert_eq!(settings.timeout_seconds, 30);
         assert!(!settings.selection_button);
+        assert_eq!(settings.selection_mode, SelectionMode::Click);
         assert_eq!(settings.icon_style, IconStyle::Translate);
+        assert_eq!(settings.icon_shape, IconShape::Rounded);
+        assert_eq!(settings.icon_size, 32);
         assert_eq!(settings.icon_color, 0xD6_A5_75);
     }
 
     #[test]
-    fn every_icon_style_and_custom_rgb_color_survive_settings_roundtrip() {
+    fn version_zero_three_settings_keep_appearance_and_default_to_click_mode() {
+        // 0.3.0 stores icon style/color but no shape, size, or selection mode.
+        for selection_button in [false, true] {
+            let document = serde_json::json!({
+                "version": 1,
+                "base_url": "https://example.com/v1",
+                "model": "custom-model",
+                "timeout_seconds": 60,
+                "selection_button": selection_button,
+                "icon_style": "leaf",
+                "icon_color": 0x12_34_56,
+                "api_key_encrypted": [18, 42, 71],
+            });
+            let stored: StoredSettings = serde_json::from_value(document).unwrap();
+            assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
+            let settings = stored.into_settings("test-only-key".into()).unwrap();
+            assert_eq!(settings.base_url, "https://example.com/v1");
+            assert_eq!(settings.model, "custom-model");
+            assert_eq!(settings.timeout_seconds, 60);
+            assert_eq!(settings.selection_button, selection_button);
+            assert_eq!(settings.selection_mode, SelectionMode::Click);
+            assert_eq!(settings.icon_style, IconStyle::Leaf);
+            assert_eq!(settings.icon_color, 0x12_34_56);
+            assert_eq!(settings.icon_shape, IconShape::Rounded);
+            assert_eq!(settings.icon_size, 32);
+            assert_eq!(settings.api_key, "test-only-key");
+        }
+    }
+
+    #[test]
+    fn every_icon_and_selection_mode_combination_survives_settings_roundtrip() {
         for (style, name, color) in [
             (IconStyle::Leaf, "leaf", 0x00_78_D4),
             (IconStyle::Translate, "translate", 0xFF_00_A6),
             (IconStyle::Letter, "letter", 0x00_00_00),
         ] {
+            for (shape, shape_name) in [
+                (IconShape::Rounded, "rounded"),
+                (IconShape::Square, "square"),
+                (IconShape::Circle, "circle"),
+            ] {
+                for (mode, mode_name) in [
+                    (SelectionMode::Click, "click"),
+                    (SelectionMode::Direct, "direct"),
+                ] {
+                    for selection_button in [false, true] {
+                        let settings = Settings {
+                            selection_button,
+                            selection_mode: mode,
+                            icon_style: style,
+                            icon_shape: shape,
+                            icon_size: 48,
+                            icon_color: color,
+                            ..Settings::default()
+                        };
+                        let encoded =
+                            serde_json::to_value(StoredSettings::from_settings(&settings, vec![]))
+                                .unwrap();
+                        assert_eq!(encoded["version"], 1);
+                        assert_eq!(encoded["icon_style"], name);
+                        assert_eq!(encoded["icon_shape"], shape_name);
+                        assert_eq!(encoded["icon_size"], 48);
+                        assert_eq!(encoded["icon_color"], color);
+                        assert_eq!(encoded["selection_mode"], mode_name);
+                        let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
+                        let restored = stored.into_settings(String::new()).unwrap();
+                        assert_eq!(restored.selection_button, selection_button);
+                        assert_eq!(restored.selection_mode, mode);
+                        assert_eq!(restored.icon_style, style);
+                        assert_eq!(restored.icon_shape, shape);
+                        assert_eq!(restored.icon_size, 48);
+                        assert_eq!(restored.icon_color, color);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn icon_size_limits_are_checked_for_runtime_and_stored_settings() {
+        for size in [0, 15, 65, u32::MAX] {
             let settings = Settings {
-                icon_style: style,
-                icon_color: color,
+                icon_size: size,
                 ..Settings::default()
             };
+            assert!(settings.validate().is_err(), "accepted icon size {size}");
+            let stored = StoredSettings::from_settings(&settings, vec![]);
+            assert!(stored.into_settings(String::new()).is_err());
+        }
+        for size in [16, 32, 64] {
+            let settings = Settings {
+                icon_size: size,
+                ..Settings::default()
+            };
+            settings.validate().unwrap();
             let encoded =
-                serde_json::to_value(StoredSettings::from_settings(&settings, vec![])).unwrap();
-            assert_eq!(encoded["icon_style"], name);
-            assert_eq!(encoded["icon_color"], color);
-            let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
-            let restored = stored.into_settings(String::new()).unwrap();
-            assert_eq!(restored.icon_style, style);
-            assert_eq!(restored.icon_color, color);
+                serde_json::to_vec(&StoredSettings::from_settings(&settings, vec![])).unwrap();
+            let stored: StoredSettings = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(stored.into_settings(String::new()).unwrap().icon_size, size);
         }
     }
 

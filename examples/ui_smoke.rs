@@ -52,6 +52,10 @@ mod windows {
     const ICON_STYLE: i32 = 230;
     const ICON_APPLY: i32 = 232;
     const ICON_RESET: i32 = 233;
+    const SELECTION_MODE: i32 = 216;
+    const ICON_SHAPE: i32 = 236;
+    const ICON_SIZE: i32 = 237;
+    const SCREEN_COLOR: i32 = 238;
 
     pub(super) fn run() -> Result<(), String> {
         let executable = std::env::args_os()
@@ -251,39 +255,102 @@ mod windows {
         // Save a key-free baseline first. Appearance saves must preserve every
         // unrelated field, including provider, timeout and selection preference.
         require_visible(settings, APPEARANCE)?;
+        require_visible(settings, SELECTION_MODE)?;
+        require_combo(settings, SELECTION_MODE, 0)?;
+        select_combo(settings, SELECTION_MODE, 1)?;
         click(settings, SAVE)?;
         let baseline = saved_settings(owned)?;
+        if baseline
+            .get("selection_mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("direct")
+        {
+            return Err(
+                "Saving direct selection mode did not persist selection_mode=direct.".into(),
+            );
+        }
         let appearance = open_appearance(owned, settings)?;
-        for id in [ICON_STYLE, ICON_APPLY, ICON_RESET, 234, 235] {
+        for id in [
+            ICON_STYLE,
+            ICON_APPLY,
+            ICON_RESET,
+            ICON_SHAPE,
+            ICON_SIZE,
+            SCREEN_COLOR,
+            234,
+            235,
+        ] {
             require_visible(appearance, id)?;
         }
         select_combo(appearance, ICON_STYLE, 2)?;
+        // Both supported size endpoints must save, together with each shape.
+        for (index, shape, size) in [(0, "rounded", 16_u32), (1, "square", 64)] {
+            select_combo(appearance, ICON_SHAPE, index)?;
+            set_control_text(appearance, ICON_SIZE, &size.to_string())?;
+            click(appearance, ICON_APPLY)?;
+            let saved = saved_settings(owned)?;
+            require_icon_geometry(&saved, shape, size)?;
+            require_same_nonappearance_settings(&baseline, &saved)?;
+        }
+        select_combo(appearance, ICON_SHAPE, 2)?;
+        set_control_text(appearance, ICON_SIZE, "48")?;
         click(appearance, ICON_APPLY)?;
         let letter = saved_settings(owned)?;
         if letter.get("icon_style").and_then(serde_json::Value::as_str) != Some("letter") {
             return Err("Applying the letter icon did not persist icon_style=letter.".into());
         }
+        require_icon_geometry(&letter, "circle", 48)?;
         require_same_nonappearance_settings(&baseline, &letter)?;
+        for invalid in ["15", "65"] {
+            set_control_text(appearance, ICON_SIZE, invalid)?;
+            click(appearance, ICON_APPLY)?;
+            if saved_settings(owned)? != letter {
+                return Err("An out-of-range icon size was persisted.".into());
+            }
+        }
 
         // A restart distinguishes persisted settings from merely updated draft
         // controls. The restarted process must reopen the saved style as A.
         let settings = owned.restart()?;
         require_text(settings, 210, "https://api.openai.com/v1")?;
         require_text(settings, 212, "gpt-4o-mini")?;
+        require_combo(settings, SELECTION_MODE, 1)?;
         let appearance = open_appearance(owned, settings)?;
-        if send(control(appearance, ICON_STYLE)?, CB_GETCURSEL, 0, 0)? != 2 {
-            return Err("The saved letter icon was not restored after restarting.".into());
-        }
+        require_combo(appearance, ICON_STYLE, 2)?;
+        require_combo(appearance, ICON_SHAPE, 2)?;
+        require_text(appearance, ICON_SIZE, "48")?;
         click(appearance, ICON_RESET)?;
         click(appearance, ICON_APPLY)?;
         let restored = saved_settings(owned)?;
-        if restored.get("icon_style") != baseline.get("icon_style")
-            || restored.get("icon_color") != baseline.get("icon_color")
-        {
-            return Err("Reset/apply did not restore the default icon appearance.".into());
+        for field in ["icon_style", "icon_color", "icon_shape", "icon_size"] {
+            if restored.get(field) != baseline.get(field) {
+                return Err("Reset/apply did not restore the default icon appearance.".into());
+            }
         }
         require_same_nonappearance_settings(&baseline, &restored)?;
-        println!("Icon appearance entry, apply/persistence, restart and default reset passed.");
+        select_combo(settings, SELECTION_MODE, 0)?;
+        click(settings, SAVE)?;
+        if saved_settings(owned)?
+            .get("selection_mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("click")
+        {
+            return Err("Saving click selection mode did not persist selection_mode=click.".into());
+        }
+        println!("Selection modes, icon styles/shapes, size limits, persistence, restart and default reset passed.");
+        Ok(())
+    }
+
+    fn require_icon_geometry(
+        saved: &serde_json::Value,
+        shape: &str,
+        size: u32,
+    ) -> Result<(), String> {
+        if saved.get("icon_shape").and_then(serde_json::Value::as_str) != Some(shape)
+            || saved.get("icon_size").and_then(serde_json::Value::as_u64) != Some(u64::from(size))
+        {
+            return Err("The icon shape or size was not persisted as requested.".into());
+        }
         Ok(())
     }
 
@@ -303,6 +370,8 @@ mod windows {
                 let mut copy = object.clone();
                 copy.remove("icon_style");
                 copy.remove("icon_color");
+                copy.remove("icon_shape");
+                copy.remove("icon_size");
                 copy
             })
         };
@@ -446,6 +515,21 @@ mod windows {
             id as usize | ((CBN_SELCHANGE as usize) << 16),
             0,
         )?;
+        Ok(())
+    }
+
+    fn require_combo(parent: HWND, id: i32, expected: usize) -> Result<(), String> {
+        if send(control(parent, id)?, CB_GETCURSEL, 0, 0)? != expected {
+            return Err(format!(
+                "Control {id} did not restore the expected selection."
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_control_text(parent: HWND, id: i32, value: &str) -> Result<(), String> {
+        let value = wide(value);
+        send(control(parent, id)?, WM_SETTEXT, 0, value.as_ptr() as isize)?;
         Ok(())
     }
 

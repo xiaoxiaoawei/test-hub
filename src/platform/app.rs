@@ -1,5 +1,5 @@
 //! Native Windows message loop. UIA and HTTP never run on this thread.
-use super::{icons, mouse, selection, theme};
+use super::{icons, mouse, picker, popup, selection, theme};
 use crate::{cache::TranslationCache, config, mailbox, translation};
 use std::{
     cell::{Cell, RefCell},
@@ -58,8 +58,16 @@ const ID_ICON_STYLE: u16 = 230;
 const ID_ICON_COLOR: u16 = 231;
 const ID_ICON_APPLY: u16 = 232;
 const ID_ICON_RESET: u16 = 233;
-const APPEARANCE_WIDTH: i32 = 360;
-const APPEARANCE_HEIGHT: i32 = 360;
+const ID_ICON_SHAPE: u16 = 236;
+const ID_ICON_SIZE: u16 = 237;
+const ID_SCREEN_PICK: u16 = 238;
+const ID_SELECTION_MODE: u16 = 216;
+const ID_INLINE_EXPAND: u16 = 252;
+const ID_INLINE_CLOSE: u16 = 253;
+const APPEARANCE_WIDTH: i32 = 390;
+const APPEARANCE_HEIGHT: i32 = 460;
+const INLINE_WIDTH: i32 = 344;
+const INLINE_HEIGHT: i32 = 190;
 const SETTINGS_WIDTH: i32 = 460;
 const SETTINGS_HEIGHT: i32 = 510;
 const SETTINGS_CONTENT_HEIGHT: i32 = 468;
@@ -73,7 +81,6 @@ thread_local! {
     static FONTS: RefCell<HashMap<(u32, i32, i32), HFONT>> = RefCell::new(HashMap::new());
     static CHIP_WINDOW: Cell<isize> = const { Cell::new(0) };
     static AUTO_CHECKED: Cell<bool> = const { Cell::new(true) };
-    static CHIP_ICON: Cell<isize> = const { Cell::new(0) };
     static DRAFT_ICON_COLOR: Cell<u32> = const { Cell::new(0xD6A575) };
 }
 
@@ -111,6 +118,7 @@ enum Event {
         generation: u64,
         text: String,
     },
+    PickedColor(Result<Option<u32>, String>),
 }
 
 struct SettingsUi {
@@ -120,6 +128,7 @@ struct SettingsUi {
     model: HWND,
     timeout: HWND,
     auto: HWND,
+    mode: HWND,
     status: HWND,
 }
 struct ResultUi {
@@ -130,9 +139,16 @@ struct ResultUi {
 }
 struct AppearanceUi {
     style: HWND,
+    shape: HWND,
+    size: HWND,
     preview: HWND,
     color: HWND,
     status: HWND,
+}
+struct InlineUi {
+    translated: HWND,
+    status: HWND,
+    copy: HWND,
 }
 
 struct App {
@@ -140,6 +156,9 @@ struct App {
     settings_window: HWND,
     result_window: HWND,
     chip: HWND,
+    inline_window: HWND,
+    inline_ui: InlineUi,
+    inline_active: bool,
     appearance_window: HWND,
     appearance_ui: AppearanceUi,
     icons: icons::IconSet,
@@ -148,6 +167,7 @@ struct App {
     result_ui: ResultUi,
     settings: config::Settings,
     events: mpsc::Receiver<Event>,
+    ui_events: mpsc::Sender<Event>,
     capture: mpsc::Sender<CaptureJob>,
     network: mailbox::Sender<TranslationJob>,
     generation: u64,
@@ -158,6 +178,14 @@ struct App {
     capture_busy: bool,
     pending: Option<CaptureJob>,
     auto_point: POINT,
+    auto_foreground: isize,
+    auto_started: Option<Instant>,
+    auto_attempt: usize,
+    last_auto: Option<(isize, String)>,
+    chip_deadline: Option<Instant>,
+    chip_pixels: Option<icons::IconPixels>,
+    chip_dpi: u32,
+    picking_color: bool,
     chip_text: String,
     chip_foreground: isize,
     translated: String,
@@ -234,8 +262,13 @@ unsafe fn run_inner() -> Result<(), String> {
         Ok(settings) => (settings, None),
         Err(error) => (config::Settings::default(), Some(error)),
     };
-    let runtime_icons =
-        icons::IconSet::new(settings.icon_style, settings.icon_color, GetDpiForSystem())?;
+    let runtime_icons = icons::IconSet::new(
+        settings.icon_style,
+        settings.icon_color,
+        settings.icon_shape,
+        settings.icon_size,
+        GetDpiForSystem(),
+    )?;
     icon = runtime_icons.small();
     let settings_window = create_window(
         "轻译 · 翻译服务设置",
@@ -255,10 +288,18 @@ unsafe fn run_inner() -> Result<(), String> {
     );
     let chip = create_window(
         "轻译",
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        WS_POPUP,
+        settings.icon_size as i32,
+        settings.icon_size as i32,
+        main,
+    );
+    let inline_window = create_window(
+        "轻译 · 划词译文",
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        WS_POPUP | WS_BORDER,
-        52,
-        36,
+        WS_POPUP,
+        INLINE_WIDTH,
+        INLINE_HEIGHT,
         main,
     );
     let appearance_window = create_window(
@@ -273,6 +314,7 @@ unsafe fn run_inner() -> Result<(), String> {
         || result_window.is_null()
         || chip.is_null()
         || appearance_window.is_null()
+        || inline_window.is_null()
     {
         return Err("无法创建翻译窗口。".into());
     }
@@ -283,11 +325,14 @@ unsafe fn run_inner() -> Result<(), String> {
     for window in [main, settings_window, result_window, appearance_window] {
         set_window_icons(window, &runtime_icons);
     }
-    CHIP_ICON.set(runtime_icons.large() as isize);
+    popup::disable_shadow(chip);
+    popup::disable_shadow(inline_window);
     let settings_ui = make_settings(settings_window);
     let result_ui = make_result(result_window);
+    let inline_ui = make_inline(inline_window);
     let appearance_ui = make_appearance(appearance_window);
     let (events_tx, events) = mpsc::channel();
+    let ui_events = events_tx.clone();
     let (capture_tx, capture_rx) = mpsc::channel::<CaptureJob>();
     let (network_tx, network_rx) = mailbox::channel::<TranslationJob>();
     let destination = main as isize;
@@ -300,8 +345,10 @@ unsafe fn run_inner() -> Result<(), String> {
                     selection::read_clipboard_text()
                 } else if GetForegroundWindow() as isize != job.foreground {
                     Err("前台窗口已改变，请重新选择文字。".into())
+                } else if job.kind == CaptureKind::Auto {
+                    selection::capture_selection_at(job.point)
                 } else {
-                    selection::capture_selection(job.kind == CaptureKind::Hotkey)
+                    selection::capture_selection(true)
                 };
                 if capture_events
                     .send(Event::Captured { job, result })
@@ -414,6 +461,9 @@ unsafe fn run_inner() -> Result<(), String> {
         settings_window,
         result_window,
         chip,
+        inline_window,
+        inline_ui,
+        inline_active: false,
         appearance_window,
         appearance_ui,
         icons: runtime_icons,
@@ -422,6 +472,7 @@ unsafe fn run_inner() -> Result<(), String> {
         result_ui,
         settings,
         events,
+        ui_events,
         capture: capture_tx,
         network: network_tx,
         generation: 0,
@@ -432,6 +483,14 @@ unsafe fn run_inner() -> Result<(), String> {
         capture_busy: false,
         pending: None,
         auto_point: POINT { x: 0, y: 0 },
+        auto_foreground: 0,
+        auto_started: None,
+        auto_attempt: 0,
+        last_auto: None,
+        chip_deadline: None,
+        chip_pixels: None,
+        chip_dpi: 0,
+        picking_color: false,
         chip_text: String::new(),
         chip_foreground: 0,
         translated: String::new(),
@@ -450,6 +509,7 @@ unsafe fn run_inner() -> Result<(), String> {
         layout_settings(app);
         layout_result(app);
         layout_appearance(app);
+        layout_inline(app);
         layout_chip(app);
         fill_settings(app);
         let mut problems = Vec::new();
@@ -477,7 +537,11 @@ unsafe fn run_inner() -> Result<(), String> {
         }
         if message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE as usize {
             let root = GetAncestor(message.hwnd, GA_ROOT);
-            if root == result_window || root == settings_window || root == appearance_window {
+            if root == result_window
+                || root == settings_window
+                || root == appearance_window
+                || root == inline_window
+            {
                 ShowWindow(root, SW_HIDE);
                 continue;
             }
@@ -485,6 +549,7 @@ unsafe fn run_inner() -> Result<(), String> {
         if IsDialogMessageW(settings_window, &message) == 0
             && IsDialogMessageW(result_window, &message) == 0
             && IsDialogMessageW(appearance_window, &message) == 0
+            && IsDialogMessageW(inline_window, &message) == 0
         {
             TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -511,6 +576,7 @@ unsafe fn run_inner() -> Result<(), String> {
         if let Some(app) = cell.borrow_mut().take() {
             Shell_NotifyIconW(NIM_DELETE, &app.tray);
             DestroyWindow(app.chip);
+            DestroyWindow(app.inline_window);
             DestroyWindow(app.result_window);
             DestroyWindow(app.settings_window);
             DestroyWindow(app.appearance_window);
@@ -524,7 +590,7 @@ unsafe fn run_inner() -> Result<(), String> {
     });
     THEME.with(|cell| drop(cell.borrow_mut().take()));
     CHIP_WINDOW.set(0);
-    CHIP_ICON.set(0);
+
     Ok(())
 }
 
@@ -565,7 +631,7 @@ unsafe fn paint_message(
             let id = GetDlgCtrlID(control);
             let surface = message == WM_CTLCOLOREDIT
                 || message == WM_CTLCOLORLISTBOX
-                || matches!(id, 210..=213 | 222 | 224)
+                || matches!(id, 210..=213 | 222 | 224 | 237 | 251)
                 || id == ID_PROVIDER as i32;
             with_theme(|palette| {
                 let dc = wparam as HDC;
@@ -580,7 +646,7 @@ unsafe fn paint_message(
                 SetBkMode(dc, OPAQUE as i32);
                 SetTextColor(
                     dc,
-                    if surface || id == 200 || id == 220 {
+                    if surface || id == 200 || id == 220 || id == 250 {
                         theme::TEXT
                     } else {
                         theme::MUTED
@@ -625,6 +691,7 @@ unsafe fn paint_message(
                 1
             })
         }
+        WM_ERASEBKGND if hwnd as isize == CHIP_WINDOW.get() && CHIP_WINDOW.get() != 0 => Some(1),
         WM_ERASEBKGND => with_theme(|palette| {
             let mut rect: RECT = zeroed();
             GetClientRect(hwnd, &mut rect);
@@ -632,29 +699,10 @@ unsafe fn paint_message(
             1
         }),
         WM_PAINT if hwnd as isize == CHIP_WINDOW.get() && CHIP_WINDOW.get() != 0 => {
-            with_theme(|palette| {
-                let mut paint: PAINTSTRUCT = zeroed();
-                let dc = BeginPaint(hwnd, &mut paint);
-                let mut rect: RECT = zeroed();
-                GetClientRect(hwnd, &mut rect);
-                FillRect(dc, &rect, palette.background);
-                let size = (rect.bottom - scaled(4, dpi(hwnd)))
-                    .min(rect.right - scaled(4, dpi(hwnd)))
-                    .max(1);
-                DrawIconEx(
-                    dc,
-                    (rect.right - size) / 2,
-                    (rect.bottom - size) / 2,
-                    CHIP_ICON.get() as HICON,
-                    size,
-                    size,
-                    0,
-                    null_mut(),
-                    DI_NORMAL,
-                );
-                EndPaint(hwnd, &paint);
-                0
-            })
+            let mut paint: PAINTSTRUCT = zeroed();
+            BeginPaint(hwnd, &mut paint);
+            EndPaint(hwnd, &paint);
+            Some(0)
         }
         _ => None,
     }
@@ -743,34 +791,57 @@ unsafe extern "system" fn window_proc(
             }
             WM_SELECTION => {
                 if lparam == isize::MIN {
-                    ShowWindow(app.chip, SW_HIDE);
-                    KillTimer(app.main, TIMER_SELECTION);
-                    app.capture_generation += 1;
-                    app.pending = None;
+                    cancel_automatic(app);
                     handled = true;
                     return;
                 }
-                if app.settings.selection_button {
+                if app.settings.selection_button && !app.picking_color {
+                    cancel_automatic(app);
                     app.auto_point = POINT {
                         x: wparam as i32,
                         y: lparam as i32,
                     };
-                    ShowWindow(app.chip, SW_HIDE);
-                    KillTimer(app.main, TIMER_SELECTION);
-                    SetTimer(app.main, TIMER_SELECTION, 150, None);
+                    app.auto_foreground = GetForegroundWindow() as isize;
+                    app.auto_started = Some(Instant::now());
+                    app.auto_attempt = 0;
+                    SetTimer(app.main, TIMER_SELECTION, 90, None);
                 }
                 handled = true;
             }
             WM_TIMER if wparam == TIMER_SELECTION => {
                 KillTimer(app.main, TIMER_SELECTION);
-                if app.settings.selection_button {
+                if app.settings.selection_button
+                    && app
+                        .auto_started
+                        .is_some_and(|time| time.elapsed() < Duration::from_secs(2))
+                    && app.auto_foreground == GetForegroundWindow() as isize
+                    && !app.picking_color
+                {
                     request_capture(app, CaptureKind::Auto, app.auto_point);
                 }
                 handled = true;
             }
             WM_TIMER if wparam == TIMER_CHIP => {
-                KillTimer(app.main, TIMER_CHIP);
-                ShowWindow(app.chip, SW_HIDE);
+                let foreground = GetForegroundWindow();
+                if IsWindowVisible(app.chip) != 0
+                    && (!app
+                        .chip_deadline
+                        .is_some_and(|deadline| Instant::now() < deadline)
+                        || foreground as isize != app.chip_foreground)
+                {
+                    ShowWindow(app.chip, SW_HIDE);
+                    app.chip_deadline = None;
+                }
+                if app.inline_active
+                    && IsWindowVisible(app.inline_window) != 0
+                    && foreground as isize != app.chip_foreground
+                    && GetAncestor(foreground, GA_ROOT) != app.inline_window
+                {
+                    ShowWindow(app.inline_window, SW_HIDE);
+                }
+                if IsWindowVisible(app.chip) == 0 && IsWindowVisible(app.inline_window) == 0 {
+                    KillTimer(app.main, TIMER_CHIP);
+                }
                 handled = true;
             }
             WM_WORK => {
@@ -783,8 +854,17 @@ unsafe extern "system" fn window_proc(
                     if (wparam >> 16) as u16 == CBN_SELCHANGE as u16 {
                         change_provider(app);
                     }
-                } else if id == ID_ICON_STYLE {
+                } else if id == ID_SELECTION_MODE {
                     if (wparam >> 16) as u16 == CBN_SELCHANGE as u16 {
+                        update_mode_hint(app);
+                    }
+                } else if id == ID_ICON_STYLE || id == ID_ICON_SHAPE {
+                    if (wparam >> 16) as u16 == CBN_SELCHANGE as u16 {
+                        refresh_icon_preview(app);
+                    }
+                } else if id == ID_ICON_SIZE {
+                    if (wparam >> 16) as u16 == EN_CHANGE as u16 && selected_icon_size(app).is_ok()
+                    {
                         refresh_icon_preview(app);
                     }
                 } else if (wparam >> 16) as u16 == BN_CLICKED as u16 {
@@ -793,7 +873,11 @@ unsafe extern "system" fn window_proc(
                 handled = true;
             }
             WM_CLOSE => {
-                ShowWindow(hwnd, SW_HIDE);
+                if hwnd == app.inline_window {
+                    close_inline(app);
+                } else {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
                 handled = true;
             }
             WM_SIZE => {
@@ -801,6 +885,8 @@ unsafe extern "system" fn window_proc(
                     layout_settings(app);
                 } else if hwnd == app.result_window {
                     layout_result(app);
+                } else if hwnd == app.inline_window {
+                    layout_inline(app);
                 } else if hwnd == app.chip {
                     layout_chip(app);
                 } else if hwnd == app.appearance_window {
@@ -840,6 +926,9 @@ unsafe extern "system" fn window_proc(
                 };
                 handled = true;
             }
+            WM_DPICHANGED if hwnd == app.chip => {
+                handled = true;
+            }
             WM_DPICHANGED => {
                 let rect = &*(lparam as *const RECT);
                 SetWindowPos(
@@ -857,12 +946,14 @@ unsafe extern "system" fn window_proc(
                     layout_settings(app);
                 } else if hwnd == app.appearance_window {
                     layout_appearance(app);
+                } else if hwnd == app.inline_window {
+                    layout_inline(app);
                 } else {
                     layout_chip(app);
                 }
                 handled = true;
             }
-            WM_MOUSEACTIVATE if hwnd == app.chip => {
+            WM_MOUSEACTIVATE if hwnd == app.chip || hwnd == app.inline_window => {
                 value = MA_NOACTIVATE as isize;
                 handled = true;
             }
@@ -889,9 +980,22 @@ unsafe fn command(app: &mut App, id: u16) {
     match id {
         ID_SETTINGS => show_settings(app),
         ID_APPEARANCE => show_appearance(app),
+        ID_INLINE_EXPAND => {
+            present_translation(app, false, cursor());
+            SetForegroundWindow(app.result_window);
+        }
+        ID_INLINE_CLOSE => close_inline(app),
+        ID_SCREEN_PICK => begin_screen_pick(app),
         ID_ICON_RESET => {
             let defaults = config::Settings::default();
             DRAFT_ICON_COLOR.set(defaults.icon_color);
+            SendMessageW(
+                app.appearance_ui.shape,
+                CB_SETCURSEL,
+                shape_index(defaults.icon_shape),
+                0,
+            );
+            set_text(app.appearance_ui.size, &defaults.icon_size.to_string());
             SendMessageW(
                 app.appearance_ui.style,
                 CB_SETCURSEL,
@@ -904,6 +1008,7 @@ unsafe fn command(app: &mut App, id: u16) {
         ID_AUTO => {
             AUTO_CHECKED.set(!AUTO_CHECKED.get());
             InvalidateRect(app.settings_ui.auto, null(), 0);
+            update_mode_hint(app);
         }
         ID_CLIPBOARD => request_capture(app, CaptureKind::Clipboard, cursor()),
         ID_EXIT => PostQuitMessage(0),
@@ -911,8 +1016,8 @@ unsafe fn command(app: &mut App, id: u16) {
             ShowWindow(app.settings_window, SW_HIDE);
         }
         ID_COPY => match write_clipboard(app.result_window, &app.translated) {
-            Ok(()) => set_text(app.result_ui.status, "译文已复制"),
-            Err(error) => set_text(app.result_ui.status, &error),
+            Ok(()) => translation_status(app, "译文已复制"),
+            Err(error) => translation_status(app, &error),
         },
         ID_TRANSLATE => {
             ShowWindow(app.chip, SW_HIDE);
@@ -945,17 +1050,21 @@ unsafe fn command(app: &mut App, id: u16) {
                         .store(app.test_generation, Ordering::Release);
                     EnableWindow(GetDlgItem(app.settings_window, ID_TEST as i32), 1);
                     mouse::set_enabled(settings.selection_button);
-                    if !settings.selection_button {
-                        ShowWindow(app.chip, SW_HIDE);
-                        KillTimer(app.main, TIMER_SELECTION);
-                        app.capture_generation += 1;
-                        app.pending = None;
+                    if !settings.selection_button
+                        || settings.selection_mode != app.settings.selection_mode
+                    {
+                        cancel_automatic(app);
+                        app.last_auto = None;
+                        if app.inline_active {
+                            app.generation += 1;
+                            app.latest_translation
+                                .store(app.generation, Ordering::Release);
+                            app.streaming = false;
+                            app.inline_active = false;
+                        }
                     }
                     app.settings = settings;
-                    set_text(
-                        app.settings_ui.status,
-                        "已保存 · 选中英文后点击“译”，或按 Ctrl+Alt+T。",
-                    );
+                    update_mode_hint(app);
                 }
                 Err(error) => set_text(app.settings_ui.status, &error),
             }
@@ -990,7 +1099,154 @@ unsafe fn command(app: &mut App, id: u16) {
     }
 }
 
+unsafe fn cancel_automatic(app: &mut App) {
+    KillTimer(app.main, TIMER_SELECTION);
+    KillTimer(app.main, TIMER_CHIP);
+    ShowWindow(app.chip, SW_HIDE);
+    if app.inline_active {
+        ShowWindow(app.inline_window, SW_HIDE);
+    }
+    app.chip_deadline = None;
+    app.capture_generation += 1;
+    app.pending = None;
+    app.auto_started = None;
+    app.auto_attempt = 0;
+}
+
+unsafe fn retry_automatic(app: &mut App) {
+    const DELAYS: [u32; 3] = [110, 220, 360];
+    if app
+        .auto_started
+        .is_some_and(|started| started.elapsed() < Duration::from_secs(2))
+        && app.auto_attempt < DELAYS.len()
+        && app.settings.selection_button
+        && GetForegroundWindow() as isize == app.auto_foreground
+        && !app.picking_color
+    {
+        let delay = DELAYS[app.auto_attempt];
+        app.auto_attempt += 1;
+        SetTimer(app.main, TIMER_SELECTION, delay, None);
+    } else {
+        app.auto_started = None;
+        app.last_auto = None;
+    }
+}
+
+unsafe fn show_chip(app: &mut App, point: POINT) -> Result<(), String> {
+    let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = zeroed();
+    info.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(monitor, &mut info) == 0 {
+        return Err("无法定位屏幕。".into());
+    }
+    let mut scale = 96;
+    let mut dpi_y = 96;
+    GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut scale, &mut dpi_y);
+    if app.chip_pixels.is_none() || app.chip_dpi != scale {
+        app.chip_pixels = Some(icons::render_pixels(
+            app.settings.icon_style,
+            app.settings.icon_color,
+            app.settings.icon_shape,
+            app.settings.icon_size,
+            scale,
+        )?);
+        app.chip_dpi = scale;
+    }
+    let pixels = app.chip_pixels.as_ref().expect("icon pixels were created");
+    let x = (point.x + scaled(12, scale))
+        .min(info.rcWork.right - pixels.width)
+        .max(info.rcWork.left);
+    let y = (point.y + scaled(16, scale))
+        .min(info.rcWork.bottom - pixels.height)
+        .max(info.rcWork.top);
+    popup::update(app.chip, x, y, pixels)?;
+    app.chip_deadline = Some(Instant::now() + Duration::from_secs(12));
+    ShowWindow(app.chip, SW_SHOWNOACTIVATE);
+    SetTimer(app.main, TIMER_CHIP, 200, None);
+    Ok(())
+}
+
+unsafe fn present_translation(app: &mut App, inline: bool, point: POINT) {
+    ShowWindow(app.chip, SW_HIDE);
+    app.inline_active = inline;
+    if inline {
+        ShowWindow(app.result_window, SW_HIDE);
+        position_near(app.inline_window, point, INLINE_WIDTH, INLINE_HEIGHT);
+        layout_inline(app);
+        ShowWindow(app.inline_window, SW_SHOWNOACTIVATE);
+        SetTimer(app.main, TIMER_CHIP, 200, None);
+    } else {
+        ShowWindow(app.inline_window, SW_HIDE);
+        position_near(app.result_window, point, RESULT_WIDTH, RESULT_HEIGHT);
+        layout_result(app);
+        ShowWindow(app.result_window, SW_SHOWNOACTIVATE);
+    }
+}
+
+unsafe fn close_inline(app: &mut App) {
+    app.last_auto = None;
+    ShowWindow(app.inline_window, SW_HIDE);
+    app.inline_active = false;
+    app.streaming = false;
+    app.generation += 1;
+    app.latest_translation
+        .store(app.generation, Ordering::Release);
+    cancel_automatic(app);
+}
+
+unsafe fn begin_screen_pick(app: &mut App) {
+    if app.picking_color {
+        return;
+    }
+    cancel_automatic(app);
+    app.picking_color = true;
+    EnableWindow(GetDlgItem(app.appearance_window, ID_SCREEN_PICK as i32), 0);
+    set_text(
+        app.appearance_ui.status,
+        "点击屏幕取色；Esc 或右键取消。取色后仍需应用保存。",
+    );
+    let sender = app.ui_events.clone();
+    let destination = app.main as isize;
+    let started = thread::Builder::new()
+        .name("screen-color".into())
+        .spawn(move || {
+            let result = picker::pick_screen_color();
+            let _ = sender.send(Event::PickedColor(result));
+            PostMessageW(destination as HWND, WM_WORK, 0, 0);
+        });
+    if started.is_err() {
+        app.picking_color = false;
+        EnableWindow(GetDlgItem(app.appearance_window, ID_SCREEN_PICK as i32), 1);
+        set_text(app.appearance_ui.status, "无法启动取色，请重试。");
+    }
+}
+
+unsafe fn selected_mode(app: &App) -> config::SelectionMode {
+    if SendMessageW(app.settings_ui.mode, CB_GETCURSEL, 0, 0) == 1 {
+        config::SelectionMode::Direct
+    } else {
+        config::SelectionMode::Click
+    }
+}
+
+unsafe fn update_mode_hint(app: &App) {
+    EnableWindow(app.settings_ui.mode, AUTO_CHECKED.get() as i32);
+    let hint = if !AUTO_CHECKED.get() {
+        "自动划词已关闭；仍可使用 Ctrl+Alt+T。"
+    } else if selected_mode(app) == config::SelectionMode::Direct {
+        "直接模式会自动发送选中文字到所选翻译服务。"
+    } else {
+        "点击图标后才会发送选中文字并显示译文。"
+    };
+    set_text(app.settings_ui.status, hint);
+}
+
 unsafe fn request_capture(app: &mut App, kind: CaptureKind, point: POINT) {
+    if kind != CaptureKind::Auto {
+        KillTimer(app.main, TIMER_SELECTION);
+        app.auto_started = None;
+        app.auto_attempt = 0;
+    }
     app.capture_generation += 1;
     let foreground = GetForegroundWindow();
     if kind != CaptureKind::Clipboard && is_our_window(foreground) {
@@ -1029,21 +1285,43 @@ unsafe fn drain_events(app: &mut App) {
                                 }
                             } else if job.kind == CaptureKind::Auto && app.settings.selection_button
                             {
-                                app.chip_text = captured.text;
+                                app.auto_started = None;
                                 app.chip_foreground = job.foreground;
-                                position_near(app.chip, job.point, 52, 36);
-                                layout_chip(app);
-                                ShowWindow(app.chip, SW_SHOWNOACTIVATE);
-                                SetTimer(app.main, TIMER_CHIP, 7000, None);
+                                if app.settings.selection_mode == config::SelectionMode::Direct {
+                                    let duplicate =
+                                        app.last_auto.as_ref().is_some_and(|(foreground, text)| {
+                                            *foreground == job.foreground && text == &captured.text
+                                        }) && app.active_text == captured.text.trim()
+                                            && app.active_epoch == app.settings_epoch;
+                                    app.last_auto = Some((job.foreground, captured.text.clone()));
+                                    if duplicate {
+                                        present_translation(app, true, job.point);
+                                    } else {
+                                        start_translation_in(
+                                            app,
+                                            captured.text,
+                                            captured.source,
+                                            job.point,
+                                            true,
+                                        );
+                                    }
+                                } else {
+                                    app.chip_text = captured.text;
+                                    let _ = show_chip(app, job.point);
+                                }
                             } else if job.kind != CaptureKind::Auto {
                                 start_translation(app, captured.text, captured.source, job.point);
                             }
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if job.kind == CaptureKind::Auto {
+                                retry_automatic(app);
+                            }
+                        }
                         Err(error) if job.kind != CaptureKind::Auto => {
                             show_error(app, &error, job.point)
                         }
-                        Err(_) => {}
+                        Err(_) => retry_automatic(app),
                     }
                 }
                 if let Some(pending) = app.pending.take() {
@@ -1096,14 +1374,16 @@ unsafe fn drain_events(app: &mut App) {
                             } else {
                                 format!("翻译完成 · {:.2} 秒", elapsed.as_secs_f64())
                             };
-                            set_text(app.result_ui.status, &status);
-                            EnableWindow(app.result_ui.copy, 1);
+                            translation_status(app, &status);
+                            translation_copy_enabled(app, true);
                         }
                         Err(error) => {
+                            app.last_auto = None;
                             if !translation::is_cancelled_error(&error) {
                                 set_text(app.result_ui.translated, &error);
+                                set_text(app.inline_ui.translated, &error);
                             }
-                            set_text(app.result_ui.status, "翻译失败，可在设置中测试接口");
+                            translation_status(app, "翻译失败，请检查设置");
                         }
                     }
                 }
@@ -1111,7 +1391,19 @@ unsafe fn drain_events(app: &mut App) {
             Event::Progress { generation, text } => {
                 if generation == app.generation && app.streaming {
                     render_translation(app, &text);
-                    set_text(app.result_ui.status, "正在翻译 · 实时显示");
+                    translation_status(app, "正在翻译 · 实时显示");
+                }
+            }
+            Event::PickedColor(result) => {
+                app.picking_color = false;
+                EnableWindow(GetDlgItem(app.appearance_window, ID_SCREEN_PICK as i32), 1);
+                match result {
+                    Ok(Some(color)) => {
+                        DRAFT_ICON_COLOR.set(color);
+                        refresh_icon_preview(app);
+                    }
+                    Ok(None) => set_text(app.appearance_ui.status, "已取消取色，颜色保持不变。"),
+                    Err(error) => set_text(app.appearance_ui.status, &error),
                 }
             }
         }
@@ -1119,9 +1411,20 @@ unsafe fn drain_events(app: &mut App) {
 }
 
 unsafe fn start_translation(app: &mut App, text: String, source: &str, point: POINT) {
+    app.last_auto = None;
+    start_translation_in(app, text, source, point, false);
+}
+
+unsafe fn start_translation_in(
+    app: &mut App,
+    text: String,
+    source: &str,
+    point: POINT,
+    inline: bool,
+) {
     if app.streaming && app.active_epoch == app.settings_epoch && app.active_text == text.trim() {
         ShowWindow(app.chip, SW_HIDE);
-        ShowWindow(app.result_window, SW_SHOWNOACTIVATE);
+        present_translation(app, inline, point);
         return;
     }
     app.generation += 1;
@@ -1133,13 +1436,12 @@ unsafe fn start_translation(app: &mut App, text: String, source: &str, point: PO
     app.active_epoch = app.settings_epoch;
     app.active_started = Some(Instant::now());
     app.streaming = true;
-    EnableWindow(app.result_ui.copy, 0);
+    translation_copy_enabled(app, false);
     set_text(app.result_ui.original, &text);
     set_text(app.result_ui.translated, "正在翻译…");
-    set_text(app.result_ui.status, &format!("{source} · 正在翻译"));
-    position_near(app.result_window, point, RESULT_WIDTH, RESULT_HEIGHT);
-    layout_result(app);
-    ShowWindow(app.result_window, SW_SHOWNOACTIVATE);
+    set_text(app.inline_ui.translated, "正在翻译…");
+    translation_status(app, &format!("{source} · 正在翻译"));
+    present_translation(app, inline, point);
     let cached = app
         .cache
         .lock()
@@ -1153,11 +1455,11 @@ unsafe fn start_translation(app: &mut App, text: String, source: &str, point: PO
             .take()
             .map(|start| start.elapsed())
             .unwrap_or_default();
-        set_text(
-            app.result_ui.status,
+        translation_status(
+            app,
             &format!("本地缓存 · {} ms · 未调用 API", elapsed.as_millis()),
         );
-        EnableWindow(app.result_ui.copy, 1);
+        translation_copy_enabled(app, true);
         return;
     }
     if app
@@ -1178,12 +1480,13 @@ unsafe fn start_translation(app: &mut App, text: String, source: &str, point: PO
 }
 
 unsafe fn show_error(app: &mut App, error: &str, point: POINT) {
+    app.last_auto = None;
     app.streaming = false;
     app.generation += 1;
     app.latest_translation
         .store(app.generation, Ordering::Release);
     app.translated.clear();
-    EnableWindow(app.result_ui.copy, 0);
+    translation_copy_enabled(app, false);
     set_text(app.result_ui.original, "未获取到可翻译的选区");
     set_text(app.result_ui.translated, error);
     set_text(
@@ -1198,25 +1501,27 @@ unsafe fn show_error(app: &mut App, error: &str, point: POINT) {
 unsafe fn render_translation(app: &mut App, text: &str) {
     let previous = native_text(&app.translated);
     let current = native_text(text);
-    if !previous.is_empty() && current.starts_with(&previous) {
-        let suffix = wide(&current[previous.len()..]);
-        SendMessageW(
-            app.result_ui.translated,
-            EM_SETSEL,
-            i32::MAX as usize,
-            i32::MAX as isize,
-        );
-        SendMessageW(
-            app.result_ui.translated,
-            EM_REPLACESEL,
-            0,
-            suffix.as_ptr() as isize,
-        );
-        SendMessageW(app.result_ui.translated, EM_SCROLLCARET, 0, 0);
-    } else {
-        SetWindowTextW(app.result_ui.translated, wide(&current).as_ptr());
+    for editor in [app.result_ui.translated, app.inline_ui.translated] {
+        if !previous.is_empty() && current.starts_with(&previous) {
+            let suffix = wide(&current[previous.len()..]);
+            SendMessageW(editor, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
+            SendMessageW(editor, EM_REPLACESEL, 0, suffix.as_ptr() as isize);
+            SendMessageW(editor, EM_SCROLLCARET, 0, 0);
+        } else {
+            SetWindowTextW(editor, wide(&current).as_ptr());
+        }
     }
     app.translated = text.to_owned();
+}
+
+unsafe fn translation_status(app: &App, message: &str) {
+    set_text(app.result_ui.status, message);
+    set_text(app.inline_ui.status, message);
+}
+
+unsafe fn translation_copy_enabled(app: &App, enabled: bool) {
+    EnableWindow(app.result_ui.copy, enabled as i32);
+    EnableWindow(app.inline_ui.copy, enabled as i32);
 }
 
 unsafe fn show_settings(app: &mut App) {
@@ -1253,7 +1558,42 @@ unsafe fn selected_icon_style(app: &App) -> config::IconStyle {
     }
 }
 
+fn shape_index(shape: config::IconShape) -> usize {
+    match shape {
+        config::IconShape::Rounded => 0,
+        config::IconShape::Square => 1,
+        config::IconShape::Circle => 2,
+    }
+}
+
+unsafe fn selected_icon_shape(app: &App) -> config::IconShape {
+    match SendMessageW(app.appearance_ui.shape, CB_GETCURSEL, 0, 0) {
+        1 => config::IconShape::Square,
+        2 => config::IconShape::Circle,
+        _ => config::IconShape::Rounded,
+    }
+}
+
+unsafe fn selected_icon_size(app: &App) -> Result<u32, String> {
+    let value: u32 = text(app.appearance_ui.size)
+        .trim()
+        .parse()
+        .map_err(|_| "请输入 16–64 的整数尺寸。".to_string())?;
+    if !(16..=64).contains(&value) {
+        return Err("图标尺寸范围为 16–64 像素。".into());
+    }
+    Ok(value)
+}
+
 unsafe fn show_appearance(app: &mut App) {
+    cancel_automatic(app);
+    SendMessageW(
+        app.appearance_ui.shape,
+        CB_SETCURSEL,
+        shape_index(app.settings.icon_shape),
+        0,
+    );
+    set_text(app.appearance_ui.size, &app.settings.icon_size.to_string());
     SendMessageW(
         app.appearance_ui.style,
         CB_SETCURSEL,
@@ -1274,19 +1614,29 @@ unsafe fn show_appearance(app: &mut App) {
 }
 
 unsafe fn refresh_icon_preview(app: &mut App) {
+    let size = match selected_icon_size(app) {
+        Ok(size) => size,
+        Err(error) => {
+            set_text(app.appearance_ui.status, &error);
+            return;
+        }
+    };
     match icons::IconSet::new(
         selected_icon_style(app),
         DRAFT_ICON_COLOR.get(),
-        dpi(app.appearance_window) * 2,
+        selected_icon_shape(app),
+        size,
+        dpi(app.appearance_window),
     ) {
         Ok(preview) => {
             SendMessageW(
                 app.appearance_ui.preview,
                 STM_SETICON,
-                preview.large() as usize,
+                preview.chip() as usize,
                 0,
             );
             app.preview_icons = Some(preview);
+            layout_appearance(app);
             set_text(
                 app.appearance_ui.color,
                 &format!("#{:06X}  选择颜色…", DRAFT_ICON_COLOR.get()),
@@ -1301,14 +1651,27 @@ unsafe fn apply_appearance(app: &mut App) {
     let mut settings = app.settings.clone();
     settings.icon_style = selected_icon_style(app);
     settings.icon_color = DRAFT_ICON_COLOR.get();
-    let next =
-        match icons::IconSet::new(settings.icon_style, settings.icon_color, GetDpiForSystem()) {
-            Ok(icons) => icons,
-            Err(error) => {
-                set_text(app.appearance_ui.status, &error);
-                return;
-            }
-        };
+    settings.icon_shape = selected_icon_shape(app);
+    settings.icon_size = match selected_icon_size(app) {
+        Ok(size) => size,
+        Err(error) => {
+            set_text(app.appearance_ui.status, &error);
+            return;
+        }
+    };
+    let next = match icons::IconSet::new(
+        settings.icon_style,
+        settings.icon_color,
+        settings.icon_shape,
+        settings.icon_size,
+        GetDpiForSystem(),
+    ) {
+        Ok(icons) => icons,
+        Err(error) => {
+            set_text(app.appearance_ui.status, &error);
+            return;
+        }
+    };
     if let Err(error) = config::save(&settings) {
         set_text(app.appearance_ui.status, &error);
         return;
@@ -1323,7 +1686,8 @@ unsafe fn apply_appearance(app: &mut App) {
     }
     app.tray.hIcon = next.small();
     let notified = Shell_NotifyIconW(NIM_MODIFY, &app.tray) != 0;
-    CHIP_ICON.set(next.large() as isize);
+    app.chip_pixels = None;
+    ShowWindow(app.chip, SW_HIDE);
     // All native users have been updated before the previous owned HICON drops.
     app.icons = next;
     app.settings = settings;
@@ -1363,6 +1727,17 @@ unsafe fn fill_settings(app: &App) {
     );
     AUTO_CHECKED.set(app.settings.selection_button);
     InvalidateRect(app.settings_ui.auto, null(), 0);
+    SendMessageW(
+        app.settings_ui.mode,
+        CB_SETCURSEL,
+        if app.settings.selection_mode == config::SelectionMode::Direct {
+            1
+        } else {
+            0
+        },
+        0,
+    );
+    update_mode_hint(app);
     let provider = provider_index(&app.settings.base_url);
     SendMessageW(app.settings_ui.provider, CB_SETCURSEL, provider, 0);
 }
@@ -1377,6 +1752,7 @@ unsafe fn read_settings(app: &App) -> Result<config::Settings, String> {
             .parse()
             .map_err(|_| "超时秒数必须是整数。".to_string())?,
         selection_button: AUTO_CHECKED.get(),
+        selection_mode: selected_mode(app),
         ..app.settings.clone()
     };
     settings.validate()?;
@@ -1524,7 +1900,17 @@ unsafe fn make_settings(parent: HWND) -> SettingsUi {
         (ES_NUMBER | ES_AUTOHSCROLL) as u32 | WS_TABSTOP,
         213,
     );
-    let auto = child(parent, "BUTTON", "划词后显示翻译按钮", WS_TABSTOP, ID_AUTO);
+    let auto = child(parent, "BUTTON", "启用自动划词", WS_TABSTOP, ID_AUTO);
+    let mode = child(
+        parent,
+        "COMBOBOX",
+        "",
+        (CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32 | WS_VSCROLL | WS_TABSTOP,
+        ID_SELECTION_MODE,
+    );
+    for label in ["点击图标后翻译", "直接显示译文"] {
+        SendMessageW(mode, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+    }
     let status = child(
         parent,
         "STATIC",
@@ -1542,13 +1928,20 @@ unsafe fn make_settings(parent: HWND) -> SettingsUi {
         model,
         timeout,
         auto,
+        mode,
         status,
     }
 }
 
 unsafe fn make_appearance(parent: HWND) -> AppearanceUi {
     child(parent, "STATIC", "图标外观", SS_LEFT, 240);
-    child(parent, "STATIC", "托盘、窗口与划词按钮", SS_LEFT, 241);
+    child(
+        parent,
+        "STATIC",
+        "无阴影 · 大小与形状用于划词图标",
+        SS_LEFT,
+        241,
+    );
     child(parent, "STATIC", "样式", SS_LEFT, 242);
     let style = child(
         parent,
@@ -1560,6 +1953,25 @@ unsafe fn make_appearance(parent: HWND) -> AppearanceUi {
     for label in ["叶片", "译字", "字母 A"] {
         SendMessageW(style, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
     }
+    child(parent, "STATIC", "形状", SS_LEFT, 245);
+    let shape = child(
+        parent,
+        "COMBOBOX",
+        "",
+        (CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32 | WS_VSCROLL | WS_TABSTOP,
+        ID_ICON_SHAPE,
+    );
+    for label in ["圆角", "方形", "圆形"] {
+        SendMessageW(shape, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+    }
+    child(parent, "STATIC", "尺寸 / 像素（16–64）", SS_LEFT, 246);
+    let size = child(
+        parent,
+        "EDIT",
+        "32",
+        (ES_NUMBER | ES_AUTOHSCROLL) as u32 | WS_TABSTOP,
+        ID_ICON_SIZE,
+    );
     let preview = child(
         parent,
         "STATIC",
@@ -1569,11 +1981,14 @@ unsafe fn make_appearance(parent: HWND) -> AppearanceUi {
     );
     child(parent, "STATIC", "颜色", SS_LEFT, 243);
     let color = child(parent, "BUTTON", "选择颜色…", WS_TABSTOP, ID_ICON_COLOR);
+    child(parent, "BUTTON", "屏幕取色", WS_TABSTOP, ID_SCREEN_PICK);
     let status = child(parent, "STATIC", "选择样式与颜色后应用。", SS_LEFT, 235);
     child(parent, "BUTTON", "恢复默认", WS_TABSTOP, ID_ICON_RESET);
     child(parent, "BUTTON", "应用", WS_TABSTOP, ID_ICON_APPLY);
     AppearanceUi {
         style,
+        shape,
+        size,
         preview,
         color,
         status,
@@ -1587,17 +2002,34 @@ unsafe fn layout_appearance(app: &mut App) {
     let mut rect: RECT = zeroed();
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
+    let preview_size = app
+        .preview_icons
+        .as_ref()
+        .map(|icon| icon.chip_size() * 96 / scale as i32)
+        .unwrap_or(32)
+        .clamp(16, 64);
     let positions = [
         (240, 22, 16, width - 44, 28),
         (241, 22, 49, width - 44, 22),
-        (242, 22, 86, 194, 22),
-        (ID_ICON_STYLE, 22, 112, width - 134, 150),
-        (234, width - 93, 102, 64, 64),
-        (243, 22, 158, width - 44, 22),
-        (ID_ICON_COLOR, 22, 184, width - 44, 32),
-        (235, 22, 230, width - 44, 36),
-        (ID_ICON_RESET, 22, 275, 112, 32),
-        (ID_ICON_APPLY, width - 126, 275, 104, 32),
+        (242, 22, 86, 154, 22),
+        (ID_ICON_STYLE, 22, 112, 154, 150),
+        (245, 196, 86, width - 218, 22),
+        (ID_ICON_SHAPE, 196, 112, width - 218, 150),
+        (246, 22, 158, 220, 22),
+        (ID_ICON_SIZE, 22, 184, 104, 30),
+        (
+            234,
+            width - 98 + (72 - preview_size) / 2,
+            154 + (72 - preview_size) / 2,
+            preview_size,
+            preview_size,
+        ),
+        (243, 22, 236, width - 44, 22),
+        (ID_ICON_COLOR, 22, 262, width - 192, 32),
+        (ID_SCREEN_PICK, width - 156, 262, 134, 32),
+        (235, 22, 310, width - 44, 46),
+        (ID_ICON_RESET, 22, 378, 112, 32),
+        (ID_ICON_APPLY, width - 126, 378, 104, 32),
     ];
     for (id, x, y, w, h) in positions {
         let face = if id == 240 {
@@ -1605,6 +2037,48 @@ unsafe fn layout_appearance(app: &mut App) {
         } else {
             face
         };
+        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, face);
+    }
+    redraw_layout(hwnd);
+}
+
+unsafe fn make_inline(parent: HWND) -> InlineUi {
+    child(parent, "STATIC", "英 → 中", SS_LEFT, 250);
+    let translated = child(
+        parent,
+        "EDIT",
+        "",
+        (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_VSCROLL,
+        251,
+    );
+    let status = child(parent, "STATIC", "正在翻译…", SS_LEFT, 254);
+    let copy = child(parent, "BUTTON", "复制", WS_TABSTOP, ID_COPY);
+    child(parent, "BUTTON", "展开", WS_TABSTOP, ID_INLINE_EXPAND);
+    child(parent, "BUTTON", "×", WS_TABSTOP, ID_INLINE_CLOSE);
+    InlineUi {
+        translated,
+        status,
+        copy,
+    }
+}
+
+unsafe fn layout_inline(app: &mut App) {
+    let hwnd = app.inline_window;
+    let scale = dpi(hwnd);
+    let face = font(scale, 14, FW_NORMAL as i32);
+    let mut rect: RECT = zeroed();
+    GetClientRect(hwnd, &mut rect);
+    let width = rect.right * 96 / scale as i32;
+    let height = rect.bottom * 96 / scale as i32;
+    let positions = [
+        (250, 12, 9, width - 58, 21),
+        (ID_INLINE_CLOSE, width - 44, 5, 36, 25),
+        (251, 12, 36, width - 24, (height - 80).max(36)),
+        (254, 12, height - 31, (width - 160).max(70), 23),
+        (ID_COPY, width - 137, height - 32, 57, 26),
+        (ID_INLINE_EXPAND, width - 72, height - 32, 60, 26),
+    ];
+    for (id, x, y, w, h) in positions {
         place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, face);
     }
     redraw_layout(hwnd);
@@ -1689,7 +2163,8 @@ unsafe fn layout_settings(app: &mut App) {
         (212, margin, 286, inner - 106, 30),
         (206, width - margin - 88, 260, 88, 21),
         (213, width - margin - 88, 286, 88, 30),
-        (ID_AUTO, margin, 330, inner, 28),
+        (ID_AUTO, margin, 330, 178, 28),
+        (ID_SELECTION_MODE, margin + 190, 326, inner - 190, 156),
         (215, margin, 370, inner, 32),
         (ID_TEST, margin, 418, 112, 34),
         (ID_APPEARANCE, margin + 128, 418, 88, 34),
@@ -1744,9 +2219,7 @@ unsafe fn layout_result(app: &mut App) {
     redraw_layout(hwnd);
 }
 
-unsafe fn layout_chip(app: &mut App) {
-    InvalidateRect(app.chip, null(), 0);
-}
+unsafe fn layout_chip(_app: &mut App) {}
 
 unsafe fn redraw_layout(hwnd: HWND) {
     // One deferred paint for the complete layout; never force per-child redraws.

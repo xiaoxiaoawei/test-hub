@@ -18,13 +18,13 @@ use windows::{
             COINIT_MULTITHREADED,
         },
         UI::Accessibility::{
-            CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationTextPattern,
-            UIA_TextPatternId,
+            CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement,
+            IUIAutomationTextPattern, IUIAutomationTreeWalker, UIA_TextPatternId,
         },
     },
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, GlobalFree, SetLastError, HGLOBAL, HWND},
+    Foundation::{GetLastError, GlobalFree, SetLastError, HGLOBAL, HWND, POINT},
     System::{
         DataExchange::{
             CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
@@ -38,8 +38,10 @@ use windows_sys::Win32::{
             KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowThreadProcessId,
-            HWND_MESSAGE,
+            CreateWindowExW, DestroyWindow, GetAncestor, GetClassNameW, GetForegroundWindow,
+            GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageTimeoutW,
+            WindowFromPoint, ES_PASSWORD, GA_ROOT, GUITHREADINFO, GWL_STYLE, HWND_MESSAGE,
+            SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, WM_GETTEXT,
         },
     },
 };
@@ -54,34 +56,241 @@ pub struct CapturedText {
     pub source: &'static str,
 }
 
+#[derive(Debug)]
 enum UiaFailure {
     Protected,
+    Unverified,
     Unavailable(String),
 }
 
 /// Capture the current foreground selection. Automatic mouse selection must pass
 /// `false`; only a deliberate user hotkey is allowed to pass `true`.
 pub fn capture_selection(allow_clipboard_fallback: bool) -> Result<CapturedText, String> {
-    let foreground = unsafe { GetForegroundWindow() };
-    if foreground.is_null() {
-        return Err("没有可读取的前台窗口。".into());
+    capture(None, allow_clipboard_fallback)
+}
+
+/// Read a mouse selection without changing the clipboard. Hit testing matters
+/// for documents whose text selection does not move Windows keyboard focus.
+pub fn capture_selection_at(point: POINT) -> Result<CapturedText, String> {
+    capture(Some(point), false)
+}
+
+fn capture(point: Option<POINT>, allow_copy: bool) -> Result<CapturedText, String> {
+    let target = Target::foreground()?;
+    let point_window = point.map(|point| unsafe { WindowFromPoint(point) });
+    let focus_window = target.focus_window();
+    // A true EDIT selection is more direct and cheaper than COM, and also works
+    // when an old application does not expose a UIA TextPattern provider.
+    let native_first = if point.is_some() {
+        point_window
+    } else {
+        focus_window
+    };
+    if let Some(window) = native_first {
+        match native_edit_selection(&target, window) {
+            Ok(NativeSelection::Text(text)) => return target.finish(text, "原生文本选区"),
+            Ok(NativeSelection::Empty) => return Err(no_selection()),
+            Err(UiaFailure::Protected) => return Err(protected_message()),
+            Ok(NativeSelection::Unsupported)
+            | Err(UiaFailure::Unavailable(_))
+            | Err(UiaFailure::Unverified) => {}
+        }
     }
 
-    match capture_uia() {
-        Ok(text) => {
-            if unsafe { GetForegroundWindow() } != foreground {
-                return Err("前台窗口已改变，请重新选择文字。".into());
+    let uia = capture_uia(&target, point);
+    match uia {
+        Ok(text) => target.finish(text, "UI Automation"),
+        Err(UiaFailure::Protected) => Err(protected_message()),
+        Err(failure) => {
+            let (reason, allow_copy) = match failure {
+                UiaFailure::Unverified => (protected_message(), false),
+                UiaFailure::Unavailable(reason) => (reason, allow_copy),
+                UiaFailure::Protected => unreachable!("protected candidate handled above"),
+            };
+            // Focused native controls are a secondary source for a drag whose
+            // pointer ends outside the document. Never cross the foreground root.
+            if let Some(window) = focus_window {
+                if Some(window) != native_first {
+                    match native_edit_selection(&target, window) {
+                        Ok(NativeSelection::Text(text)) => {
+                            return target.finish(text, "原生文本选区")
+                        }
+                        Err(UiaFailure::Protected) => return Err(protected_message()),
+                        _ => {}
+                    }
+                }
             }
-            Ok(CapturedText {
-                text,
-                source: "UI Automation",
-            })
+            if allow_copy {
+                capture_by_copy(target.foreground)
+                    .map_err(|fallback| format!("{reason}\n{fallback}"))
+            } else {
+                Err(reason)
+            }
         }
-        Err(UiaFailure::Protected) => Err("不会读取密码字段或无法确认安全属性的控件。".into()),
-        Err(UiaFailure::Unavailable(reason)) if allow_clipboard_fallback => {
-            capture_by_copy(foreground).map_err(|fallback| format!("{reason}\n{fallback}"))
+    }
+}
+
+fn no_selection() -> String {
+    "未读取到选中文字，请重新选择。".into()
+}
+fn protected_message() -> String {
+    "不会读取密码字段或无法确认安全属性的文本控件。".into()
+}
+
+struct Target {
+    foreground: HWND,
+    root: HWND,
+    pid: u32,
+    thread: u32,
+}
+
+impl Target {
+    fn foreground() -> Result<Self, String> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.is_null() {
+            return Err("没有可读取的前台窗口。".into());
         }
-        Err(UiaFailure::Unavailable(reason)) => Err(reason),
+        let mut pid = 0;
+        let thread = unsafe { GetWindowThreadProcessId(foreground, &mut pid) };
+        let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+        if root.is_null() || pid == 0 || thread == 0 {
+            return Err("前台窗口已经失效。".into());
+        }
+        Ok(Self {
+            foreground,
+            root,
+            pid,
+            thread,
+        })
+    }
+
+    fn owns_window(&self, window: HWND) -> bool {
+        !window.is_null() && unsafe { GetAncestor(window, GA_ROOT) } == self.root
+    }
+
+    fn focus_window(&self) -> Option<HWND> {
+        let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        if unsafe { GetGUIThreadInfo(self.thread, &mut info) } != 0
+            && self.owns_window(info.hwndFocus)
+        {
+            Some(info.hwndFocus)
+        } else {
+            None
+        }
+    }
+
+    fn finish(&self, text: String, source: &'static str) -> Result<CapturedText, String> {
+        if unsafe { GetForegroundWindow() } != self.foreground {
+            return Err("前台窗口已改变，请重新选择文字。".into());
+        }
+        Ok(CapturedText { text, source })
+    }
+}
+
+const NATIVE_TIMEOUT_MS: u32 = 120;
+const EM_GETSEL_MESSAGE: u32 = 0x00B0;
+
+enum NativeSelection {
+    Unsupported,
+    Empty,
+    Text(String),
+}
+
+fn native_edit_selection(target: &Target, window: HWND) -> Result<NativeSelection, UiaFailure> {
+    if !target.owns_window(window) {
+        return Ok(NativeSelection::Unsupported);
+    }
+    let mut class = [0u16; 64];
+    let count = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+    let class = String::from_utf16_lossy(&class[..count.max(0) as usize]);
+    // RichEdit's WM_USER range messages do not marshal pointers across processes,
+    // and its paragraph offsets can differ from WM_GETTEXT. Keep it on UIA.
+    if !class.eq_ignore_ascii_case("edit") {
+        return Ok(NativeSelection::Unsupported);
+    }
+    if native_password(window)? {
+        return Err(UiaFailure::Protected);
+    }
+    let (start, end) = native_range(window)?;
+    if start == end {
+        return Ok(NativeSelection::Empty);
+    }
+    if end > MAX_SELECTION_UNITS || end < start {
+        return Err(UiaFailure::Unavailable(
+            "原生控件选区超出安全读取范围，请尝试快捷键。".into(),
+        ));
+    }
+    let mut text = vec![0u16; end + 1];
+    let read = native_message(window, WM_GETTEXT, text.len(), text.as_mut_ptr() as isize)?;
+    if native_password(window)? {
+        return Err(UiaFailure::Protected);
+    }
+    if !target.owns_window(window) || read < end || native_range(window)? != (start, end) {
+        return Err(UiaFailure::Unavailable(
+            "选区已变化，请重新选择文字。".into(),
+        ));
+    }
+    let selected = String::from_utf16(&text[start..end])
+        .map_err(|_| UiaFailure::Unavailable("选区含不完整的 Unicode 字符，请重新选择。".into()))?;
+    let selected = selected.trim().to_owned();
+    Ok(if selected.is_empty() {
+        NativeSelection::Empty
+    } else {
+        NativeSelection::Text(selected)
+    })
+}
+
+fn native_password(window: HWND) -> Result<bool, UiaFailure> {
+    unsafe { SetLastError(0) };
+    let style = unsafe { GetWindowLongPtrW(window, GWL_STYLE) };
+    if style == 0 && unsafe { GetLastError() } != 0 {
+        return Err(UiaFailure::Unverified);
+    }
+    Ok(style & ES_PASSWORD as isize != 0)
+}
+
+fn native_range(window: HWND) -> Result<(usize, usize), UiaFailure> {
+    let mut start = u32::MAX;
+    let mut end = u32::MAX;
+    native_message(
+        window,
+        EM_GETSEL_MESSAGE,
+        (&mut start as *mut u32) as usize,
+        (&mut end as *mut u32) as isize,
+    )?;
+    if start == u32::MAX || end == u32::MAX {
+        return Err(UiaFailure::Unavailable(
+            "此控件没有提供可读取的原生选区。".into(),
+        ));
+    }
+    Ok((start as usize, end as usize))
+}
+
+fn native_message(
+    window: HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> Result<usize, UiaFailure> {
+    let mut result = 0;
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            window,
+            message,
+            wparam,
+            lparam,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+            NATIVE_TIMEOUT_MS,
+            &mut result,
+        )
+    };
+    if sent == 0 {
+        Err(UiaFailure::Unavailable(
+            "目标程序暂时没有响应选区读取。".into(),
+        ))
+    } else {
+        Ok(result)
     }
 }
 
@@ -113,65 +322,161 @@ impl Drop for ComApartment {
     }
 }
 
-fn capture_uia() -> Result<String, UiaFailure> {
+const UIA_BUDGET: Duration = Duration::from_millis(900);
+const MAX_ANCESTORS: usize = 10;
+
+fn capture_uia(target: &Target, point: Option<POINT>) -> Result<String, UiaFailure> {
     let _apartment = ComApartment::initialize()?;
-    // Keep every COM object inside the apartment's lifetime. A provider may still
-    // misbehave; the caller must not wait on this thread from its UI thread.
+    // UIA timeouts bound individual provider transactions. They cannot make a
+    // misbehaving COM provider synchronously cancellable; the UI never waits here.
+    let deadline = Instant::now() + UIA_BUDGET;
     unsafe {
         let automation: IUIAutomation =
             CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
                 .or_else(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))
-                .map_err(|error| {
-                    UiaFailure::Unavailable(format!("此窗口暂时无法读取选区：{error}"))
-                })?;
+                .map_err(|_| UiaFailure::Unavailable("此窗口暂时无法读取选区。".into()))?;
         if let Ok(settings) = automation.cast::<IUIAutomation2>() {
-            let _ = settings.SetConnectionTimeout(1_000);
-            let _ = settings.SetTransactionTimeout(1_200);
+            let _ = settings.SetConnectionTimeout(400);
+            let _ = settings.SetTransactionTimeout(500);
         }
-        let mut element = automation.GetFocusedElement().map_err(|_| {
-            UiaFailure::Unavailable("无法定位选中文字，请手动复制后使用“翻译剪贴板”。".into())
-        })?;
-
-        // Failing closed here prevents a failed accessibility property read from
-        // silently falling through to simulated copy in a protected input.
-        match element.CurrentIsPassword() {
-            Ok(value) if !value.as_bool() => {}
-            _ => return Err(UiaFailure::Protected),
-        }
-
         let walker = automation.ControlViewWalker().ok();
-        for _ in 0..7 {
-            if element
-                .CurrentIsPassword()
-                .map(|value| value.as_bool())
-                .unwrap_or(true)
-            {
-                return Err(UiaFailure::Protected);
-            }
-            if let Ok(pattern) =
-                element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-            {
-                if let Some(selected) = selected_text(&pattern)? {
-                    return Ok(selected);
+        let mut unverified = false;
+        if let Some(point) = point {
+            if target.owns_window(WindowFromPoint(point)) && Instant::now() < deadline {
+                if let Ok(element) =
+                    automation.ElementFromPoint(windows::Win32::Foundation::POINT {
+                        x: point.x,
+                        y: point.y,
+                    })
+                {
+                    match candidate_text(target, element, walker.as_ref(), deadline) {
+                        Ok(Some(text)) => return Ok(text),
+                        Err(UiaFailure::Unverified) => unverified = true,
+                        Err(failure) => return Err(failure),
+                        Ok(None) => {}
+                    }
                 }
             }
-            let Some(walker) = &walker else { break };
-            let Ok(parent) = walker.GetParentElement(&element) else {
-                break;
-            };
-            // Do not climb into unrelated windows or read the desktop tree.
-            if parent.CurrentProcessId().ok() != element.CurrentProcessId().ok() {
-                break;
+        }
+        if Instant::now() < deadline {
+            if let Ok(element) = automation.GetFocusedElement() {
+                match candidate_text(target, element, walker.as_ref(), deadline) {
+                    Ok(Some(text)) => return Ok(text),
+                    Err(UiaFailure::Unverified) => unverified = true,
+                    Err(failure) => return Err(failure),
+                    Ok(None) => {}
+                }
             }
-            element = parent;
+        }
+        if unverified {
+            return Err(UiaFailure::Unverified);
         }
     }
     Err(UiaFailure::Unavailable(
-        "未读取到选中文字；此软件可能未提供文本选区接口。".into(),
+        "未读取到选中文字；请重新划选或使用快捷键。".into(),
     ))
 }
 
-unsafe fn selected_text(pattern: &IUIAutomationTextPattern) -> Result<Option<String>, UiaFailure> {
+unsafe fn candidate_text(
+    target: &Target,
+    first: IUIAutomationElement,
+    walker: Option<&IUIAutomationTreeWalker>,
+    deadline: Instant,
+) -> Result<Option<String>, UiaFailure> {
+    let chain = unsafe { scoped_chain(target, first, walker, deadline) };
+    let mut verified_leaf = false;
+    for element in chain {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match unsafe { element.CurrentIsPassword() } {
+            Ok(value) if value.as_bool() => return Err(UiaFailure::Protected),
+            Ok(_) => verified_leaf = true,
+            // An unknown first candidate is unsafe to read. After a known-safe
+            // leaf, skip an unsupported ancestor and try its next ancestor;
+            // never extract text from the unknown element itself.
+            Err(_) if verified_leaf => continue,
+            Err(_) => return Err(UiaFailure::Unverified),
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(pattern) =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }
+        {
+            if let Some(text) = unsafe { selected_text(&pattern, deadline)? } {
+                return Ok(Some(text));
+            }
+        }
+    }
+    Ok(None)
+}
+
+unsafe fn scoped_chain(
+    target: &Target,
+    first: IUIAutomationElement,
+    walker: Option<&IUIAutomationTreeWalker>,
+    deadline: Instant,
+) -> Vec<IUIAutomationElement> {
+    let initial_pid = unsafe { first.CurrentProcessId() }.ok().unwrap_or(0);
+    let mut scoped = false;
+    let mut chain = Vec::new();
+    let mut element = first;
+    for _ in 0..MAX_ANCESTORS {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let native = unsafe { element.CurrentNativeWindowHandle() }
+            .ok()
+            .map(|window| window.0);
+        if let Some(native) = native.filter(|window| !window.is_null()) {
+            if !target.owns_window(native) {
+                return Vec::new();
+            }
+            scoped = true;
+        }
+        let at_root = native == Some(target.root);
+        let pid = unsafe { element.CurrentProcessId() }.ok().unwrap_or(0);
+        chain.push((element.clone(), pid));
+        if at_root {
+            break;
+        }
+        let Some(walker) = walker else { break };
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(parent) = (unsafe { walker.GetParentElement(&element) }) else {
+            break;
+        };
+        // Hosted browsers can cross renderer/host PIDs within one foreground
+        // root. Native HWND ancestry is stronger evidence than PID equality.
+        element = parent;
+    }
+    // Some providers do not expose HWNDs. A same-process candidate returned by
+    // the foreground's hit test/focus is still useful, but never accept an
+    // unproven cross-process document or walk into another root window.
+    if scoped {
+        chain.into_iter().map(|(element, _)| element).collect()
+    } else if initial_pid == target.pid as i32 {
+        chain
+            .into_iter()
+            .take_while(|(_, pid)| *pid == target.pid as i32)
+            .map(|(element, _)| element)
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+unsafe fn selected_text(
+    pattern: &IUIAutomationTextPattern,
+    deadline: Instant,
+) -> Result<Option<String>, UiaFailure> {
+    if Instant::now() >= deadline {
+        return Err(UiaFailure::Unavailable(
+            "选区读取暂时超时，请重新划选。".into(),
+        ));
+    }
     let Ok(ranges) = (unsafe { pattern.GetSelection() }) else {
         return Ok(None);
     };
@@ -184,8 +489,18 @@ unsafe fn selected_text(pattern: &IUIAutomationTextPattern) -> Result<Option<Str
     let mut text = String::new();
     let mut units = 0;
     for index in 0..count.max(0) {
+        if Instant::now() >= deadline {
+            return Err(UiaFailure::Unavailable(
+                "选区读取暂时超时，请重新划选。".into(),
+            ));
+        }
         let range = unsafe { ranges.GetElement(index) }
             .map_err(|_| UiaFailure::Unavailable("选区已失效，请重新选择文字。".into()))?;
+        if Instant::now() >= deadline {
+            return Err(UiaFailure::Unavailable(
+                "选区读取暂时超时，请重新划选。".into(),
+            ));
+        }
         let selected = unsafe { range.GetText((MAX_SELECTION_UNITS + 1) as i32) }
             .map_err(|_| UiaFailure::Unavailable("无法读取这段选区，请尝试手动复制。".into()))?;
         let selected = selected.to_string();
@@ -496,7 +811,143 @@ fn capture_by_copy(foreground: HWND) -> Result<CapturedText, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_unicode;
+    use super::{
+        decode_unicode, native_edit_selection, NativeSelection, Target, UiaFailure,
+        MAX_SELECTION_UNITS,
+    };
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetAncestor, GetWindowThreadProcessId, SendMessageW,
+            ES_MULTILINE, ES_PASSWORD, GA_ROOT, WM_SETTEXT, WS_CHILD,
+        },
+    };
+
+    struct TestWindow(HWND);
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+
+    fn edit(text: &str, password: bool) -> (TestWindow, HWND, Target) {
+        let root_class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let edit_class: Vec<u16> = "EDIT\0".encode_utf16().collect();
+        let root = unsafe {
+            CreateWindowExW(
+                0,
+                root_class.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                100,
+                100,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        assert!(!root.is_null());
+        let guard = TestWindow(root);
+        let child = unsafe {
+            CreateWindowExW(
+                0,
+                edit_class.as_ptr(),
+                ptr::null(),
+                WS_CHILD
+                    | if password {
+                        ES_PASSWORD as u32
+                    } else {
+                        ES_MULTILINE as u32
+                    },
+                0,
+                0,
+                100,
+                100,
+                root,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        assert!(!child.is_null());
+        let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        assert_ne!(
+            unsafe { SendMessageW(child, WM_SETTEXT, 0, wide.as_ptr() as isize) },
+            0
+        );
+        let mut pid = 0;
+        let thread = unsafe { GetWindowThreadProcessId(root, &mut pid) };
+        let target = Target {
+            foreground: root,
+            root: unsafe { GetAncestor(root, GA_ROOT) },
+            pid,
+            thread,
+        };
+        (guard, child, target)
+    }
+
+    fn select(window: HWND, start: usize, end: usize) {
+        unsafe {
+            SendMessageW(window, 0x00B1, start, end as isize);
+        }
+    }
+
+    #[test]
+    fn native_edit_reads_only_the_selected_utf16_range() {
+        let prefix = "unselected prefix ";
+        let selected = "Hello 世界 🦀";
+        let (_root, window, target) = edit(&format!("{prefix}{selected} unselected suffix"), false);
+        let start = prefix.encode_utf16().count();
+        select(window, start, start + selected.encode_utf16().count());
+        match native_edit_selection(&target, window).unwrap() {
+            NativeSelection::Text(actual) => assert_eq!(actual, selected),
+            _ => panic!("the actual native selection was not read"),
+        }
+    }
+
+    #[test]
+    fn native_edit_empty_selection_and_password_are_not_read_as_text() {
+        let (_root, window, target) = edit("A harmless test sentence", false);
+        select(window, 5, 5);
+        assert!(matches!(
+            native_edit_selection(&target, window),
+            Ok(NativeSelection::Empty)
+        ));
+        let (_protected, password, target) = edit("not-a-real-password", true);
+        select(password, 0, 5);
+        assert!(matches!(
+            native_edit_selection(&target, password),
+            Err(UiaFailure::Protected)
+        ));
+    }
+
+    #[test]
+    fn native_edit_rejects_other_windows_and_unbounded_document_prefixes() {
+        let (_first, first, first_target) = edit("first window", false);
+        let (_second, second, _) = edit("second window", false);
+        select(second, 0, 6);
+        assert!(matches!(
+            native_edit_selection(&first_target, second),
+            Ok(NativeSelection::Unsupported)
+        ));
+        select(first, 0, 5);
+        assert!(matches!(
+            native_edit_selection(&first_target, first),
+            Ok(NativeSelection::Text(_))
+        ));
+        let (_large, large, target) = edit(&"x".repeat(MAX_SELECTION_UNITS + 10), false);
+        select(large, MAX_SELECTION_UNITS + 1, MAX_SELECTION_UNITS + 5);
+        assert!(matches!(
+            native_edit_selection(&target, large),
+            Err(UiaFailure::Unavailable(_))
+        ));
+    }
 
     #[test]
     fn clipboard_decode_preserves_unicode_and_lines() {

@@ -1,5 +1,6 @@
-//! Lightweight mouse observation. The hook only posts notifications; selection
-//! capture and HTTP requests must stay on the application's worker thread.
+//! Lightweight mouse observation. Every completed external left click is only a
+//! candidate; the controller checks actual selection and deduplicates its text.
+//! No UI Automation, clipboard read, or HTTP work happens inside the hook.
 
 use std::{
     cell::RefCell,
@@ -8,15 +9,12 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HINSTANCE, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{GetLastError, HINSTANCE, LPARAM, LRESULT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentProcessId},
-    UI::{
-        Input::KeyboardAndMouse::GetDoubleClickTime,
-        WindowsAndMessaging::{
-            CallNextHookEx, GetSystemMetrics, GetWindowThreadProcessId, PostMessageW,
-            SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, HHOOK, MSLLHOOKSTRUCT,
-            SM_CXDOUBLECLK, SM_CYDOUBLECLK, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        },
+    UI::WindowsAndMessaging::{
+        CallNextHookEx, GetAncestor, GetWindowThreadProcessId, PostMessageW, SetWindowsHookExW,
+        UnhookWindowsHookEx, WindowFromPoint, GA_ROOTOWNER, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL,
+        WM_LBUTTONDOWN, WM_LBUTTONUP,
     },
 };
 
@@ -25,8 +23,32 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 struct HookContext {
     target: isize,
     message: u32,
-    pressed_at: Option<POINT>,
-    last_click: Option<(POINT, u32)>,
+    external_press: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Notice {
+    Cancel,
+    Candidate,
+}
+
+impl HookContext {
+    fn observe(&mut self, own_window: bool, down: bool) -> Option<Notice> {
+        if own_window {
+            self.external_press = false;
+            return None;
+        }
+        if down {
+            self.external_press = true;
+            return Some(Notice::Cancel);
+        }
+        // Do not depend on a 4px distance or a double-click timeout. Those
+        // thresholds dropped tiny drags, triple clicks and Shift+click ranges.
+        // A matching down prevents dragging our own popup into a source app from
+        // being treated as a new text selection.
+        let pressed = std::mem::take(&mut self.external_press);
+        pressed.then_some(Notice::Candidate)
+    }
 }
 
 thread_local! {
@@ -55,8 +77,7 @@ pub fn install(target_window: isize, message: u32) -> Result<MouseHook, String> 
         *context.borrow_mut() = Some(HookContext {
             target: target_window,
             message,
-            pressed_at: None,
-            last_click: None,
+            external_press: false,
         });
     });
     Ok(MouseHook(hook))
@@ -66,8 +87,7 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
     CONTEXT.with(|context| {
         if let Some(context) = context.borrow_mut().as_mut() {
-            context.pressed_at = None;
-            context.last_click = None;
+            context.external_press = false;
         }
     });
 }
@@ -87,61 +107,67 @@ unsafe extern "system" fn mouse_callback(code: i32, message: WPARAM, data: LPARA
     {
         return unsafe { CallNextHookEx(ptr::null_mut(), code, message, data) };
     }
-    // Windows owns this structure for the duration of the hook callback.
     let mouse = unsafe { &*(data as *const MSLLHOOKSTRUCT) };
-    let mut position_pid = 0;
-    let position_window = unsafe { WindowFromPoint(mouse.pt) };
-    unsafe { GetWindowThreadProcessId(position_window, &mut position_pid) };
-    let own_window = position_pid != 0 && position_pid == unsafe { GetCurrentProcessId() };
-
+    let window = unsafe { WindowFromPoint(mouse.pt) };
+    let owner = unsafe { GetAncestor(window, GA_ROOTOWNER) };
+    let own_pid = unsafe { GetCurrentProcessId() };
+    let mut window_pid = 0;
+    let mut owner_pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(window, &mut window_pid);
+        GetWindowThreadProcessId(owner, &mut owner_pid);
+    }
+    let own_window = window_pid == own_pid || owner_pid == own_pid;
     let notification = CONTEXT.with(|context| {
-        // Never unwind across a Windows hook if a nested callback is delivered.
         let Ok(mut context) = context.try_borrow_mut() else {
             return None;
         };
         let context = context.as_mut()?;
-        if own_window {
-            context.pressed_at = None;
-            context.last_click = None;
-            return None;
-        }
-        if message as u32 == WM_LBUTTONDOWN {
-            context.pressed_at = Some(mouse.pt);
-            // Invalidate the previous selection immediately, even if this click
-            // never becomes a drag. MIN cannot be a real screen coordinate.
-            return Some((context.target, context.message, 0, isize::MIN));
-        }
-        let pressed = context.pressed_at.take()?;
-        let dragged = distance(pressed.x, mouse.pt.x) >= 4 || distance(pressed.y, mouse.pt.y) >= 4;
-        let double_click = context
-            .last_click
-            .map(|(previous, previous_time)| {
-                let tolerance_x = (unsafe { GetSystemMetrics(SM_CXDOUBLECLK) } / 2).max(2) as i64;
-                let tolerance_y = (unsafe { GetSystemMetrics(SM_CYDOUBLECLK) } / 2).max(2) as i64;
-                mouse.time.wrapping_sub(previous_time) <= unsafe { GetDoubleClickTime() }
-                    && distance(previous.x, mouse.pt.x) <= tolerance_x
-                    && distance(previous.y, mouse.pt.y) <= tolerance_y
-            })
-            .unwrap_or(false);
-        if dragged || double_click {
-            context.last_click = None;
-            Some((
-                context.target,
-                context.message,
-                mouse.pt.x as usize,
-                mouse.pt.y as isize,
-            ))
-        } else {
-            context.last_click = Some((mouse.pt, mouse.time));
-            None
-        }
+        context
+            .observe(own_window, message as u32 == WM_LBUTTONDOWN)
+            .map(|notice| (context.target, context.message, notice))
     });
-    if let Some((target, notification, x, y)) = notification {
+    if let Some((target, notification, notice)) = notification {
+        let (x, y) = match notice {
+            Notice::Cancel => (0, isize::MIN),
+            Notice::Candidate => (mouse.pt.x as usize, mouse.pt.y as isize),
+        };
         unsafe { PostMessageW(target as _, notification, x, y) };
     }
     unsafe { CallNextHookEx(ptr::null_mut(), code, message, data) }
 }
 
-fn distance(a: i32, b: i32) -> i64 {
-    (i64::from(a) - i64::from(b)).abs()
+#[cfg(test)]
+mod tests {
+    use super::{HookContext, Notice};
+
+    fn context() -> HookContext {
+        HookContext {
+            target: 1,
+            message: 2,
+            external_press: false,
+        }
+    }
+
+    #[test]
+    fn short_drags_shift_clicks_and_all_three_click_releases_are_candidates() {
+        let mut hook = context();
+        // The selection provider, not cursor distance, decides whether these
+        // releases really contain text. This also preserves all three clicks.
+        for _ in 0..3 {
+            assert_eq!(hook.observe(false, true), Some(Notice::Cancel));
+            assert_eq!(hook.observe(false, false), Some(Notice::Candidate));
+        }
+        assert_eq!(hook.observe(false, false), None);
+    }
+
+    #[test]
+    fn app_clicks_and_drags_from_app_to_source_never_create_candidates() {
+        let mut hook = context();
+        assert_eq!(hook.observe(true, true), None);
+        assert_eq!(hook.observe(false, false), None);
+        assert_eq!(hook.observe(false, true), Some(Notice::Cancel));
+        assert_eq!(hook.observe(true, false), None);
+        assert_eq!(hook.observe(false, false), None);
+    }
 }

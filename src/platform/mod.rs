@@ -1,4 +1,5 @@
 pub mod app;
+mod clipboard_copy;
 mod icons;
 pub mod mouse;
 mod picker;

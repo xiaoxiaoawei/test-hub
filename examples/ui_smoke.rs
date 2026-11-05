@@ -53,6 +53,7 @@ mod windows {
     const ICON_APPLY: i32 = 232;
     const ICON_RESET: i32 = 233;
     const SELECTION_MODE: i32 = 216;
+    const COMPATIBILITY_CAPTURE: i32 = 217;
     const ICON_SHAPE: i32 = 236;
     const ICON_SIZE: i32 = 237;
     const SCREEN_COLOR: i32 = 238;
@@ -256,10 +257,20 @@ mod windows {
         // unrelated field, including provider, timeout and selection preference.
         require_visible(settings, APPEARANCE)?;
         require_visible(settings, SELECTION_MODE)?;
+        require_visible(settings, COMPATIBILITY_CAPTURE)?;
         require_combo(settings, SELECTION_MODE, 0)?;
         select_combo(settings, SELECTION_MODE, 1)?;
         click(settings, SAVE)?;
-        let baseline = saved_settings(owned)?;
+        let mut baseline = saved_settings(owned)?;
+        if baseline
+            .get("compatibility_capture")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        {
+            return Err(
+                "Compatibility capture must remain disabled until explicitly chosen.".into(),
+            );
+        }
         if baseline
             .get("selection_mode")
             .and_then(serde_json::Value::as_str)
@@ -267,6 +278,19 @@ mod windows {
         {
             return Err(
                 "Saving direct selection mode did not persist selection_mode=direct.".into(),
+            );
+        }
+        // Drive the owner-drawn checkbox through its real command path. Provider
+        // presets must preserve this choice, as must the appearance saves below.
+        click(settings, COMPATIBILITY_CAPTURE)?;
+        select_provider(settings, 0)?;
+        select_provider(settings, 1)?;
+        click(settings, SAVE)?;
+        let enabled = saved_settings(owned)?;
+        baseline["compatibility_capture"] = serde_json::Value::Bool(true);
+        if enabled != baseline {
+            return Err(
+                "Enabling compatibility capture did not preserve the other settings.".into(),
             );
         }
         let appearance = open_appearance(owned, settings)?;
@@ -315,6 +339,17 @@ mod windows {
         require_text(settings, 210, "https://api.openai.com/v1")?;
         require_text(settings, 212, "gpt-4o-mini")?;
         require_combo(settings, SELECTION_MODE, 1)?;
+        // A second click must disable the choice restored from disk. Checking
+        // the whole document also protects mode, provider and saved icon values.
+        click(settings, COMPATIBILITY_CAPTURE)?;
+        click(settings, SAVE)?;
+        let disabled = saved_settings(owned)?;
+        let mut expected = letter.clone();
+        expected["compatibility_capture"] = serde_json::Value::Bool(false);
+        if disabled != expected {
+            return Err("Restart did not restore the compatibility checkbox or toggling it changed unrelated settings.".into());
+        }
+        baseline["compatibility_capture"] = serde_json::Value::Bool(false);
         let appearance = open_appearance(owned, settings)?;
         require_combo(appearance, ICON_STYLE, 2)?;
         require_combo(appearance, ICON_SHAPE, 2)?;
@@ -337,7 +372,7 @@ mod windows {
         {
             return Err("Saving click selection mode did not persist selection_mode=click.".into());
         }
-        println!("Selection modes, icon styles/shapes, size limits, persistence, restart and default reset passed.");
+        println!("Selection modes, compatibility capture, icon styles/shapes, size limits, persistence, restart and default reset passed.");
         Ok(())
     }
 

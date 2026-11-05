@@ -2,9 +2,45 @@
 //! calls so the selection boundaries can be tested without a browser or COM.
 
 pub(super) const MAX_DEPTH: usize = 8;
-pub(super) const MAX_SIBLINGS: usize = 24;
+pub(super) const MAX_SIBLINGS: usize = 96;
 const MAX_UNKNOWN_BOUNDS: usize = 2;
 const HIT_SLOP: i64 = 12;
+
+pub(super) fn native_document_class(root: &str, hit: &str) -> bool {
+    (root.starts_with("Chrome_WidgetWin_") && hit == "Chrome_RenderWidgetHostHWND")
+        || (root == "MozillaWindowClass" && hit == "MozillaContentWindowClass")
+        || (root == "SUMATRA_PDF_FRAME" && hit == "SUMATRA_PDF_CANVAS")
+}
+
+pub(super) fn should_request_pattern(
+    text: Option<bool>,
+    text2: Option<bool>,
+    text_candidate: bool,
+) -> bool {
+    text_candidate || text != Some(false) || text2 != Some(false)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NativeScope {
+    None,
+    Foreground,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AncestorStep {
+    Continue,
+    StopBefore,
+    StopAfter,
+}
+
+pub(super) fn ancestor_step(native: NativeScope, foreground_window: bool) -> AncestorStep {
+    match native {
+        NativeScope::Other => AncestorStep::StopBefore,
+        NativeScope::Foreground if foreground_window => AncestorStep::StopAfter,
+        NativeScope::None | NativeScope::Foreground => AncestorStep::Continue,
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Bounds {
@@ -119,11 +155,16 @@ pub(super) fn priority(
 pub(super) struct Budget {
     nodes: usize,
     patterns: usize,
+    scans: usize,
 }
 
 impl Budget {
     pub fn new(nodes: usize, patterns: usize) -> Self {
-        Self { nodes, patterns }
+        Self {
+            nodes,
+            patterns,
+            scans: nodes.saturating_mul(4).min(256),
+        }
     }
 
     pub fn node(&mut self) -> bool {
@@ -134,8 +175,12 @@ impl Budget {
         take(&mut self.patterns)
     }
 
+    pub fn scan(&mut self) -> bool {
+        take(&mut self.scans)
+    }
+
     pub fn has_nodes(&self) -> bool {
-        self.nodes > 0
+        self.nodes > 0 && self.scans > 0
     }
 }
 
@@ -311,5 +356,82 @@ mod tests {
             None
         );
         assert_eq!(gesture.intersects_rectangles(&[1.0]), None);
+    }
+
+    #[test]
+    fn cached_false_does_not_suppress_first_document_or_text_pattern_request() {
+        assert!(should_request_pattern(Some(false), Some(false), true));
+        assert!(!should_request_pattern(Some(false), Some(false), false));
+        assert!(should_request_pattern(None, Some(false), false));
+        assert!(should_request_pattern(Some(false), Some(true), false));
+    }
+
+    #[test]
+    fn native_host_proof_keeps_the_text_ancestor_path_open_until_the_actual_window() {
+        assert_eq!(
+            ancestor_step(NativeScope::Foreground, false),
+            AncestorStep::Continue
+        );
+        assert_eq!(
+            ancestor_step(NativeScope::None, false),
+            AncestorStep::Continue
+        );
+        assert_eq!(
+            ancestor_step(NativeScope::Foreground, true),
+            AncestorStep::StopAfter
+        );
+        assert_eq!(
+            ancestor_step(NativeScope::Other, false),
+            AncestorStep::StopBefore
+        );
+    }
+
+    #[test]
+    fn pruned_toolbar_or_offscreen_siblings_do_not_spend_the_document_node_budget() {
+        let mut budget = Budget::new(32, 8);
+        // More than the old 24-sibling limit may precede the actual page.
+        for _ in 0..40 {
+            assert!(budget.scan());
+        }
+        assert!(budget.has_nodes());
+        for _ in 0..32 {
+            assert!(budget.node());
+        }
+        assert!(!budget.node());
+        assert!(!budget.has_nodes());
+        let mut scans = Budget::new(32, 8);
+        for _ in 0..128 {
+            assert!(scans.scan());
+        }
+        assert!(!scans.scan());
+    }
+
+    #[test]
+    fn compatibility_copy_requires_a_real_document_native_class_not_browser_chrome() {
+        assert!(native_document_class(
+            "Chrome_WidgetWin_1",
+            "Chrome_RenderWidgetHostHWND"
+        ));
+        assert!(native_document_class(
+            "MozillaWindowClass",
+            "MozillaContentWindowClass"
+        ));
+        assert!(native_document_class(
+            "SUMATRA_PDF_FRAME",
+            "SUMATRA_PDF_CANVAS"
+        ));
+        for class in [
+            "Chrome_WidgetWin_1",
+            "ToolbarWindow32",
+            "EDIT",
+            "RichEdit20W",
+            "Button",
+        ] {
+            assert!(!native_document_class("Chrome_WidgetWin_1", class));
+        }
+        assert!(!native_document_class(
+            "unrelated_application",
+            "Chrome_RenderWidgetHostHWND"
+        ));
     }
 }

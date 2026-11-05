@@ -1,8 +1,8 @@
 //! Selection capture runs on a worker thread, never in a hook or window procedure.
 //!
-//! UI Automation is read-only. The opt-in copy fallback deliberately refuses rich
-//! clipboards: losing HTML, images, or delayed-rendered data is worse than asking
-//! the user to copy explicitly and use “Translate clipboard”.
+//! UI Automation is read-only. Explicit copy fallback uses a shared clipboard
+//! backend that eagerly snapshots supported formats and refuses incomplete
+//! backups before sending any input.
 
 use std::{
     cell::RefCell,
@@ -30,8 +30,8 @@ use windows::{
             UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
             UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
             UIA_IsTextPattern2AvailablePropertyId, UIA_IsTextPatternAvailablePropertyId,
-            UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_TextPattern2Id,
-            UIA_TextPatternId,
+            UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_TextControlTypeId,
+            UIA_TextPattern2Id, UIA_TextPatternId, UIA_WindowControlTypeId,
         },
     },
 };
@@ -42,25 +42,19 @@ mod probe;
 #[path = "selection/provider_tests.rs"]
 mod provider_tests;
 use windows_sys::Win32::{
-    Foundation::{GetLastError, GlobalFree, SetLastError, HGLOBAL, HWND, POINT},
+    Foundation::{GetLastError, SetLastError, HWND, POINT, RECT},
+    Graphics::Gdi::ClientToScreen,
     System::{
         DataExchange::{
-            CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
-            GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard, SetClipboardData,
+            CloseClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
         },
-        Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
     },
-    UI::{
-        Input::KeyboardAndMouse::{
-            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-            KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
-        },
-        WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, GetAncestor, GetClassNameW, GetForegroundWindow,
-            GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId, IsChild,
-            SendMessageTimeoutW, WindowFromPoint, ES_PASSWORD, GA_ROOT, GUITHREADINFO, GWL_STYLE,
-            HWND_MESSAGE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, WM_GETTEXT,
-        },
+    UI::WindowsAndMessaging::{
+        GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
+        GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId, IsChild,
+        SendMessageTimeoutW, WindowFromPoint, ES_PASSWORD, GA_ROOT, GUITHREADINFO, GWL_STYLE,
+        SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, WM_GETTEXT,
     },
 };
 
@@ -102,6 +96,86 @@ pub fn capture_selection_for_gesture(
     point: POINT,
 ) -> Result<CapturedText, String> {
     capture(Some(point), origin, false)
+}
+
+/// Eligibility only; this never copies, reads selected text, or changes focus.
+/// The caller must separately require the user's compatibility setting, a real
+/// selection gesture, and an unchanged foreground/clipboard before simulating C.
+pub fn can_copy_gesture(origin: Option<POINT>, point: POINT) -> bool {
+    let Ok(target) = Target::foreground() else {
+        return false;
+    };
+    let Some(anchor) = source_hit_point(&target, Some(point), origin) else {
+        return false;
+    };
+    let root_class = native_class(target.root);
+    if !browser_window(target.root)
+        && !matches!(
+            root_class.as_str(),
+            "SUMATRA_PDF_FRAME" | "AcrobatSDIWindow"
+        )
+    {
+        return false;
+    }
+    // A PDF drag must not copy a toolbar EDIT's retained selection. Ignore an
+    // unrelated release over our nonactivating popup; its source origin remains.
+    for hit in [Some(point), origin]
+        .into_iter()
+        .flatten()
+        .map(|point| unsafe { WindowFromPoint(point) })
+    {
+        if target.owns_window(hit) && native_edit_class(&native_class(hit)) {
+            return false;
+        }
+    }
+    let hit = unsafe { WindowFromPoint(anchor) };
+    let native_content = probe::native_document_class(&root_class, &native_class(hit));
+    let eligible = with_uia(|session| unsafe {
+        let deadline = Instant::now() + Duration::from_millis(220);
+        let element = session
+            .automation
+            .ElementFromPointBuildCache(
+                windows::Win32::Foundation::POINT {
+                    x: anchor.x,
+                    y: anchor.y,
+                },
+                &session.cache,
+            )
+            .map_err(uia_setup_error)?;
+        let chain = scoped_chain(
+            &target,
+            UiaNode::cached(element),
+            session,
+            &session.raw,
+            deadline,
+        );
+        let Some(leaf) = chain.first() else {
+            return Ok(false);
+        };
+        match leaf.element.CurrentIsPassword() {
+            Ok(value) if value.as_bool() => return Err(UiaFailure::Protected),
+            Ok(_) if leaf.password == Some(false) => {}
+            _ => return Err(UiaFailure::Unverified),
+        }
+        if chain
+            .iter()
+            .any(|node| node.metadata.edit || node.password == Some(true))
+        {
+            return Ok(false);
+        }
+        let document = chain.iter().any(|node| {
+            node.metadata.document
+                && node.password == Some(false)
+                && probe::priority(node.metadata, Some((anchor.x, anchor.y)), 0, 0).is_some()
+        });
+        Ok(native_content || document)
+    });
+    let eligible = match eligible {
+        Ok(eligible) => eligible,
+        Err(UiaFailure::Unavailable(_)) => native_content,
+        Err(UiaFailure::Protected | UiaFailure::Unverified) => false,
+    };
+    eligible && unsafe { GetForegroundWindow() } == target.foreground
 }
 
 fn capture(
@@ -439,6 +513,9 @@ impl UiaSession {
             cache
                 .SetTreeScope(TreeScope_Element)
                 .map_err(uia_setup_error)?;
+            cache
+                .SetTreeFilter(&automation.RawViewCondition().map_err(uia_setup_error)?)
+                .map_err(uia_setup_error)?;
             // One provider transaction returns the geometry and safety metadata.
             // No Name, Value, DocumentRange or document text is cached.
             for property in [
@@ -490,6 +567,8 @@ struct UiaNode {
     password: Option<bool>,
     text_available: Option<bool>,
     text2_available: Option<bool>,
+    text_candidate: bool,
+    window: bool,
     metadata: probe::Metadata,
 }
 
@@ -521,7 +600,11 @@ impl ProbeFailures {
 
 impl UiaNode {
     fn may_have_text(&self) -> bool {
-        self.text_available != Some(false) || self.text2_available != Some(false)
+        probe::should_request_pattern(
+            self.text_available,
+            self.text2_available,
+            self.text_candidate,
+        )
     }
 
     unsafe fn cached(element: IUIAutomationElement) -> Self {
@@ -546,6 +629,15 @@ impl UiaNode {
                 password: element.CachedIsPassword().ok().map(|value| value.as_bool()),
                 text_available: cached_bool(&element, UIA_IsTextPatternAvailablePropertyId),
                 text2_available: cached_bool(&element, UIA_IsTextPattern2AvailablePropertyId),
+                text_candidate: kind.is_some_and(|kind| {
+                    [
+                        UIA_DocumentControlTypeId,
+                        UIA_EditControlTypeId,
+                        UIA_TextControlTypeId,
+                    ]
+                    .contains(&kind)
+                }),
+                window: kind == Some(UIA_WindowControlTypeId),
                 metadata: probe::Metadata {
                     bounds,
                     offscreen: element
@@ -580,41 +672,131 @@ pub fn warm_selection_provider(foreground: isize) {
     }
     let _ = with_uia(|session| unsafe {
         let deadline = Instant::now() + Duration::from_millis(350);
-        let element = session
-            .automation
-            .ElementFromHandleBuildCache(
-                windows::Win32::Foundation::HWND(target.root),
+        // Foreground activation often happens while the cursor is on a taskbar
+        // or toolbar. Hit the browser client centre first, then its cursor hit;
+        // avoid spending the whole warm budget enumerating browser chrome.
+        for point in browser_probe_points(target.root) {
+            if Instant::now() >= deadline || GetForegroundWindow() != target.foreground {
+                break;
+            }
+            if !target.owns_window(WindowFromPoint(point)) {
+                continue;
+            }
+            let Ok(element) = session.automation.ElementFromPointBuildCache(
+                windows::Win32::Foundation::POINT {
+                    x: point.x,
+                    y: point.y,
+                },
                 &session.cache,
-            )
-            .map_err(uia_setup_error)?;
-        let root = UiaNode::cached(element);
-        if root.native != target.root {
-            return Ok(());
+            ) else {
+                continue;
+            };
+            let first = UiaNode::cached(element);
+            let chain = scoped_chain(
+                &target,
+                first,
+                session,
+                &session.raw,
+                (Instant::now() + Duration::from_millis(100)).min(deadline),
+            );
+            for node in &chain {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                if node.metadata.document
+                    && node.password == Some(false)
+                    && text_pattern(node, true).is_some()
+                {
+                    // Only request the pattern; never read selection or text.
+                    return Ok(());
+                }
+            }
+            if let Some(scope) = subtree_scope(&chain) {
+                search_subtree(
+                    &target,
+                    session,
+                    &session.raw,
+                    scope,
+                    SearchOptions {
+                        point: Some(point),
+                        deadline: (Instant::now() + Duration::from_millis(120)).min(deadline),
+                        read_text: false,
+                        gesture: None,
+                    },
+                    &mut probe::Budget::new(32, 6),
+                )?;
+            }
         }
-        // Requesting TextPattern activates inline-text accessibility in Chromium;
-        // merely looking at the browser shell does not. Do not call GetSelection.
-        search_subtree(
-            &target,
-            session,
-            &session.raw,
-            root,
-            SearchOptions {
-                point: None,
-                deadline,
-                read_text: false,
-                gesture: None,
-            },
-            &mut probe::Budget::new(24, 6),
-        )?;
+        // The fallback stays inside this foreground HWND. Control view omits
+        // many toolbar implementation nodes; the cache itself includes Raw view.
+        if Instant::now() < deadline {
+            let element = session
+                .automation
+                .ElementFromHandleBuildCache(
+                    windows::Win32::Foundation::HWND(target.root),
+                    &session.cache,
+                )
+                .map_err(uia_setup_error)?;
+            let root = UiaNode::cached(element);
+            if root.native == target.root {
+                search_subtree(
+                    &target,
+                    session,
+                    &session.control,
+                    root,
+                    SearchOptions {
+                        point: None,
+                        deadline,
+                        read_text: false,
+                        gesture: None,
+                    },
+                    &mut probe::Budget::new(32, 6),
+                )?;
+            }
+        }
         Ok(())
     });
 }
 
+fn browser_probe_points(window: HWND) -> Vec<POINT> {
+    let mut points = Vec::with_capacity(2);
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetClientRect(window, &mut rect) } != 0
+        && rect.right > rect.left
+        && rect.bottom > rect.top
+    {
+        let mut centre = POINT {
+            x: rect.left + (rect.right - rect.left) / 2,
+            y: rect.top + (rect.bottom - rect.top) / 2,
+        };
+        if unsafe { ClientToScreen(window, &mut centre) } != 0 {
+            points.push(centre);
+        }
+    }
+    let mut cursor = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut cursor) } != 0
+        && !points
+            .iter()
+            .any(|point| point.x == cursor.x && point.y == cursor.y)
+    {
+        points.push(cursor);
+    }
+    points
+}
+
 fn browser_window(window: HWND) -> bool {
+    let class = native_class(window);
+    class.starts_with("Chrome_WidgetWin_") || class == "MozillaWindowClass"
+}
+
+fn native_edit_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("edit") || class.to_ascii_lowercase().starts_with("richedit")
+}
+
+fn native_class(window: HWND) -> String {
     let mut class = [0u16; 64];
     let count = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
-    let class = String::from_utf16_lossy(&class[..count.max(0) as usize]);
-    class.starts_with("Chrome_WidgetWin_") || class == "MozillaWindowClass"
+    String::from_utf16_lossy(&class[..count.max(0) as usize])
 }
 
 fn capture_uia(
@@ -643,6 +825,18 @@ fn capture_uia(
                     &session.cache,
                 ) {
                     let first = UiaNode::cached(element);
+                    // A directly verified document/text hit should get its
+                    // first pattern request before walking provider ancestry.
+                    if !first.native.is_null() && target.owns_window(first.native) {
+                        if let Some(text) = failures.observe(chain_text(
+                            std::slice::from_ref(&first),
+                            Some(point),
+                            gesture,
+                            (Instant::now() + Duration::from_millis(120)).min(deadline),
+                        ))? {
+                            return Ok(text);
+                        }
+                    }
                     let mut chain = scoped_chain(
                         target,
                         first.clone(),
@@ -837,20 +1031,32 @@ unsafe fn scoped_chain(
 ) -> Vec<UiaNode> {
     let initial_pid = first.pid;
     let mut chain = Vec::new();
+    let mut scoped = false;
     let mut node = first;
     for _ in 0..MAX_ANCESTORS {
         if Instant::now() >= deadline {
             break;
         }
-        if !node.native.is_null() && !target.owns_window(node.native) {
-            return Vec::new();
+        let native_scope = if node.native.is_null() {
+            probe::NativeScope::None
+        } else if target.owns_window(node.native) {
+            probe::NativeScope::Foreground
+        } else {
+            probe::NativeScope::Other
+        };
+        let step = probe::ancestor_step(native_scope, node.window && node.native == target.root);
+        if step == probe::AncestorStep::StopBefore {
+            if !scoped {
+                return Vec::new();
+            }
+            break;
         }
-        let proven = !node.native.is_null();
+        scoped |= native_scope == probe::NativeScope::Foreground;
         chain.push(node.clone());
-        // A native child HWND already proves the foreground root. Walking on to
-        // the entire browser shell costs time needed by an embedded document.
-        if proven {
-            return chain;
+        // A child HWND proves ownership, but its UIA parent can still be the
+        // TextPattern document. Stop at the actual foreground Window element.
+        if step == probe::AncestorStep::StopAfter {
+            break;
         }
         let Ok(parent) =
             (unsafe { walker.GetParentElementBuildCache(&node.element, &session.cache) })
@@ -859,7 +1065,9 @@ unsafe fn scoped_chain(
         };
         node = unsafe { UiaNode::cached(parent) };
     }
-    if initial_pid == target.pid as i32 {
+    if scoped {
+        chain
+    } else if initial_pid == target.pid as i32 {
         chain
             .into_iter()
             .take_while(|node| node.pid == target.pid as i32)
@@ -974,7 +1182,7 @@ unsafe fn search_subtree(
         let mut child =
             unsafe { walker.GetFirstChildElementBuildCache(&node.element, &session.cache) }.ok();
         for _ in 0..probe::MAX_SIBLINGS {
-            if Instant::now() >= deadline || !budget.node() {
+            if Instant::now() >= deadline || !budget.scan() {
                 break;
             }
             let Some(element) = child else { break };
@@ -985,12 +1193,14 @@ unsafe fn search_subtree(
                 current.depth + 1,
                 current.unknown_bounds,
             ) {
-                pending.push(PendingNode {
-                    node: child_node.clone(),
-                    priority,
-                    depth: current.depth + 1,
-                    unknown_bounds,
-                });
+                if budget.node() {
+                    pending.push(PendingNode {
+                        node: child_node.clone(),
+                        priority,
+                        depth: current.depth + 1,
+                        unknown_bounds,
+                    });
+                }
             }
             if Instant::now() >= deadline || !budget.has_nodes() {
                 break;
@@ -1011,7 +1221,7 @@ unsafe fn text_pattern(node: &UiaNode, warming: bool) -> Option<IUIAutomationTex
         // TextPattern2 inherits the same selection contract. Accept the newer
         // pattern ID too; never substitute caret/whole-document extraction or
         // LegacyIAccessible.Value for an unavailable selection.
-        (node.text_available != Some(false) || warming)
+        (node.text_available != Some(false) || node.text_candidate || warming)
             .then(|| {
                 node.element
                     .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
@@ -1217,222 +1427,16 @@ unsafe fn read_unicode_text() -> Result<String, String> {
     decode_unicode(&unsafe { clipboard_bytes()? })
 }
 
-struct ClipboardOwner(HWND);
-
-impl ClipboardOwner {
-    fn new() -> Result<Self, String> {
-        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
-        let window = unsafe {
-            CreateWindowExW(
-                0,
-                class.as_ptr(),
-                ptr::null(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                HWND_MESSAGE,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null(),
-            )
-        };
-        if window.is_null() {
-            return Err("无法安全备份剪贴板，请手动复制后使用“翻译剪贴板”。".into());
-        }
-        Ok(Self(window))
-    }
-}
-
-impl Drop for ClipboardOwner {
-    fn drop(&mut self) {
-        unsafe { DestroyWindow(self.0) };
-    }
-}
-
-struct ClipboardSnapshot {
-    // Allocation is prepared before sending Ctrl+C, so an allocation failure
-    // cannot prevent restoring the previous text after we clear the clipboard.
-    original: Option<HGLOBAL>,
-}
-
-impl ClipboardSnapshot {
-    unsafe fn take() -> Result<Self, String> {
-        unsafe { SetLastError(0) };
-        let first = unsafe { EnumClipboardFormats(0) };
-        if first == 0 {
-            if unsafe { GetLastError() } != 0 {
-                return Err("无法检查剪贴板，已取消模拟复制。".into());
-            }
-            return Ok(Self { original: None });
-        }
-        if first != UNICODE_TEXT {
-            return Err(
-                "为保护剪贴板中的图片或富文本，未模拟复制。请先手动复制，再使用“翻译剪贴板”。"
-                    .into(),
-            );
-        }
-        unsafe { SetLastError(0) };
-        if unsafe { EnumClipboardFormats(first) } != 0 || unsafe { GetLastError() } != 0 {
-            return Err(
-                "剪贴板包含多种格式，已保留原内容。请先手动复制，再使用“翻译剪贴板”。".into(),
-            );
-        }
-        let bytes = unsafe { clipboard_bytes()? };
-        let allocation = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
-        if allocation.is_null() {
-            return Err("无法备份剪贴板，已取消模拟复制。".into());
-        }
-        let output = unsafe { GlobalLock(allocation) };
-        if output.is_null() {
-            unsafe { GlobalFree(allocation) };
-            return Err("无法备份剪贴板，已取消模拟复制。".into());
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), output.cast(), bytes.len());
-            GlobalUnlock(allocation);
-        }
-        Ok(Self {
-            original: Some(allocation),
-        })
-    }
-
-    /// The caller holds the clipboard lock and has verified its sequence number.
-    unsafe fn restore(&mut self) -> Result<(), String> {
-        if unsafe { EmptyClipboard() } == 0 {
-            return Err("未能恢复原剪贴板内容。".into());
-        }
-        if let Some(handle) = self.original {
-            if unsafe { SetClipboardData(UNICODE_TEXT, handle) }.is_null() {
-                return Err("未能恢复原剪贴板内容。".into());
-            }
-            self.original = None; // The system now owns the allocation.
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ClipboardSnapshot {
-    fn drop(&mut self) {
-        if let Some(allocation) = self.original {
-            unsafe { GlobalFree(allocation) };
-        }
-    }
-}
-
-fn modifiers_down() -> bool {
-    [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
-        .iter()
-        .any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0)
-}
-
-fn keyboard_input(key: u16, up: bool) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: key,
-                wScan: 0,
-                dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }
-}
-
 fn capture_by_copy(foreground: HWND) -> Result<CapturedText, String> {
-    let released = Instant::now();
-    while modifiers_down() {
-        if released.elapsed() >= Duration::from_millis(1_200) {
-            return Err("请松开快捷键后重试。".into());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    if unsafe { GetForegroundWindow() } != foreground {
-        return Err("前台窗口已改变，已取消模拟复制。".into());
-    }
-
-    let owner = ClipboardOwner::new()?;
-    let (mut snapshot, initial_sequence) = {
-        let _clipboard = ClipboardLock::open(owner.0)?;
-        let snapshot = unsafe { ClipboardSnapshot::take()? };
-        (snapshot, unsafe { GetClipboardSequenceNumber() })
-    };
-    if unsafe { GetForegroundWindow() } != foreground
-        || modifiers_down()
-        || unsafe { GetClipboardSequenceNumber() } != initial_sequence
-    {
-        return Err("窗口、按键或剪贴板状态已改变，请重试。".into());
-    }
-
-    let input = [
-        keyboard_input(VK_CONTROL, false),
-        keyboard_input(0x43, false),
-        keyboard_input(0x43, true),
-        keyboard_input(VK_CONTROL, true),
-    ];
-    let sent = unsafe {
-        SendInput(
-            input.len() as u32,
-            input.as_ptr(),
-            size_of::<INPUT>() as i32,
-        )
-    };
-    if sent != input.len() as u32 {
-        if sent > 0 {
-            let release = [keyboard_input(0x43, true), keyboard_input(VK_CONTROL, true)];
-            unsafe {
-                SendInput(
-                    release.len() as u32,
-                    release.as_ptr(),
-                    size_of::<INPUT>() as i32,
-                )
-            };
-        }
-        return Err("此窗口不允许模拟复制（例如管理员程序）。请手动复制后翻译剪贴板。".into());
-    }
-    let started = Instant::now();
-    loop {
-        let sequence = unsafe { GetClipboardSequenceNumber() };
-        if sequence != initial_sequence {
-            let _clipboard = ClipboardLock::open(owner.0)?;
-            if unsafe { GetClipboardSequenceNumber() } != sequence {
-                return Err("检测到另一次复制，已保留最新剪贴板内容。".into());
-            }
-            let clipboard_owner = unsafe { GetClipboardOwner() };
-            let mut source_pid = 0;
-            let mut clipboard_pid = 0;
-            unsafe {
-                GetWindowThreadProcessId(foreground, &mut source_pid);
-                GetWindowThreadProcessId(clipboard_owner, &mut clipboard_pid);
-            }
-            if source_pid == 0 || source_pid != clipboard_pid {
-                return Err(
-                    "无法确认这次复制的来源，已保留最新剪贴板内容。请手动复制后翻译。".into(),
-                );
-            }
-            let selected = unsafe { read_unicode_text() };
-            // Delayed rendering may itself advance the sequence. Nobody else can
-            // replace the clipboard while this lock remains held.
-            unsafe { snapshot.restore()? };
-            if unsafe { GetForegroundWindow() } != foreground {
-                return Err("前台窗口已改变，已取消翻译。".into());
-            }
-            return selected.map(|text| CapturedText {
-                text,
-                source: "模拟复制",
-            });
-        }
-        if unsafe { GetForegroundWindow() } != foreground {
-            return Err("前台窗口已改变，已取消读取；剪贴板保持当前内容。".into());
-        }
-        if started.elapsed() >= Duration::from_millis(700) {
-            return Err("未收到复制结果，请手动复制后使用“翻译剪贴板”。".into());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    super::clipboard_copy::capture(
+        foreground as isize,
+        unsafe { GetClipboardSequenceNumber() },
+        || unsafe { GetForegroundWindow() } != foreground,
+    )
+    .map(|text| CapturedText {
+        text,
+        source: "模拟复制",
+    })
 }
 
 #[cfg(test)]

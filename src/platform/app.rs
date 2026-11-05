@@ -1,5 +1,5 @@
 //! Native Windows message loop. UIA and HTTP never run on this thread.
-use super::{icons, mouse, picker, popup, selection, selection_events, theme};
+use super::{clipboard_copy, icons, mouse, picker, popup, selection, selection_events, theme};
 use crate::{cache::TranslationCache, config, mailbox, translation};
 use std::{
     cell::{Cell, RefCell},
@@ -54,6 +54,7 @@ const ID_TEST: u16 = 106;
 const ID_CANCEL: u16 = 107;
 const ID_PROVIDER: u16 = 208;
 const ID_AUTO: u16 = 214;
+const ID_COMPATIBILITY: u16 = 217;
 const ID_APPEARANCE: u16 = 108;
 const ID_ICON_STYLE: u16 = 230;
 const ID_ICON_COLOR: u16 = 231;
@@ -70,8 +71,8 @@ const APPEARANCE_HEIGHT: i32 = 460;
 const INLINE_WIDTH: i32 = 344;
 const INLINE_HEIGHT: i32 = 190;
 const SETTINGS_WIDTH: i32 = 460;
-const SETTINGS_HEIGHT: i32 = 510;
-const SETTINGS_CONTENT_HEIGHT: i32 = 468;
+const SETTINGS_HEIGHT: i32 = 550;
+const SETTINGS_CONTENT_HEIGHT: i32 = 508;
 const RESULT_WIDTH: i32 = 480;
 const RESULT_HEIGHT: i32 = 420;
 
@@ -82,6 +83,7 @@ thread_local! {
     static FONTS: RefCell<HashMap<(u32, i32, i32), HFONT>> = RefCell::new(HashMap::new());
     static CHIP_WINDOW: Cell<isize> = const { Cell::new(0) };
     static AUTO_CHECKED: Cell<bool> = const { Cell::new(true) };
+    static COMPATIBILITY_CHECKED: Cell<bool> = const { Cell::new(false) };
     static DRAFT_ICON_COLOR: Cell<u32> = const { Cell::new(0xD6A575) };
 }
 
@@ -98,6 +100,11 @@ struct CaptureJob {
     foreground: isize,
     point: POINT,
     origin: Option<POINT>,
+    compatibility: bool,
+    copy_attempted: bool,
+    compatibility_checked: bool,
+    copy_retryable: bool,
+    clipboard_sequence: u32,
 }
 enum CaptureWork {
     Warm(isize),
@@ -135,6 +142,7 @@ struct SettingsUi {
     model: HWND,
     timeout: HWND,
     auto: HWND,
+    compatibility: HWND,
     mode: HWND,
     status: HWND,
 }
@@ -179,6 +187,7 @@ struct App {
     network: mailbox::Sender<TranslationJob>,
     generation: u64,
     capture_generation: u64,
+    latest_capture: Arc<AtomicU64>,
     test_generation: u64,
     latest_translation: Arc<AtomicU64>,
     latest_test: Arc<AtomicU64>,
@@ -196,6 +205,7 @@ struct App {
     auto_attempt: usize,
     auto_text: Option<String>,
     pending_icon_click: bool,
+    compatibility_attempted: bool,
     chip_deadline: Option<Instant>,
     chip_pixels: Option<icons::IconPixels>,
     chip_dpi: u32,
@@ -353,11 +363,13 @@ unsafe fn run_inner() -> Result<(), String> {
     let (network_tx, network_rx) = mailbox::channel::<TranslationJob>();
     let destination = main as isize;
     let capture_events = events_tx.clone();
+    let latest_capture = Arc::new(AtomicU64::new(0));
+    let worker_capture = latest_capture.clone();
     thread::Builder::new()
         .name("selection".into())
         .spawn(move || {
             for work in capture_rx {
-                let job = match work {
+                let mut job = match work {
                     CaptureWork::Warm(foreground) => {
                         selection::warm_selection_provider(foreground);
                         if capture_events.send(Event::Warmed).is_err() {
@@ -368,12 +380,38 @@ unsafe fn run_inner() -> Result<(), String> {
                     }
                     CaptureWork::Capture(job) => job,
                 };
-                let result = if job.kind == CaptureKind::Clipboard {
+                let cancelled = || worker_capture.load(Ordering::Acquire) != job.generation;
+                let result = if cancelled() {
+                    Err("选区已改变，已取消读取。".into())
+                } else if job.kind == CaptureKind::Clipboard {
                     selection::read_clipboard_text()
                 } else if GetForegroundWindow() as isize != job.foreground {
                     Err("前台窗口已改变，请重新选择文字。".into())
                 } else if job.kind == CaptureKind::Auto {
-                    selection::capture_selection_for_gesture(job.origin, job.point)
+                    let result = selection::capture_selection_for_gesture(job.origin, job.point);
+                    if job.compatibility
+                        && !cancelled()
+                        && result.as_ref().err().is_some_and(|error| {
+                            !selection::is_no_selection_error(error)
+                                && !selection::is_protected_error(error)
+                        })
+                        && selection::can_copy_gesture(job.origin, job.point)
+                    {
+                        job.compatibility_checked = true;
+                        let outcome = clipboard_copy::capture_checked(
+                            job.foreground,
+                            job.clipboard_sequence,
+                            cancelled,
+                        );
+                        job.copy_attempted = outcome.injected;
+                        job.copy_retryable = outcome.retryable;
+                        outcome.result.map(|text| selection::CapturedText {
+                            text,
+                            source: "兼容取词",
+                        })
+                    } else {
+                        result
+                    }
                 } else {
                     selection::capture_selection(true)
                 };
@@ -505,6 +543,7 @@ unsafe fn run_inner() -> Result<(), String> {
         network: network_tx,
         generation: 0,
         capture_generation: 0,
+        latest_capture,
         test_generation: 0,
         latest_translation,
         latest_test,
@@ -522,6 +561,7 @@ unsafe fn run_inner() -> Result<(), String> {
         auto_attempt: 0,
         auto_text: None,
         pending_icon_click: false,
+        compatibility_attempted: false,
         chip_deadline: None,
         chip_pixels: None,
         chip_dpi: 0,
@@ -722,6 +762,8 @@ unsafe fn paint_message(
                     palette.draw_combo(item, face);
                 } else if item.CtlID == ID_AUTO as u32 {
                     palette.draw_checkbox(item, face, AUTO_CHECKED.get());
+                } else if item.CtlID == ID_COMPATIBILITY as u32 {
+                    palette.draw_checkbox(item, face, COMPATIBILITY_CHECKED.get());
                 } else {
                     palette.draw_button(
                         item,
@@ -872,6 +914,12 @@ unsafe extern "system" fn window_proc(
                 let foreground = GetForegroundWindow();
                 if wparam as u32 == selection_events::FOREGROUND {
                     if window == foreground {
+                        if (app.auto_pressed || app.auto_started.is_some())
+                            && !is_our_window(foreground)
+                            && GetAncestor(foreground, GA_ROOT) as isize != app.auto_source_root
+                        {
+                            cancel_automatic(app);
+                        }
                         warm_foreground(app, foreground as isize);
                     }
                 } else if wparam as u32 == selection_events::SELECTION
@@ -1103,6 +1151,11 @@ unsafe fn command(app: &mut App, id: u16) {
             InvalidateRect(app.settings_ui.auto, null(), 0);
             update_mode_hint(app);
         }
+        ID_COMPATIBILITY => {
+            COMPATIBILITY_CHECKED.set(!COMPATIBILITY_CHECKED.get());
+            InvalidateRect(app.settings_ui.compatibility, null(), 0);
+            update_mode_hint(app);
+        }
         ID_CLIPBOARD => request_capture(app, CaptureKind::Clipboard, cursor()),
         ID_EXIT => PostQuitMessage(0),
         ID_CANCEL => {
@@ -1148,6 +1201,7 @@ unsafe fn command(app: &mut App, id: u16) {
                     mouse::set_enabled(settings.selection_button);
                     if !settings.selection_button
                         || settings.selection_mode != app.settings.selection_mode
+                        || settings.compatibility_capture != app.settings.compatibility_capture
                     {
                         cancel_automatic(app);
                         if app.inline_active {
@@ -1207,6 +1261,8 @@ unsafe fn reset_automatic(app: &mut App) {
     app.chip_deadline = None;
     app.chip_text.clear();
     app.capture_generation += 1;
+    app.latest_capture
+        .store(app.capture_generation, Ordering::Release);
     app.pending = None;
     app.auto_started = None;
     app.auto_attempt = 0;
@@ -1216,6 +1272,7 @@ unsafe fn reset_automatic(app: &mut App) {
     app.auto_pressed = false;
     app.auto_strong = false;
     app.pending_icon_click = false;
+    app.compatibility_attempted = false;
     // Keep the network model alive for cache/in-flight reuse. Detach its view
     // immediately so an older stream cannot paint over a new selection.
     app.display_pending = true;
@@ -1296,8 +1353,15 @@ unsafe fn retry_automatic(app: &mut App) {
             ShowWindow(app.chip, SW_HIDE);
             if app.auto_strong || app.pending_icon_click {
                 app.chip_foreground = app.auto_foreground;
-                set_text(app.inline_ui.translated, "此页面暂未提供可读取的文字选区。");
-                translation_status(app, "可复制文字后，右击托盘选择“翻译剪贴板”");
+                set_text(
+                    app.inline_ui.translated,
+                    if app.settings.compatibility_capture {
+                        "暂未读取到这次选区，请重新划选。\r\n\r\n也可手动复制后，从托盘选择“翻译剪贴板”。"
+                    } else {
+                        "暂未读取到这次选区，请重新划选。\r\n\r\n网页或 PDF 可在设置开启“兼容取词”。"
+                    },
+                );
+                translation_status(app, "请重新划选");
                 translation_copy_enabled(app, false);
                 present_translation(app, true, app.auto_point);
             } else {
@@ -1405,8 +1469,15 @@ unsafe fn selected_mode(app: &App) -> config::SelectionMode {
 
 unsafe fn update_mode_hint(app: &App) {
     EnableWindow(app.settings_ui.mode, AUTO_CHECKED.get() as i32);
+    EnableWindow(app.settings_ui.compatibility, AUTO_CHECKED.get() as i32);
     let hint = if !AUTO_CHECKED.get() {
         "自动划词已关闭；仍可使用 Ctrl+Alt+T。"
+    } else if COMPATIBILITY_CHECKED.get() {
+        if selected_mode(app) == config::SelectionMode::Direct {
+            "直接模式会发送选区；兼容取词会临时复制并尝试恢复剪贴板。"
+        } else {
+            "兼容取词会临时复制并尝试恢复剪贴板；点击图标才发送选区。"
+        }
     } else if selected_mode(app) == config::SelectionMode::Direct {
         "直接模式会自动发送选中文字到所选翻译服务。"
     } else {
@@ -1433,6 +1504,14 @@ unsafe fn request_capture(app: &mut App, kind: CaptureKind, point: POINT) {
         } else {
             None
         },
+        compatibility: kind == CaptureKind::Auto
+            && app.auto_strong
+            && app.settings.compatibility_capture
+            && !app.compatibility_attempted,
+        copy_attempted: false,
+        compatibility_checked: false,
+        copy_retryable: false,
+        clipboard_sequence: GetClipboardSequenceNumber(),
     };
     if app.capture_busy {
         app.pending = Some(job);
@@ -1453,6 +1532,9 @@ unsafe fn drain_events(app: &mut App) {
             }
             Event::Captured { job, result } => {
                 app.capture_busy = false;
+                if job.generation == app.capture_generation {
+                    app.compatibility_attempted |= job.copy_attempted;
+                }
                 if job.generation == app.capture_generation
                     && (job.kind == CaptureKind::Clipboard
                         || GetForegroundWindow() as isize == job.foreground)
@@ -1503,7 +1585,20 @@ unsafe fn drain_events(app: &mut App) {
                             show_error(app, &error, job.point)
                         }
                         Err(error) => {
-                            if selection::is_no_selection_error(&error)
+                            if job.compatibility_checked && job.copy_retryable {
+                                retry_automatic(app);
+                            } else if job.compatibility_checked {
+                                KillTimer(app.main, TIMER_SELECTION);
+                                app.auto_started = None;
+                                app.capture_generation += 1;
+                                app.latest_capture
+                                    .store(app.capture_generation, Ordering::Release);
+                                app.pending = None;
+                                set_text(app.inline_ui.translated, &error);
+                                translation_status(app, "可手动复制后从托盘翻译");
+                                translation_copy_enabled(app, false);
+                                present_translation(app, true, job.point);
+                            } else if selection::is_no_selection_error(&error)
                                 || selection::is_protected_error(&error)
                             {
                                 cancel_automatic(app);
@@ -1513,11 +1608,13 @@ unsafe fn drain_events(app: &mut App) {
                         }
                     }
                 }
-                if let Some(pending) = app.pending.take() {
+                if let Some(mut pending) = app.pending.take() {
                     if pending.generation == app.capture_generation
                         && (GetForegroundWindow() as isize == pending.foreground
                             || pending.kind == CaptureKind::Clipboard)
                     {
+                        pending.compatibility &= !app.compatibility_attempted;
+                        pending.clipboard_sequence = GetClipboardSequenceNumber();
                         app.capture_busy = true;
                         if app.capture.send(CaptureWork::Capture(pending)).is_err() {
                             app.capture_busy = false;
@@ -1734,6 +1831,7 @@ unsafe fn translation_copy_enabled(app: &App, enabled: bool) {
 }
 
 unsafe fn show_settings(app: &mut App) {
+    cancel_automatic(app);
     fill_settings(app);
     position_near(
         app.settings_window,
@@ -1935,7 +2033,9 @@ unsafe fn fill_settings(app: &App) {
         &app.settings.timeout_seconds.to_string(),
     );
     AUTO_CHECKED.set(app.settings.selection_button);
+    COMPATIBILITY_CHECKED.set(app.settings.compatibility_capture);
     InvalidateRect(app.settings_ui.auto, null(), 0);
+    InvalidateRect(app.settings_ui.compatibility, null(), 0);
     SendMessageW(
         app.settings_ui.mode,
         CB_SETCURSEL,
@@ -1962,6 +2062,7 @@ unsafe fn read_settings(app: &App) -> Result<config::Settings, String> {
             .map_err(|_| "超时秒数必须是整数。".to_string())?,
         selection_button: AUTO_CHECKED.get(),
         selection_mode: selected_mode(app),
+        compatibility_capture: COMPATIBILITY_CHECKED.get(),
         ..app.settings.clone()
     };
     settings.validate()?;
@@ -2120,6 +2221,13 @@ unsafe fn make_settings(parent: HWND) -> SettingsUi {
     for label in ["点击图标后翻译", "直接显示译文"] {
         SendMessageW(mode, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
     }
+    let compatibility = child(
+        parent,
+        "BUTTON",
+        "兼容取词（网页 / PDF，临时复制）",
+        WS_TABSTOP,
+        ID_COMPATIBILITY,
+    );
     let status = child(
         parent,
         "STATIC",
@@ -2137,6 +2245,7 @@ unsafe fn make_settings(parent: HWND) -> SettingsUi {
         model,
         timeout,
         auto,
+        compatibility,
         mode,
         status,
     }
@@ -2374,10 +2483,11 @@ unsafe fn layout_settings(app: &mut App) {
         (213, width - margin - 88, 286, 88, 30),
         (ID_AUTO, margin, 330, 178, 28),
         (ID_SELECTION_MODE, margin + 190, 326, inner - 190, 156),
-        (215, margin, 370, inner, 32),
-        (ID_TEST, margin, 418, 112, 34),
-        (ID_APPEARANCE, margin + 128, 418, 88, 34),
-        (ID_SAVE, width - margin - 104, 418, 104, 34),
+        (ID_COMPATIBILITY, margin, 365, inner, 28),
+        (215, margin, 402, inner, 42),
+        (ID_TEST, margin, 458, 112, 34),
+        (ID_APPEARANCE, margin + 128, 458, 88, 34),
+        (ID_SAVE, width - margin - 104, 458, 104, 34),
     ];
     for (id, x, y, w, h) in positions {
         let control_font = if id == 200 {

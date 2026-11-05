@@ -48,6 +48,8 @@ pub struct Settings {
     /// Overall switch for automatic text-selection translation.
     pub selection_button: bool,
     pub selection_mode: SelectionMode,
+    /// Explicit opt-in to temporarily copy a selection when UIA cannot read it.
+    pub compatibility_capture: bool,
     pub icon_style: IconStyle,
     pub icon_shape: IconShape,
     /// Floating icon size in logical pixels, before per-monitor DPI scaling.
@@ -65,6 +67,7 @@ impl Default for Settings {
             api_key: String::new(),
             selection_button: true,
             selection_mode: SelectionMode::default(),
+            compatibility_capture: false,
             icon_style: IconStyle::default(),
             icon_shape: IconShape::default(),
             icon_size: default_icon_size(),
@@ -91,6 +94,7 @@ impl fmt::Debug for Settings {
             )
             .field("selection_button", &self.selection_button)
             .field("selection_mode", &self.selection_mode)
+            .field("compatibility_capture", &self.compatibility_capture)
             .field("icon_style", &self.icon_style)
             .field("icon_shape", &self.icon_shape)
             .field("icon_size", &self.icon_size)
@@ -172,6 +176,8 @@ struct StoredSettings {
     #[serde(default)]
     selection_mode: SelectionMode,
     #[serde(default)]
+    compatibility_capture: bool,
+    #[serde(default)]
     icon_style: IconStyle,
     #[serde(default)]
     icon_shape: IconShape,
@@ -192,6 +198,7 @@ impl StoredSettings {
             timeout_seconds: settings.timeout_seconds,
             selection_button: settings.selection_button,
             selection_mode: settings.selection_mode,
+            compatibility_capture: settings.compatibility_capture,
             icon_style: settings.icon_style,
             icon_shape: settings.icon_shape,
             icon_size: settings.icon_size,
@@ -210,6 +217,7 @@ impl StoredSettings {
             timeout_seconds: self.timeout_seconds,
             selection_button: self.selection_button,
             selection_mode: self.selection_mode,
+            compatibility_capture: self.compatibility_capture,
             icon_style: self.icon_style,
             icon_shape: self.icon_shape,
             icon_size: self.icon_size,
@@ -651,6 +659,7 @@ mod tests {
         assert!(decoded.selection_button);
         assert_eq!(decoded.timeout_seconds, 20);
         assert_eq!(decoded.selection_mode, SelectionMode::Click);
+        assert!(!decoded.compatibility_capture);
         assert_eq!(decoded.icon_style, IconStyle::Translate);
         assert_eq!(decoded.icon_shape, IconShape::Rounded);
         assert_eq!(decoded.icon_size, 32);
@@ -681,6 +690,7 @@ mod tests {
         assert_eq!(settings.timeout_seconds, 30);
         assert!(!settings.selection_button);
         assert_eq!(settings.selection_mode, SelectionMode::Click);
+        assert!(!settings.compatibility_capture);
         assert_eq!(settings.icon_style, IconStyle::Translate);
         assert_eq!(settings.icon_shape, IconShape::Rounded);
         assert_eq!(settings.icon_size, 32);
@@ -709,11 +719,55 @@ mod tests {
             assert_eq!(settings.timeout_seconds, 60);
             assert_eq!(settings.selection_button, selection_button);
             assert_eq!(settings.selection_mode, SelectionMode::Click);
+            assert!(!settings.compatibility_capture);
             assert_eq!(settings.icon_style, IconStyle::Leaf);
             assert_eq!(settings.icon_color, 0x12_34_56);
             assert_eq!(settings.icon_shape, IconShape::Rounded);
             assert_eq!(settings.icon_size, 32);
             assert_eq!(settings.api_key, "test-only-key");
+        }
+    }
+
+    #[test]
+    fn old_direct_mode_configuration_never_enables_clipboard_capture() {
+        // Direct translation was an existing choice before compatibility copying.
+        let stored: StoredSettings = serde_json::from_str(
+            r#"{"version":1,"base_url":"https://example.com/v1","model":"test","selection_button":true,"selection_mode":"direct","icon_style":"letter","icon_shape":"circle","icon_size":48,"icon_color":1193046,"api_key_encrypted":[18,42,71]}"#,
+        )
+        .unwrap();
+        let encrypted_key = stored.api_key_encrypted.clone();
+        let settings = stored.into_settings("test-only-key".into()).unwrap();
+        assert!(settings.selection_button);
+        assert_eq!(settings.selection_mode, SelectionMode::Direct);
+        assert!(!settings.compatibility_capture);
+        assert_eq!(settings.icon_style, IconStyle::Letter);
+        assert_eq!(settings.icon_shape, IconShape::Circle);
+        assert_eq!(settings.icon_size, 48);
+        assert_eq!(settings.icon_color, 0x12_34_56);
+        let saved = StoredSettings::from_settings(&settings, encrypted_key);
+        assert!(!saved.compatibility_capture);
+        assert_eq!(saved.api_key_encrypted, [18, 42, 71]);
+    }
+
+    #[test]
+    fn explicit_clipboard_capture_choice_survives_settings_roundtrip() {
+        assert!(!Settings::default().compatibility_capture);
+        assert!(!Settings::deepseek().compatibility_capture);
+        for mode in [SelectionMode::Click, SelectionMode::Direct] {
+            let settings = Settings {
+                compatibility_capture: true,
+                selection_mode: mode,
+                ..Settings::default()
+            };
+            settings.validate().unwrap();
+            let encoded =
+                serde_json::to_value(StoredSettings::from_settings(&settings, vec![])).unwrap();
+            assert_eq!(encoded["compatibility_capture"], true);
+            assert_eq!(encoded["version"], 1);
+            let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
+            let restored = stored.into_settings(String::new()).unwrap();
+            assert!(restored.compatibility_capture);
+            assert_eq!(restored.selection_mode, mode);
         }
     }
 

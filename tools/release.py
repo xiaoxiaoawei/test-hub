@@ -29,6 +29,8 @@ OPTIONAL_DOCUMENTS = (
     "docs/images/cache.png",
     "docs/images/inline.png",
     "docs/images/selection-icon.png",
+    "docs/images/browser-web-0.4.2.png",
+    "docs/images/browser-pdf-0.4.2.png",
 )
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 

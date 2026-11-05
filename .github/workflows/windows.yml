@@ -14,6 +14,8 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,6 +40,14 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build release
         run: cargo build --release --locked
+      - name: Verify embedded executable version
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['package']['version'])"
+          $binary = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path target/release/lingoleaf.exe))
+          if ($binary.FileVersion -cne "$version.0" -or $binary.ProductVersion -cne $version) {
+            throw "Built EXE version does not match Cargo.toml"
+          }
       - name: Package distribution
         run: python tools/release.py --exe target/release/lingoleaf.exe --out-dir dist
       - name: Upload distribution
@@ -48,7 +58,52 @@ jobs:
             dist/lingoleaf-*-windows-x64.exe
             dist/lingoleaf-*-windows-x64.zip
             dist/SHA256SUMS
+            dist/update.json
           if-no-files-found: error
+
+  draft-release:
+    name: Prepare version draft
+    needs: [windows, core-tests]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'xiaoxiaoawei/test-hub'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: lingoleaf-draft-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Download verified Windows distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: lingoleaf-windows-x64
+          path: dist
+      - name: Verify distribution checksums
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+      - name: Create or refresh draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          draft_state="$(gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+          if [[ "$draft_state" == "false" ]]; then
+            echo "This version has already been published; existing update assets will not be overwritten." >&2
+            exit 1
+          fi
+          assets=(dist/lingoleaf-*-windows-x64.exe dist/lingoleaf-*-windows-x64.zip dist/SHA256SUMS dist/update.json)
+          if [[ "$draft_state" == "true" ]]; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$RELEASE_REPO" --clobber
+          else
+            cat > dist/release-notes.md <<'NOTES'
+          轻译 Windows x64 版本。提供居中设置页、暖色日间与暗夜主题，以及应用内更新检查。
+
+          独立 EXE 可直接运行，ZIP 包含说明和验证记录。`update.json` 供客户端检查版本，`SHA256SUMS` 用于核对下载内容。Windows 实机验证状态见随包 `docs/build-validation.md`。
+          NOTES
+            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$RELEASE_REPO" --verify-tag --draft --title "LingoLeaf $RELEASE_TAG" --notes-file dist/release-notes.md
+          fi
 
   core-tests:
     name: Portable logic tests

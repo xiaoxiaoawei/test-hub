@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 from pathlib import Path
 import re
 import struct
@@ -31,24 +32,34 @@ OPTIONAL_DOCUMENTS = (
     "docs/images/selection-icon.png",
     "docs/images/browser-web-0.4.2.png",
     "docs/images/browser-pdf-0.4.2.png",
+    "docs/images/settings-dark-0.5.0.png",
+    "docs/images/settings-day-0.5.0.png",
 )
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+UPDATE_REPOSITORY = "https://github.com/xiaoxiaoawei/test-hub"
+MAX_EXECUTABLE_BYTES = 32 * 1024 * 1024
+UPDATE_FIELDS = {"schema_version", "version", "download_url", "sha256", "size", "notes_url"}
 
 
 class ReleaseError(ValueError):
     """An input does not satisfy the distribution contract."""
 
 
+def stable_version(value: object) -> str:
+    """Use the same stable, Windows-version-compatible form as the updater."""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", value
+    ):
+        raise ReleaseError("Version must use stable major.minor.patch")
+    if any(int(part) > 65535 for part in value.split(".")):
+        raise ReleaseError("Windows version components must not exceed 65535")
+    return value
+
+
 def project_version(root: Path, tag: str | None = None) -> str:
     """Check the manifest, lockfile, Windows resources, changelog, and optional tag."""
     manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
-    version = manifest["package"]["version"]
-    if not isinstance(version, str) or not re.fullmatch(
-        r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version
-    ):
-        raise ReleaseError("Cargo.toml must use a stable major.minor.patch version")
-    if any(int(part) > 65535 for part in version.split(".")):
-        raise ReleaseError("Windows version components must not exceed 65535")
+    version = stable_version(manifest["package"]["version"])
 
     lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
     own_versions = [
@@ -79,9 +90,11 @@ def project_version(root: Path, tag: str | None = None) -> str:
 
 
 def windows_executable(path: Path) -> bytes:
-    """Reject missing files and non-x64 PE inputs; this does not execute the program."""
+    """Reject oversized, DLL, console, and non-x64 PE inputs without executing them."""
+    if not 64 <= path.stat().st_size <= MAX_EXECUTABLE_BYTES:
+        raise ReleaseError("--exe must be between 64 bytes and 32 MiB")
     executable = path.read_bytes()
-    if len(executable) < 64 or executable[:2] != b"MZ":
+    if not 64 <= len(executable) <= MAX_EXECUTABLE_BYTES or executable[:2] != b"MZ":
         raise ReleaseError("--exe must be a Windows x64 PE executable")
     pe_offset = struct.unpack_from("<I", executable, 0x3C)[0]
     if (
@@ -91,7 +104,55 @@ def windows_executable(path: Path) -> bytes:
         or struct.unpack_from("<H", executable, pe_offset + 4)[0] != 0x8664
     ):
         raise ReleaseError("--exe must be a Windows x64 PE executable")
+    optional = pe_offset + 24
+    optional_size = struct.unpack_from("<H", executable, pe_offset + 20)[0]
+    characteristics = struct.unpack_from("<H", executable, pe_offset + 22)[0]
+    if (
+        optional_size < 112
+        or optional + optional_size > len(executable)
+        or struct.unpack_from("<H", executable, optional)[0] != 0x20B
+        or struct.unpack_from("<H", executable, optional + 68)[0] != 2
+        or characteristics & 0x2000
+        or not characteristics & 0x0002
+    ):
+        raise ReleaseError("--exe must be a PE32+ Windows GUI executable, not a DLL")
     return executable
+
+
+def validate_update_manifest(value: object) -> dict:
+    """Require one version and exact same-repository URLs; no arbitrary download host."""
+    if not isinstance(value, dict) or set(value) != UPDATE_FIELDS:
+        raise ReleaseError("Update metadata has missing or unexpected fields")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ReleaseError("Unsupported update metadata schema")
+    version = stable_version(value["version"])
+    asset = f"lingoleaf-{version}-windows-x64.exe"
+    expected_url = f"{UPDATE_REPOSITORY}/releases/download/v{version}/{asset}"
+    if value["download_url"] != expected_url:
+        raise ReleaseError("Update download URL must match this repository, version and EXE")
+    if value["notes_url"] != f"{UPDATE_REPOSITORY}/releases/tag/v{version}":
+        raise ReleaseError("Update notes URL must match this repository and version")
+    if not isinstance(value["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"]):
+        raise ReleaseError("Update SHA-256 must contain 64 lowercase hexadecimal characters")
+    if type(value["size"]) is not int or not 64 <= value["size"] <= MAX_EXECUTABLE_BYTES:
+        raise ReleaseError("Update executable size must be between 64 bytes and 32 MiB")
+    return value
+
+
+def update_manifest(version: str, executable: bytes) -> bytes:
+    version = stable_version(version)
+    metadata = validate_update_manifest({
+        "schema_version": 1,
+        "version": version,
+        "download_url": (
+            f"{UPDATE_REPOSITORY}/releases/download/v{version}/"
+            f"lingoleaf-{version}-windows-x64.exe"
+        ),
+        "sha256": hashlib.sha256(executable).hexdigest(),
+        "size": len(executable),
+        "notes_url": f"{UPDATE_REPOSITORY}/releases/tag/v{version}",
+    })
+    return (json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
 
 def document_bytes(root: Path, relative: str) -> bytes:
@@ -128,7 +189,11 @@ def package(root: Path, executable_path: Path, out_dir: Path, tag: str | None = 
             bundle.writestr(info, content, compresslevel=9)
 
     stem = f"lingoleaf-{version}-windows-x64"
-    payloads = {f"{stem}.exe": executable, f"{stem}.zip": archive.getvalue()}
+    payloads = {
+        f"{stem}.exe": executable,
+        f"{stem}.zip": archive.getvalue(),
+        "update.json": update_manifest(version, executable),
+    }
     checksums = "".join(
         f"{hashlib.sha256(content).hexdigest()}  {name}\n"
         for name, content in sorted(payloads.items())

@@ -1,6 +1,7 @@
 //! Warm native palette and owner drawing. These helpers never borrow App state,
 //! so synchronous WM_CTLCOLOR / WM_DRAWITEM callbacks can use them during layout.
 
+use crate::config::ThemeMode;
 use std::{mem::size_of, ptr::null};
 use windows_sys::Win32::{
     Foundation::{COLORREF, HWND, POINT, RECT},
@@ -29,8 +30,56 @@ pub(crate) const BORDER: COLORREF = rgb(0x59, 0x49, 0x3e);
 const SURFACE_ACTIVE: COLORREF = rgb(0x40, 0x34, 0x2c);
 const ACCENT_ACTIVE: COLORREF = rgb(0xbd, 0x8e, 0x62);
 
+#[derive(Clone, Copy)]
+struct Colors {
+    background: COLORREF,
+    surface: COLORREF,
+    text: COLORREF,
+    muted: COLORREF,
+    accent: COLORREF,
+    border: COLORREF,
+    surface_active: COLORREF,
+    accent_active: COLORREF,
+    combo_selected_text: COLORREF,
+}
+
+impl Colors {
+    const fn for_mode(mode: ThemeMode) -> Self {
+        match mode {
+            ThemeMode::Dark => Self {
+                background: BACKGROUND,
+                surface: SURFACE,
+                text: TEXT,
+                muted: MUTED,
+                accent: ACCENT,
+                border: BORDER,
+                surface_active: SURFACE_ACTIVE,
+                accent_active: ACCENT_ACTIVE,
+                combo_selected_text: ACCENT,
+            },
+            ThemeMode::Light => Self {
+                background: rgb(0xf4, 0xea, 0xd8),
+                surface: rgb(0xff, 0xf8, 0xea),
+                text: rgb(0x33, 0x27, 0x1e),
+                muted: rgb(0x75, 0x62, 0x4d),
+                accent: rgb(0x8d, 0x5a, 0x39),
+                border: rgb(0xa1, 0x8a, 0x6d),
+                surface_active: rgb(0xe6, 0xd6, 0xbc),
+                accent_active: rgb(0x73, 0x43, 0x29),
+                combo_selected_text: rgb(0x33, 0x27, 0x1e),
+            },
+        }
+    }
+}
+
 /// Keep this value on the UI thread until all windows using its brushes close.
 pub(crate) struct Theme {
+    pub background_color: COLORREF,
+    pub surface_color: COLORREF,
+    pub text_color: COLORREF,
+    pub muted_color: COLORREF,
+    pub accent_color: COLORREF,
+    pub border_color: COLORREF,
     pub background: HBRUSH,
     pub surface: HBRUSH,
     pub accent: HBRUSH,
@@ -40,11 +89,19 @@ pub(crate) struct Theme {
     accent_pen: HPEN,
     primary_pen: HPEN,
     check_pen: HPEN,
+    combo_selected_text: COLORREF,
 }
 
 impl Theme {
-    pub(crate) fn new() -> Result<Self, String> {
+    pub(crate) fn new(mode: ThemeMode) -> Result<Self, String> {
+        let colors = Colors::for_mode(mode);
         let mut theme = Self {
+            background_color: colors.background,
+            surface_color: colors.surface,
+            text_color: colors.text,
+            muted_color: colors.muted,
+            accent_color: colors.accent,
+            border_color: colors.border,
             background: std::ptr::null_mut(),
             surface: std::ptr::null_mut(),
             accent: std::ptr::null_mut(),
@@ -54,18 +111,19 @@ impl Theme {
             accent_pen: std::ptr::null_mut(),
             primary_pen: std::ptr::null_mut(),
             check_pen: std::ptr::null_mut(),
+            combo_selected_text: colors.combo_selected_text,
         };
         // Assign each resource immediately, so Drop also cleans partial failure.
         unsafe {
-            theme.background = checked(CreateSolidBrush(BACKGROUND))?;
-            theme.surface = checked(CreateSolidBrush(SURFACE))?;
-            theme.accent = checked(CreateSolidBrush(ACCENT))?;
-            theme.surface_active = checked(CreateSolidBrush(SURFACE_ACTIVE))?;
-            theme.accent_active = checked(CreateSolidBrush(ACCENT_ACTIVE))?;
-            theme.border_pen = checked(CreatePen(PS_SOLID, 1, BORDER))?;
-            theme.accent_pen = checked(CreatePen(PS_SOLID, 1, ACCENT))?;
-            theme.primary_pen = checked(CreatePen(PS_SOLID, 1, ACCENT_ACTIVE))?;
-            theme.check_pen = checked(CreatePen(PS_SOLID, 2, BACKGROUND))?;
+            theme.background = checked(CreateSolidBrush(theme.background_color))?;
+            theme.surface = checked(CreateSolidBrush(theme.surface_color))?;
+            theme.accent = checked(CreateSolidBrush(theme.accent_color))?;
+            theme.surface_active = checked(CreateSolidBrush(colors.surface_active))?;
+            theme.accent_active = checked(CreateSolidBrush(colors.accent_active))?;
+            theme.border_pen = checked(CreatePen(PS_SOLID, 1, theme.border_color))?;
+            theme.accent_pen = checked(CreatePen(PS_SOLID, 1, theme.accent_color))?;
+            theme.primary_pen = checked(CreatePen(PS_SOLID, 1, colors.accent_active))?;
+            theme.check_pen = checked(CreatePen(PS_SOLID, 2, colors.background))?;
         }
         Ok(theme)
     }
@@ -150,11 +208,11 @@ impl Theme {
         SetTextColor(
             dc,
             if disabled {
-                MUTED
+                self.muted_color
             } else if primary {
-                BACKGROUND
+                self.background_color
             } else {
-                TEXT
+                self.text_color
             },
         );
         SelectObject(dc, font);
@@ -228,11 +286,11 @@ impl Theme {
         SetTextColor(
             dc,
             if disabled {
-                MUTED
+                self.muted_color
             } else if selected {
-                ACCENT
+                self.combo_selected_text
             } else {
-                TEXT
+                self.text_color
             },
         );
         rect.left += scale(info.hwndItem, 10);
@@ -303,7 +361,14 @@ impl Theme {
         }
         SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, if disabled { MUTED } else { TEXT });
+        SetTextColor(
+            dc,
+            if disabled {
+                self.muted_color
+            } else {
+                self.text_color
+            },
+        );
         let mut text_rect = RECT {
             left: left + size + scale(info.hwndItem, 10),
             ..rect
@@ -350,26 +415,36 @@ fn checked(object: HGDIOBJ) -> Result<HGDIOBJ, String> {
     }
 }
 
-/// Apply documented DWM dark caption attributes. Unsupported attributes are
+/// Apply documented DWM caption attributes for the selected palette. Unsupported attributes are
 /// optional hints; the application still paints its own client area.
 ///
 /// # Safety
 /// `hwnd` must refer to a live top-level window owned by the current UI thread.
-pub(crate) unsafe fn apply_window(hwnd: HWND) {
-    attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &1_i32);
-    attribute(hwnd, DWMWA_CAPTION_COLOR, &BACKGROUND);
-    attribute(hwnd, DWMWA_TEXT_COLOR, &TEXT);
-    attribute(hwnd, DWMWA_BORDER_COLOR, &BORDER);
+pub(crate) unsafe fn apply_window(hwnd: HWND, mode: ThemeMode) {
+    let colors = Colors::for_mode(mode);
+    attribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &i32::from(mode == ThemeMode::Dark),
+    );
+    attribute(hwnd, DWMWA_CAPTION_COLOR, &colors.background);
+    attribute(hwnd, DWMWA_TEXT_COLOR, &colors.text);
+    attribute(hwnd, DWMWA_BORDER_COLOR, &colors.border);
     attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_ROUND);
 }
 
-/// Hint to a native child control that its border/scrollbar should use a dark
-/// Explorer theme. WM_CTLCOLOR and owner drawing still supply the actual palette.
+/// Hint to a native child control that its border/scrollbar should use the
+/// matching Explorer theme. WM_CTLCOLOR and owner drawing supply the actual palette.
 ///
 /// # Safety
 /// `hwnd` must refer to a live native child control on the current UI thread.
-pub(crate) unsafe fn style_edit(hwnd: HWND) {
-    let theme: Vec<u16> = "DarkMode_Explorer\0".encode_utf16().collect();
+pub(crate) unsafe fn style_edit(hwnd: HWND, mode: ThemeMode) {
+    let theme: Vec<u16> = match mode {
+        ThemeMode::Dark => "DarkMode_Explorer\0",
+        ThemeMode::Light => "Explorer\0",
+    }
+    .encode_utf16()
+    .collect();
     let _ = SetWindowTheme(hwnd, theme.as_ptr(), null());
 }
 

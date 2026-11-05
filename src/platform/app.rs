@@ -1,9 +1,11 @@
 //! Native Windows message loop. UIA and HTTP never run on this thread.
-use super::{clipboard_copy, icons, mouse, picker, popup, selection, selection_events, theme};
-use crate::{cache::TranslationCache, config, mailbox, translation};
+use super::{
+    clipboard_copy, icons, mouse, picker, popup, selection, selection_events, theme, update_install,
+};
+use crate::{cache::TranslationCache, config, mailbox, translation, update};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
     sync::{
@@ -35,12 +37,17 @@ use windows_sys::Win32::{
     },
 };
 
+#[path = "app/update_ui.rs"]
+mod update_ui;
+use update_ui::{check_updates, download_available_update, enqueue_notice, handle_notice};
+
 const CLASS: &str = "LingoLeaf.NativeWindow";
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_WORK: u32 = WM_APP + 2;
 const WM_SELECTION: u32 = WM_APP + 3;
 const WM_SETTINGS: u32 = WM_APP + 4;
 const WM_ACCESSIBILITY: u32 = WM_APP + 5;
+const WM_NOTICE: u32 = WM_APP + 6;
 const HOTKEY: i32 = 1;
 const TIMER_SELECTION: usize = 1;
 const TIMER_CHIP: usize = 2;
@@ -56,6 +63,8 @@ const ID_PROVIDER: u16 = 208;
 const ID_AUTO: u16 = 214;
 const ID_COMPATIBILITY: u16 = 217;
 const ID_APPEARANCE: u16 = 108;
+const ID_THEME: u16 = 109;
+const ID_UPDATE: u16 = 110;
 const ID_ICON_STYLE: u16 = 230;
 const ID_ICON_COLOR: u16 = 231;
 const ID_ICON_APPLY: u16 = 232;
@@ -71,8 +80,8 @@ const APPEARANCE_HEIGHT: i32 = 460;
 const INLINE_WIDTH: i32 = 344;
 const INLINE_HEIGHT: i32 = 190;
 const SETTINGS_WIDTH: i32 = 460;
-const SETTINGS_HEIGHT: i32 = 550;
-const SETTINGS_CONTENT_HEIGHT: i32 = 508;
+const SETTINGS_HEIGHT: i32 = 580;
+const SETTINGS_CONTENT_HEIGHT: i32 = 538;
 const RESULT_WIDTH: i32 = 480;
 const RESULT_HEIGHT: i32 = 420;
 
@@ -84,6 +93,9 @@ thread_local! {
     static CHIP_WINDOW: Cell<isize> = const { Cell::new(0) };
     static AUTO_CHECKED: Cell<bool> = const { Cell::new(true) };
     static COMPATIBILITY_CHECKED: Cell<bool> = const { Cell::new(false) };
+    static CURRENT_THEME: Cell<config::ThemeMode> = const { Cell::new(config::ThemeMode::Dark) };
+    static NOTICES: RefCell<VecDeque<Notice>> = const { RefCell::new(VecDeque::new()) };
+    static NOTICE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static DRAFT_ICON_COLOR: Cell<u32> = const { Cell::new(0xD6A575) };
 }
 
@@ -133,6 +145,24 @@ enum Event {
         text: String,
     },
     PickedColor(Result<Option<u32>, String>),
+    UpdateChecked {
+        manual: bool,
+        result: Result<update::CheckResult, String>,
+    },
+    UpdateProgress {
+        received: u64,
+        total: u64,
+    },
+    UpdateDownloaded(Result<update::VerifiedDownload, String>),
+    UpdateLaunched(Result<(), String>),
+}
+
+enum Notice {
+    Saved,
+    Information(String),
+    Error(String),
+    UpdateAvailable,
+    RestartUpdate,
 }
 
 struct SettingsUi {
@@ -145,6 +175,7 @@ struct SettingsUi {
     compatibility: HWND,
     mode: HWND,
     status: HWND,
+    update_status: HWND,
 }
 struct ResultUi {
     original: HWND,
@@ -224,6 +255,9 @@ struct App {
     active_started: Option<Instant>,
     streaming: bool,
     cache: Arc<Mutex<TranslationCache>>,
+    update_busy: bool,
+    available_update: Option<update::Release>,
+    downloaded_update: Option<update::VerifiedDownload>,
 }
 
 pub fn run() {
@@ -248,19 +282,26 @@ unsafe fn run_inner() -> Result<(), String> {
     if GetLastError() == ERROR_ALREADY_EXISTS {
         let existing = FindWindowW(wide(CLASS).as_ptr(), wide("轻译 · 后台").as_ptr());
         if !existing.is_null() {
+            let mut process = 0;
+            GetWindowThreadProcessId(existing, &mut process);
+            AllowSetForegroundWindow(process);
             PostMessageW(existing, WM_SETTINGS, 0, 0);
         }
         return Ok(());
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    let (settings, load_error) = match config::load() {
+        Ok(settings) => (settings, None),
+        Err(error) => (config::Settings::default(), Some(error)),
+    };
+    CURRENT_THEME.set(settings.theme_mode);
     let instance = GetModuleHandleW(null());
     // Win32 integer resource ID, not an address that will be dereferenced.
     let mut icon = LoadIconW(instance, std::ptr::without_provenance(1));
     if icon.is_null() {
         icon = LoadIconW(null_mut(), IDI_APPLICATION);
     }
-    let palette = theme::Theme::new()?;
-    let background = palette.background;
+    let palette = theme::Theme::new(settings.theme_mode)?;
     THEME.with(|cell| *cell.borrow_mut() = Some(palette));
     let class = WNDCLASSW {
         style: 0,
@@ -268,7 +309,8 @@ unsafe fn run_inner() -> Result<(), String> {
         hInstance: instance,
         hIcon: icon,
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: background,
+        // Brushes belong to the replaceable Theme, not the window class.
+        hbrBackground: null_mut(),
         ..zeroed()
     };
     // Keep the class-name buffer alive until RegisterClassW has copied it.
@@ -284,10 +326,6 @@ unsafe fn run_inner() -> Result<(), String> {
     if main.is_null() {
         return Err("无法创建后台窗口。".into());
     }
-    let (settings, load_error) = match config::load() {
-        Ok(settings) => (settings, None),
-        Err(error) => (config::Settings::default(), Some(error)),
-    };
     let runtime_icons = icons::IconSet::new(
         settings.icon_style,
         settings.icon_color,
@@ -345,9 +383,9 @@ unsafe fn run_inner() -> Result<(), String> {
         return Err("无法创建翻译窗口。".into());
     }
     CHIP_WINDOW.set(chip as isize);
-    theme::apply_window(settings_window);
-    theme::apply_window(result_window);
-    theme::apply_window(appearance_window);
+    theme::apply_window(settings_window, settings.theme_mode);
+    theme::apply_window(result_window, settings.theme_mode);
+    theme::apply_window(appearance_window, settings.theme_mode);
     for window in [main, settings_window, result_window, appearance_window] {
         set_window_icons(window, &runtime_icons);
     }
@@ -521,7 +559,6 @@ unsafe fn run_inner() -> Result<(), String> {
     let hook = mouse::install(main as isize, WM_SELECTION);
     let accessibility = selection_events::install(main as isize, WM_ACCESSIBILITY);
     let hook_error = hook.as_ref().err().cloned();
-    let first_run = !config::has_saved_settings();
     let app = App {
         main,
         settings_window,
@@ -580,6 +617,9 @@ unsafe fn run_inner() -> Result<(), String> {
         active_started: None,
         streaming: false,
         cache: shared_cache,
+        update_busy: false,
+        available_update: None,
+        downloaded_update: None,
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(|app| {
@@ -600,13 +640,13 @@ unsafe fn run_inner() -> Result<(), String> {
         if let Some(error) = hook_error {
             problems.push(error);
         }
-        if first_run || !problems.is_empty() {
-            show_settings(app);
-            if !problems.is_empty() {
-                set_text(app.settings_ui.status, &problems.join("\r\n"));
-            }
+        show_settings(app);
+        if !problems.is_empty() {
+            set_text(app.settings_ui.status, &problems.join("\r\n"));
         }
+        check_updates(app, false);
     });
+    update_install::notify_startup_ready();
     let mut message: MSG = zeroed();
     loop {
         let status = GetMessageW(&mut message, null_mut(), 0, 0);
@@ -721,18 +761,18 @@ unsafe fn paint_message(
                 SetBkColor(
                     dc,
                     if surface {
-                        theme::SURFACE
+                        palette.surface_color
                     } else {
-                        theme::BACKGROUND
+                        palette.background_color
                     },
                 );
                 SetBkMode(dc, OPAQUE as i32);
                 SetTextColor(
                     dc,
                     if surface || id == 200 || id == 220 || id == 250 {
-                        theme::TEXT
+                        palette.text_color
                     } else {
-                        theme::MUTED
+                        palette.muted_color
                     },
                 );
                 if surface {
@@ -833,6 +873,10 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_NOTICE {
+        handle_notice(hwnd);
+        return 0;
+    }
     if message == WM_COMMAND
         && (wparam & 0xffff) as u16 == ID_ICON_COLOR
         && (wparam >> 16) as u16 == BN_CLICKED as u16
@@ -857,6 +901,7 @@ unsafe extern "system" fn window_proc(
         match message {
             WM_SETTINGS => {
                 show_settings(app);
+                check_updates(app, false);
                 handled = true;
             }
             WM_TRAY => {
@@ -1120,6 +1165,16 @@ unsafe extern "system" fn window_proc(
 unsafe fn command(app: &mut App, id: u16) {
     match id {
         ID_SETTINGS => show_settings(app),
+        ID_THEME => toggle_theme(app),
+        ID_UPDATE => {
+            if app.downloaded_update.is_some() {
+                enqueue_notice(app, Notice::RestartUpdate);
+            } else if app.available_update.is_some() {
+                download_available_update(app);
+            } else {
+                check_updates(app, true);
+            }
+        }
         ID_APPEARANCE => show_appearance(app),
         ID_INLINE_EXPAND => {
             present_translation(app, false, cursor());
@@ -1214,6 +1269,8 @@ unsafe fn command(app: &mut App, id: u16) {
                     }
                     app.settings = settings;
                     update_mode_hint(app);
+                    set_text(app.settings_ui.status, "设置已保存 · 已立即生效");
+                    enqueue_notice(app, Notice::Saved);
                 }
                 Err(error) => set_text(app.settings_ui.status, &error),
             }
@@ -1699,6 +1756,16 @@ unsafe fn drain_events(app: &mut App) {
                     Err(error) => set_text(app.appearance_ui.status, &error),
                 }
             }
+            Event::UpdateChecked { manual, result } => update_ui::checked(app, manual, result),
+            Event::UpdateProgress { received, total } => {
+                let percent = received.saturating_mul(100).checked_div(total).unwrap_or(0);
+                set_text(
+                    app.settings_ui.update_status,
+                    &format!("正在下载更新 · {}%", percent.min(100)),
+                );
+            }
+            Event::UpdateDownloaded(result) => update_ui::downloaded(app, result),
+            Event::UpdateLaunched(result) => update_ui::launched(app, result),
         }
     }
 }
@@ -1832,16 +1899,79 @@ unsafe fn translation_copy_enabled(app: &App, enabled: bool) {
 
 unsafe fn show_settings(app: &mut App) {
     cancel_automatic(app);
-    fill_settings(app);
-    position_near(
-        app.settings_window,
-        cursor(),
-        SETTINGS_WIDTH,
-        SETTINGS_HEIGHT,
-    );
+    if IsWindowVisible(app.settings_window) == 0 {
+        fill_settings(app);
+    }
+    position_centered(app.settings_window, SETTINGS_WIDTH, SETTINGS_HEIGHT);
     layout_settings(app);
-    ShowWindow(app.settings_window, SW_SHOW);
+    ShowWindow(app.settings_window, SW_RESTORE);
     SetForegroundWindow(app.settings_window);
+}
+
+unsafe fn toggle_theme(app: &mut App) {
+    let mode = if app.settings.theme_mode == config::ThemeMode::Dark {
+        config::ThemeMode::Light
+    } else {
+        config::ThemeMode::Dark
+    };
+    let next = match theme::Theme::new(mode) {
+        Ok(next) => next,
+        Err(error) => {
+            enqueue_notice(app, Notice::Error(error));
+            return;
+        }
+    };
+    let mut settings = app.settings.clone();
+    settings.theme_mode = mode;
+    if let Err(error) = config::save(&settings) {
+        enqueue_notice(app, Notice::Error(error));
+        return;
+    }
+    app.settings = settings;
+    CURRENT_THEME.set(mode);
+    // Native theme calls can synchronously request colors. Release the borrow
+    // before calling Windows or destroying the previous brush resources.
+    let previous = THEME.with(|cell| cell.replace(Some(next)));
+    for window in [
+        app.settings_window,
+        app.result_window,
+        app.inline_window,
+        app.appearance_window,
+    ] {
+        theme::apply_window(window, mode);
+        EnumChildWindows(window, Some(retheme_child), 0);
+        redraw_layout(window);
+    }
+    drop(previous);
+    set_text(
+        GetDlgItem(app.settings_window, ID_THEME as i32),
+        if mode == config::ThemeMode::Dark {
+            "白天模式"
+        } else {
+            "暗夜模式"
+        },
+    );
+    set_text(
+        app.settings_ui.status,
+        if mode == config::ThemeMode::Dark {
+            "已切换暗夜模式 · 已保存"
+        } else {
+            "已切换白天模式 · 已保存"
+        },
+    );
+}
+
+unsafe extern "system" fn retheme_child(window: HWND, _data: LPARAM) -> BOOL {
+    let mut class = [0u16; 64];
+    let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
+    let class = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+    if class.eq_ignore_ascii_case("EDIT")
+        || class.eq_ignore_ascii_case("COMBOBOX")
+        || class.eq_ignore_ascii_case("ComboLBox")
+    {
+        theme::style_edit(window, CURRENT_THEME.get());
+    }
+    1
 }
 
 unsafe fn set_window_icons(hwnd: HWND, icon: &icons::IconSet) {
@@ -2025,6 +2155,14 @@ unsafe fn pick_icon_color(owner: HWND, rgb: u32) -> Option<u32> {
 }
 
 unsafe fn fill_settings(app: &App) {
+    set_text(
+        GetDlgItem(app.settings_window, ID_THEME as i32),
+        if app.settings.theme_mode == config::ThemeMode::Dark {
+            "白天模式"
+        } else {
+            "暗夜模式"
+        },
+    );
     set_text(app.settings_ui.base, &app.settings.base_url);
     set_text(app.settings_ui.key, &app.settings.api_key);
     set_text(app.settings_ui.model, &app.settings.model);
@@ -2163,15 +2301,16 @@ unsafe fn child(parent: HWND, class: &str, label: &str, style: u32, id: u16) -> 
             (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
             10 | (10 << 16),
         );
-        theme::style_edit(hwnd);
+        theme::style_edit(hwnd, CURRENT_THEME.get());
     } else if class == "COMBOBOX" {
-        theme::style_edit(hwnd);
+        theme::style_edit(hwnd, CURRENT_THEME.get());
     }
     hwnd
 }
 
 unsafe fn make_settings(parent: HWND) -> SettingsUi {
     child(parent, "STATIC", "轻译", SS_LEFT, 200);
+    child(parent, "BUTTON", "白天模式", WS_TABSTOP, ID_THEME);
     child(
         parent,
         "STATIC",
@@ -2237,7 +2376,15 @@ unsafe fn make_settings(parent: HWND) -> SettingsUi {
     );
     child(parent, "BUTTON", "测试连接", WS_TABSTOP, ID_TEST);
     child(parent, "BUTTON", "图标", WS_TABSTOP, ID_APPEARANCE);
+    child(parent, "BUTTON", "检查更新", WS_TABSTOP, ID_UPDATE);
     child(parent, "BUTTON", "保存", WS_TABSTOP, ID_SAVE);
+    let update_status = child(
+        parent,
+        "STATIC",
+        &format!("v{} · 启动时自动检查更新", env!("CARGO_PKG_VERSION")),
+        SS_LEFT,
+        219,
+    );
     SettingsUi {
         provider,
         base,
@@ -2248,6 +2395,7 @@ unsafe fn make_settings(parent: HWND) -> SettingsUi {
         compatibility,
         mode,
         status,
+        update_status,
     }
 }
 
@@ -2469,7 +2617,8 @@ unsafe fn layout_settings(app: &mut App) {
     let margin = 24;
     let inner = width - margin * 2;
     let positions = [
-        (200, margin, 16, inner, 30),
+        (200, margin, 16, inner - 108, 30),
+        (ID_THEME, width - margin - 96, 17, 96, 28),
         (201, margin, 50, inner, 21),
         (202, margin, 88, 52, 22),
         (ID_PROVIDER, margin + 65, 80, inner - 65, 180),
@@ -2485,9 +2634,11 @@ unsafe fn layout_settings(app: &mut App) {
         (ID_SELECTION_MODE, margin + 190, 326, inner - 190, 156),
         (ID_COMPATIBILITY, margin, 365, inner, 28),
         (215, margin, 402, inner, 42),
-        (ID_TEST, margin, 458, 112, 34),
-        (ID_APPEARANCE, margin + 128, 458, 88, 34),
-        (ID_SAVE, width - margin - 104, 458, 104, 34),
+        (219, margin, 448, inner, 23),
+        (ID_TEST, margin, 488, 104, 34),
+        (ID_APPEARANCE, margin + 116, 488, 64, 34),
+        (ID_UPDATE, margin + 192, 488, 104, 34),
+        (ID_SAVE, width - margin - 104, 488, 104, 34),
     ];
     for (id, x, y, w, h) in positions {
         let control_font = if id == 200 {
@@ -2621,6 +2772,30 @@ unsafe fn position_near(hwnd: HWND, point: POINT, width: i32, height: i32) {
         HWND_NOTOPMOST
     };
     SetWindowPos(hwnd, insert_after, x, y, w, h, SWP_NOACTIVATE);
+}
+
+unsafe fn position_centered(hwnd: HWND, width: i32, height: i32) {
+    let monitor = MonitorFromPoint(cursor(), MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = zeroed();
+    info.cbSize = size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(monitor, &mut info) == 0 {
+        return;
+    }
+    let mut scale = 96;
+    let mut y_dpi = 96;
+    GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut scale, &mut y_dpi);
+    let work = info.rcWork;
+    let w = scaled(width, scale).min(work.right - work.left);
+    let h = scaled(height, scale).min(work.bottom - work.top);
+    SetWindowPos(
+        hwnd,
+        HWND_TOP,
+        work.left + (work.right - work.left - w) / 2,
+        work.top + (work.bottom - work.top - h) / 2,
+        w,
+        h,
+        SWP_NOACTIVATE,
+    );
 }
 
 unsafe fn ensure_settings_focus_visible(app: &mut App) {

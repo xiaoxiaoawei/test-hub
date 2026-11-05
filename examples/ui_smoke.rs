@@ -29,14 +29,24 @@ mod windows {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use windows_sys::Win32::{
-        Foundation::{FILETIME, HANDLE, HWND},
-        System::Threading::{AttachThreadInput, GetCurrentThreadId, GetProcessTimes},
+        Foundation::{CloseHandle, FILETIME, HANDLE, HWND, POINT, RECT, WAIT_OBJECT_0},
+        Graphics::Gdi::{
+            GetDC, GetMonitorInfoW, GetPixel, MonitorFromPoint, ReleaseDC, MONITORINFO,
+            MONITOR_DEFAULTTONEAREST,
+        },
+        System::Threading::{
+            AttachThreadInput, CreateEventW, GetCurrentThreadId, GetProcessTimes,
+            WaitForSingleObject,
+        },
         UI::Input::KeyboardAndMouse::SetFocus,
         UI::WindowsAndMessaging::{
-            FindWindowW, GetDlgItem, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId,
+            FindWindowExW, FindWindowW, GetCursorPos, GetDlgItem, GetForegroundWindow,
+            GetGUIThreadInfo, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow,
             IsWindowVisible, PeekMessageW, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
-            BM_CLICK, CBN_SELCHANGE, CB_ERR, CB_GETCURSEL, CB_SETCURSEL, GUITHREADINFO, MSG,
-            PM_NOREMOVE, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_COMMAND, WM_GETTEXT, WM_SETTEXT,
+            SetWindowPos, BM_CLICK, CBN_SELCHANGE, CB_ERR, CB_GETCURSEL, CB_SETCURSEL,
+            GUITHREADINFO, GW_OWNER, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+            SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_APP, WM_CLOSE, WM_COMMAND, WM_GETTEXT,
+            WM_SETTEXT,
         },
     };
 
@@ -57,6 +67,11 @@ mod windows {
     const ICON_SHAPE: i32 = 236;
     const ICON_SIZE: i32 = 237;
     const SCREEN_COLOR: i32 = 238;
+    const THEME: i32 = 109;
+    const UPDATE: i32 = 110;
+    const UPDATE_STATUS: i32 = 219;
+    const SAVE_TITLE: &str = "轻译 · 保存成功";
+    const SAVE_BODY: &str = "设置保存成功，已立即生效。";
 
     pub(super) fn run() -> Result<(), String> {
         let executable = std::env::args_os()
@@ -80,8 +95,24 @@ mod windows {
             std::env::temp_dir().join(format!("lingoleaf-ui-smoke-{}-{nonce}", std::process::id()));
         fs::create_dir(&directory)
             .map_err(|error| format!("Cannot create an isolated test directory: {error}"))?;
+        let restart_nonce = format!("{nonce:032x}");
+        let ready = unsafe {
+            CreateEventW(
+                null(),
+                1,
+                0,
+                wide(&format!("Local\\LingoLeaf.Update.AppReady.{restart_nonce}")).as_ptr(),
+            )
+        };
+        if ready.is_null() {
+            let _ = fs::remove_dir(&directory);
+            return Err("Cannot create the isolated update startup acknowledgement event.".into());
+        }
+        let ready = StartupEvent(ready);
+        let startup = Instant::now();
         let child = match Command::new(&executable)
             .env("LOCALAPPDATA", &directory)
+            .args(["--lingoleaf-update-restarted", &restart_nonce])
             .spawn()
         {
             Ok(child) => child,
@@ -97,6 +128,19 @@ mod windows {
             stopped: false,
         };
         let settings = owned.wait_for_settings()?;
+        if unsafe { WaitForSingleObject(ready.0, 3_000) } != WAIT_OBJECT_0 {
+            return Err(
+                "The real application did not acknowledge successful update startup.".into(),
+            );
+        }
+        if startup.elapsed() >= Duration::from_secs(5) {
+            return Err("Opening settings took over five seconds; startup update checking may be blocking the UI.".into());
+        }
+        require_centered(settings)?;
+        for id in [THEME, UPDATE, UPDATE_STATUS] {
+            require_visible(settings, id)?;
+        }
+        check_repeated_launch(&mut owned, settings)?;
         let ui_thread = window_thread(settings, owned.child.id())?;
         focus_settings_root(settings, ui_thread)?;
 
@@ -149,10 +193,12 @@ mod windows {
         require_visible(settings, SAVE)?;
         println!("Provider presets, credential clearing, model label and Save visibility passed.");
 
+        check_live_save(&mut owned, settings)?;
+        let settings = check_theme(&mut owned, settings)?;
         check_icon_appearance(&mut owned, settings)?;
 
         owned.stop()?;
-        println!("UI smoke check passed; no API request was sent.");
+        println!("UI smoke check passed; no translation API request was sent.");
         Ok(())
     }
 
@@ -163,6 +209,13 @@ mod windows {
         stopped: bool,
     }
 
+    struct StartupEvent(HANDLE);
+    impl Drop for StartupEvent {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
     impl OwnedApplication {
         fn restart(&mut self) -> Result<HWND, String> {
             self.stop()?;
@@ -171,11 +224,11 @@ mod windows {
                 .spawn()
                 .map_err(|error| format!("Cannot restart the test application: {error}"))?;
             self.stopped = false;
-            let background = self.wait_for_window(BACKGROUND_TITLE, false)?;
-            // Post rather than send: the window can exist before startup has
-            // installed its App state, while posted commands wait for the loop.
-            unsafe { PostMessageW(background, WM_COMMAND, 100, 0) };
-            self.wait_for_settings()
+            // A saved profile must still open settings automatically. Never
+            // post an Open command here: it would hide a startup regression.
+            let settings = self.wait_for_settings()?;
+            require_centered(settings)?;
+            Ok(settings)
         }
 
         fn wait_for_window(&mut self, title: &str, visible: bool) -> Result<HWND, String> {
@@ -220,7 +273,7 @@ mod windows {
                 }
                 if Instant::now() >= deadline {
                     return Err(
-                        "The first-run settings window did not appear within 20 seconds.".into(),
+                        "The settings window did not open automatically within 20 seconds.".into(),
                     );
                 }
                 thread::sleep(Duration::from_millis(40));
@@ -252,6 +305,205 @@ mod windows {
         }
     }
 
+    fn require_centered(window: HWND) -> Result<(), String> {
+        let mut pointer: POINT = unsafe { zeroed() };
+        let mut monitor: MONITORINFO = unsafe { zeroed() };
+        monitor.cbSize = size_of::<MONITORINFO>() as u32;
+        let mut rect: RECT = unsafe { zeroed() };
+        if unsafe { GetCursorPos(&mut pointer) } == 0
+            || unsafe {
+                GetMonitorInfoW(
+                    MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST),
+                    &mut monitor,
+                )
+            } == 0
+            || unsafe { GetWindowRect(window, &mut rect) } == 0
+        {
+            return Err("Cannot inspect the settings monitor and window bounds.".into());
+        }
+        let work = monitor.rcWork;
+        let expected_x = i64::from(work.left)
+            + (i64::from(work.right - work.left) - i64::from(rect.right - rect.left)) / 2;
+        let expected_y = i64::from(work.top)
+            + (i64::from(work.bottom - work.top) - i64::from(rect.bottom - rect.top)) / 2;
+        if (i64::from(rect.left) - expected_x).abs() > 4
+            || (i64::from(rect.top) - expected_y).abs() > 4
+        {
+            return Err(format!(
+                "Settings were not centered on the pointer's monitor: actual ({}, {}), expected ({expected_x}, {expected_y}).",
+                rect.left, rect.top
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_repeated_launch(owned: &mut OwnedApplication, settings: HWND) -> Result<(), String> {
+        unsafe {
+            SetWindowPos(
+                settings,
+                null_mut(),
+                25,
+                25,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        send(settings, WM_CLOSE, 0, 0)?;
+        let mut duplicate = Command::new(&owned.executable)
+            .env("LOCALAPPDATA", &owned.directory)
+            .spawn()
+            .map_err(|error| format!("Cannot test a repeated launch: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match duplicate.try_wait().map_err(|error| error.to_string())? {
+                Some(status) if status.success() => break,
+                Some(status) => return Err(format!("The repeated launch exited with {status}.")),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(30)),
+                None => {
+                    let _ = duplicate.kill();
+                    let _ = duplicate.wait();
+                    return Err(
+                        "The repeated launch did not return to the original instance.".into(),
+                    );
+                }
+            }
+        }
+        let shown = owned.wait_for_settings()?;
+        if shown != settings {
+            return Err("A repeated launch created a second settings window.".into());
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if require_centered(settings).is_ok() && unsafe { GetForegroundWindow() } == settings {
+                println!(
+                    "Startup and repeated-launch settings visibility, centering and focus passed."
+                );
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        Err("A repeated launch did not center and focus the existing settings window.".into())
+    }
+
+    fn save_settings(owned: &OwnedApplication, settings: HWND) -> Result<(), String> {
+        if unsafe { PostMessageW(control(settings, SAVE)?, BM_CLICK, 0, 0) } == 0 {
+            return Err("Cannot request a settings save.".into());
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let dialog = loop {
+            let dialog = unsafe { FindWindowW(wide("#32770").as_ptr(), wide(SAVE_TITLE).as_ptr()) };
+            if !dialog.is_null()
+                && window_thread(dialog, owned.child.id()).is_ok()
+                && unsafe { IsWindowVisible(dialog) } != 0
+            {
+                break dialog;
+            }
+            if Instant::now() >= deadline {
+                return Err("Saving settings did not show its native success dialog.".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        if unsafe { GetWindow(dialog, GW_OWNER) } != settings
+            || unsafe {
+                FindWindowExW(
+                    dialog,
+                    null_mut(),
+                    wide("Static").as_ptr(),
+                    wide(SAVE_BODY).as_ptr(),
+                )
+            }
+            .is_null()
+        {
+            return Err(
+                "The save confirmation did not belong to settings or show its success message."
+                    .into(),
+            );
+        }
+        click(dialog, 1)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { IsWindow(dialog) } != 0 {
+            if Instant::now() >= deadline {
+                return Err("The native save confirmation did not close after OK.".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    fn check_live_save(owned: &mut OwnedApplication, settings: HWND) -> Result<(), String> {
+        select_provider(settings, 0)?;
+        save_settings(owned, settings)?;
+        set_control_text(settings, 212, "ui-smoke-unsaved-draft")?;
+        // Bringing an already-visible settings window forward intentionally
+        // preserves a user's draft. Closing and reopening reloads the active
+        // in-memory settings and therefore exercises immediate application.
+        send(settings, WM_CLOSE, 0, 0)?;
+        let main = owned.wait_for_window(BACKGROUND_TITLE, false)?;
+        unsafe { PostMessageW(main, WM_APP + 4, 0, 0) };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while require_text(settings, 212, "deepseek-chat").is_err() {
+            if Instant::now() >= deadline {
+                return Err("Saved API settings were not applied to the running process.".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        require_text(settings, 210, "https://api.deepseek.com/v1")?;
+        select_provider(settings, 1)?;
+        save_settings(owned, settings)?;
+        println!("Native save confirmation and immediate API settings application passed.");
+        Ok(())
+    }
+
+    fn background_lightness(settings: HWND) -> Result<u32, String> {
+        let dc = unsafe { GetDC(settings) };
+        if dc.is_null() {
+            return Err("Cannot sample the visible settings palette.".into());
+        }
+        let color = unsafe { GetPixel(dc, 8, 8) };
+        unsafe { ReleaseDC(settings, dc) };
+        if color == u32::MAX {
+            return Err("The settings background pixel is unavailable.".into());
+        }
+        Ok((color & 255) + ((color >> 8) & 255) + ((color >> 16) & 255))
+    }
+
+    fn check_theme(owned: &mut OwnedApplication, settings: HWND) -> Result<HWND, String> {
+        require_text(settings, THEME, "白天模式")?;
+        let dark = background_lightness(settings)?;
+        let baseline = saved_settings(owned)?;
+        click(settings, THEME)?;
+        require_text(settings, THEME, "暗夜模式")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while background_lightness(settings)? < dark + 300 {
+            if Instant::now() >= deadline {
+                return Err("The day palette was not painted immediately.".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let mut expected = baseline.clone();
+        expected["theme_mode"] = serde_json::Value::String("light".into());
+        if saved_settings(owned)? != expected {
+            return Err(
+                "Changing the theme did not persist it or changed unrelated settings.".into(),
+            );
+        }
+        let settings = owned.restart()?;
+        require_text(settings, THEME, "暗夜模式")?;
+        if background_lightness(settings)? < dark + 300 {
+            return Err("The saved day palette was not restored on automatic startup.".into());
+        }
+        click(settings, THEME)?;
+        require_text(settings, THEME, "白天模式")?;
+        if saved_settings(owned)? != baseline {
+            return Err("Switching back to night did not preserve the saved settings.".into());
+        }
+        println!(
+            "Immediate day/night painting, persistence and automatic startup restoration passed."
+        );
+        Ok(settings)
+    }
+
     fn check_icon_appearance(owned: &mut OwnedApplication, settings: HWND) -> Result<(), String> {
         // Save a key-free baseline first. Appearance saves must preserve every
         // unrelated field, including provider, timeout and selection preference.
@@ -260,7 +512,7 @@ mod windows {
         require_visible(settings, COMPATIBILITY_CAPTURE)?;
         require_combo(settings, SELECTION_MODE, 0)?;
         select_combo(settings, SELECTION_MODE, 1)?;
-        click(settings, SAVE)?;
+        save_settings(owned, settings)?;
         let mut baseline = saved_settings(owned)?;
         if baseline
             .get("compatibility_capture")
@@ -285,7 +537,7 @@ mod windows {
         click(settings, COMPATIBILITY_CAPTURE)?;
         select_provider(settings, 0)?;
         select_provider(settings, 1)?;
-        click(settings, SAVE)?;
+        save_settings(owned, settings)?;
         let enabled = saved_settings(owned)?;
         baseline["compatibility_capture"] = serde_json::Value::Bool(true);
         if enabled != baseline {
@@ -342,7 +594,7 @@ mod windows {
         // A second click must disable the choice restored from disk. Checking
         // the whole document also protects mode, provider and saved icon values.
         click(settings, COMPATIBILITY_CAPTURE)?;
-        click(settings, SAVE)?;
+        save_settings(owned, settings)?;
         let disabled = saved_settings(owned)?;
         let mut expected = letter.clone();
         expected["compatibility_capture"] = serde_json::Value::Bool(false);
@@ -364,7 +616,7 @@ mod windows {
         }
         require_same_nonappearance_settings(&baseline, &restored)?;
         select_combo(settings, SELECTION_MODE, 0)?;
-        click(settings, SAVE)?;
+        save_settings(owned, settings)?;
         if saved_settings(owned)?
             .get("selection_mode")
             .and_then(serde_json::Value::as_str)

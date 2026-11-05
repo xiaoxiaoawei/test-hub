@@ -39,6 +39,15 @@ pub enum SelectionMode {
     Direct,
 }
 
+/// Persisted application palette, independent of the operating system theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub base_url: String,
@@ -50,6 +59,7 @@ pub struct Settings {
     pub selection_mode: SelectionMode,
     /// Explicit opt-in to temporarily copy a selection when UIA cannot read it.
     pub compatibility_capture: bool,
+    pub theme_mode: ThemeMode,
     pub icon_style: IconStyle,
     pub icon_shape: IconShape,
     /// Floating icon size in logical pixels, before per-monitor DPI scaling.
@@ -68,6 +78,7 @@ impl Default for Settings {
             selection_button: true,
             selection_mode: SelectionMode::default(),
             compatibility_capture: false,
+            theme_mode: ThemeMode::default(),
             icon_style: IconStyle::default(),
             icon_shape: IconShape::default(),
             icon_size: default_icon_size(),
@@ -95,6 +106,7 @@ impl fmt::Debug for Settings {
             .field("selection_button", &self.selection_button)
             .field("selection_mode", &self.selection_mode)
             .field("compatibility_capture", &self.compatibility_capture)
+            .field("theme_mode", &self.theme_mode)
             .field("icon_style", &self.icon_style)
             .field("icon_shape", &self.icon_shape)
             .field("icon_size", &self.icon_size)
@@ -178,6 +190,8 @@ struct StoredSettings {
     #[serde(default)]
     compatibility_capture: bool,
     #[serde(default)]
+    theme_mode: ThemeMode,
+    #[serde(default)]
     icon_style: IconStyle,
     #[serde(default)]
     icon_shape: IconShape,
@@ -199,6 +213,7 @@ impl StoredSettings {
             selection_button: settings.selection_button,
             selection_mode: settings.selection_mode,
             compatibility_capture: settings.compatibility_capture,
+            theme_mode: settings.theme_mode,
             icon_style: settings.icon_style,
             icon_shape: settings.icon_shape,
             icon_size: settings.icon_size,
@@ -218,6 +233,7 @@ impl StoredSettings {
             selection_button: self.selection_button,
             selection_mode: self.selection_mode,
             compatibility_capture: self.compatibility_capture,
+            theme_mode: self.theme_mode,
             icon_style: self.icon_style,
             icon_shape: self.icon_shape,
             icon_size: self.icon_size,
@@ -660,6 +676,7 @@ mod tests {
         assert_eq!(decoded.timeout_seconds, 20);
         assert_eq!(decoded.selection_mode, SelectionMode::Click);
         assert!(!decoded.compatibility_capture);
+        assert_eq!(decoded.theme_mode, ThemeMode::Dark);
         assert_eq!(decoded.icon_style, IconStyle::Translate);
         assert_eq!(decoded.icon_shape, IconShape::Rounded);
         assert_eq!(decoded.icon_size, 32);
@@ -768,6 +785,66 @@ mod tests {
             let restored = stored.into_settings(String::new()).unwrap();
             assert!(restored.compatibility_capture);
             assert_eq!(restored.selection_mode, mode);
+        }
+    }
+
+    #[test]
+    fn old_direct_configuration_keeps_warm_dark_theme_and_existing_settings() {
+        let legacy = serde_json::json!({
+            "version": 1,
+            "base_url": "https://example.com/v1",
+            "model": "custom-model",
+            "timeout_seconds": 30,
+            "selection_mode": "direct",
+            "compatibility_capture": true,
+            "icon_style": "letter",
+            "icon_shape": "circle",
+            "icon_size": 48,
+            "icon_color": 0x12_34_56,
+            "api_key_encrypted": [18, 42, 71]
+        });
+        let stored: StoredSettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
+        let restored = stored.into_settings("test-only-key".into()).unwrap();
+        assert_eq!(restored.theme_mode, ThemeMode::Dark);
+        assert_eq!(restored.base_url, "https://example.com/v1");
+        assert_eq!(restored.model, "custom-model");
+        assert_eq!(restored.selection_mode, SelectionMode::Direct);
+        assert!(restored.compatibility_capture);
+        assert_eq!(restored.icon_shape, IconShape::Circle);
+        assert_eq!(restored.icon_color, 0x12_34_56);
+        assert_eq!(restored.api_key, "test-only-key");
+    }
+
+    #[test]
+    fn both_theme_choices_roundtrip_without_changing_translation_or_appearance() {
+        for (mode, encoded_mode) in [(ThemeMode::Dark, "dark"), (ThemeMode::Light, "light")] {
+            let settings = Settings {
+                theme_mode: mode,
+                model: "custom-model".into(),
+                selection_mode: SelectionMode::Direct,
+                compatibility_capture: true,
+                icon_shape: IconShape::Circle,
+                icon_size: 48,
+                ..Settings::default()
+            };
+            let encoded =
+                serde_json::to_value(StoredSettings::from_settings(&settings, vec![18, 42, 71]))
+                    .unwrap();
+            assert_eq!(encoded["theme_mode"], encoded_mode);
+            assert_eq!(encoded["version"], SETTINGS_VERSION);
+            let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
+            assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
+            let restored = stored.into_settings("test-only-key".into()).unwrap();
+            assert_eq!(restored.theme_mode, mode);
+            assert_eq!(restored.model, settings.model);
+            assert_eq!(restored.selection_mode, settings.selection_mode);
+            assert_eq!(
+                restored.compatibility_capture,
+                settings.compatibility_capture
+            );
+            assert_eq!(restored.icon_shape, settings.icon_shape);
+            assert_eq!(restored.icon_size, settings.icon_size);
         }
     }
 

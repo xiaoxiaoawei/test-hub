@@ -2,6 +2,9 @@
 
 #[cfg(windows)]
 fn main() {
+    if lingoleaf::platform::update_install::run_helper_if_requested() {
+        return;
+    }
     lingoleaf::platform::app::run();
 }
 

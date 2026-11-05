@@ -1,17 +1,18 @@
-# 版本与打包
+# 版本、发布与更新源
 
-`lingoleaf` 是轻译的开发分支。以 `Cargo.toml` 的版本为准，使用 `主版本.次版本.修订号`：当前 0.x 阶段新增功能升级次版本，兼容修复升级修订号。每个版本在 `CHANGELOG.md` 中记录用户能观察到的变化、兼容性和验证状态。
+`lingoleaf` 是轻译开发分支。以 `Cargo.toml` 的 `主版本.次版本.修订号` 为准：当前 0.x 阶段新增功能升级次版本，兼容修复升级修订号；每版在 `CHANGELOG.md` 记录用户可见行为与验证状态。
 
-`vX.Y.Z` 标签用于标记对应源码。标签推送、分支推送、PR 或手动运行 Actions 都会执行检查；标签必须与源码版本一致。工作流只生成可下载的构建产物，不创建 GitHub Release，也不自动推送标签。
+`vX.Y.Z` 标签标记对应源码，必须与 Cargo、锁文件、Windows 资源及更新记录一致。分支、PR、标签和手动 Actions 都执行检查；仅本仓库的版本标签在检查通过后准备 **草稿 Release**。草稿不会进入客户端的已发布更新源，不会自动公开。
 
-## 准备一个版本
+## 准备版本
 
-1. 在 `lingoleaf` 分支完成改动，更新 `Cargo.toml` 的版本，并通过 Cargo 同步 `Cargo.lock` 中的本项目版本。
-2. 同步 `assets/lingoleaf.rc` 的四个版本字段：`FILEVERSION`、`PRODUCTVERSION` 为 `X,Y,Z,0`，字符串 `FileVersion` 为 `X.Y.Z.0`，`ProductVersion` 为 `X.Y.Z`。
-3. 更新 `CHANGELOG.md`、README 和 `docs/build-validation.md`。验证记录注明平台、工具链和结果；未执行的 Windows 手工项目保持未执行，不能用 Linux 或 Wine 结果代替。
-4. 完成以下检查与打包，再提交到开发分支。Python 需要 3.12 或更高版本，无第三方 Python 依赖。
+1. 在 `lingoleaf` 完成修改，更新 `Cargo.toml` 并通过 Cargo 同步锁文件中的本项目版本。
+2. 同步 `assets/lingoleaf.rc`：数字字段为 `X,Y,Z,0`，`FileVersion` 字符串为 `X.Y.Z.0`，`ProductVersion` 为 `X.Y.Z`。
+3. 更新 README、更新记录和 `docs/build-validation.md`，注明构建、Wine 与真实 Windows 的实际结果；未执行项目保持未执行。
+4. 使用 Python 3.12 或以上版本完成以下检查；Python 打包工具不需要第三方依赖。
 
 ```powershell
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
 python tools/release.py --check
 python -m unittest discover -s tools -p test_release.py
 cargo fmt --all -- --check
@@ -21,21 +22,22 @@ cargo build --release --locked
 python tools/release.py --exe target/release/lingoleaf.exe --out-dir dist
 ```
 
-在 Windows 上使用 MSVC 工具链和 Windows SDK 构建。Linux 交叉编译可用于构建检查，但仍需记录构建来源并完成 [Windows 验证清单](windows-validation.md)。Windows 交互测试需要可交互桌面，Actions 的非交互构建不代表完成手工验收。
+Windows CI 使用 MSVC 与 Windows SDK，配置静态 CRT 链接，并核对生成 EXE 的实际 `FileVersion`、`ProductVersion` 与 Cargo 一致。交叉编译可用于构建检查，但不能代替 [Windows 验证清单](windows-validation.md)。CI 的非交互测试也不代表完成手工验收。
 
-脚本会校验 Cargo 清单、锁文件、Windows 资源和更新记录的一致性，拒绝非 x64 PE 输入。它只读取文件头，不运行或验证 EXE 的实际功能，也不证明文件来自某次源码构建。
+打包脚本校验源码版本，拒绝超过 32 MiB、非 PE32+ x64、DLL 或非 GUI EXE 的输入，不执行输入文件。客户端在下载后和替换前另行核对大小、SHA-256、EXE 类型及内嵌版本。文件头或哈希检查不代表代码签名，也不证明实际功能已通过。
 
 ## 输出与校验
 
-以 0.4.2 为例，`dist` 生成：
+以 0.5.0 为例，`dist` 包含：
 
 ```text
-lingoleaf-0.4.2-windows-x64.exe
-lingoleaf-0.4.2-windows-x64.zip
+lingoleaf-0.5.0-windows-x64.exe
+lingoleaf-0.5.0-windows-x64.zip
+update.json
 SHA256SUMS
 ```
 
-ZIP 内保留以下相对路径，让 README 的文档链接在解压后可用：
+ZIP 仅包含程序与明确列出的文档，保留相对链接：
 
 ```text
 lingoleaf.exe
@@ -45,54 +47,86 @@ CHANGELOG.md
 docs/releasing.md
 docs/build-validation.md
 docs/windows-validation.md
-docs/images/settings-warm-dark.png  # 文件存在时包含
-docs/images/appearance.png        # 文件存在时包含
-docs/images/streaming.png         # 文件存在时包含
-docs/images/cache.png             # 文件存在时包含
-docs/images/inline.png            # 文件存在时包含
-docs/images/selection-icon.png    # 文件存在时包含
-docs/images/browser-web-0.4.2.png  # 文件存在时包含
-docs/images/browser-pdf-0.4.2.png  # 文件存在时包含
+docs/images/settings-warm-dark.png  # 文件存在时包含；0.4.0 旧截图
+docs/images/appearance.png        # 文件存在时包含；0.4.0 旧截图
+docs/images/streaming.png         # 文件存在时包含；0.4.0 旧截图
+docs/images/cache.png             # 文件存在时包含；0.4.0 旧截图
+docs/images/inline.png            # 文件存在时包含；0.4.0 旧截图
+docs/images/selection-icon.png    # 文件存在时包含；0.4.0 旧截图
+docs/images/browser-web-0.4.2.png  # 文件存在时包含；0.4.2 测试证据
+docs/images/browser-pdf-0.4.2.png  # 文件存在时包含；0.4.2 测试证据
+docs/images/settings-dark-0.5.0.png # 文件存在时包含；0.5.0 Wine 模拟源截图
+docs/images/settings-day-0.5.0.png  # 文件存在时包含；0.5.0 Wine 模拟源截图
 ```
 
-打包采用明确文件列表，不收集配置、密钥、缓存、日志或 UI 测试助手。构建前仍应检查源码和文档没有敏感信息。相同 EXE 和文档，在相同 Python/zlib 实现下会得到相同 ZIP：条目顺序、时间戳和权限固定。这不表示不同工具链会生成相同 EXE。
+不收集用户配置、密钥、缓存、日志、浏览器或测试助手。相同 EXE 与文档在相同 Python/zlib 下生成相同 ZIP：条目顺序、时间戳及权限固定；不同工具链的 EXE 不保证逐字节相同。更新清单是独立发布资产，不放进 ZIP，避免清单与 ZIP 哈希循环依赖。
 
-`SHA256SUMS` 包含独立 EXE 和 ZIP 的 SHA-256。可在 PowerShell 中计算并与文件中的对应行比较：
+`SHA256SUMS` 覆盖 EXE、ZIP 和 `update.json`。可核对：
 
 ```powershell
-Get-FileHash dist/lingoleaf-0.4.2-windows-x64.exe -Algorithm SHA256
-Get-FileHash dist/lingoleaf-0.4.2-windows-x64.zip -Algorithm SHA256
+Get-FileHash dist/lingoleaf-0.5.0-windows-x64.exe -Algorithm SHA256
+Get-FileHash dist/lingoleaf-0.5.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash dist/update.json -Algorithm SHA256
 ```
 
-当前产物未签名，没有安装器、自动更新器或自动升级服务。CI 产物不等于正式发布；公开发布 GitHub Release 应在核对版本、校验和及验证记录后单独执行。
+## 更新清单协议
 
-## 标记版本与获取 CI 产物
+客户端固定检查：
 
-确认开发分支的检查和评审已通过后，再为目标提交创建标签。以下命令示范 0.4.2；实际操作需与当前版本一致：
+```text
+https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/update.json
+```
+
+清单由打包工具生成，字段严格固定，不接受额外下载源：
+
+```json
+{
+  "schema_version": 1,
+  "version": "0.5.0",
+  "download_url": "https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.5.0/lingoleaf-0.5.0-windows-x64.exe",
+  "sha256": "<由打包脚本生成的64位小写十六进制SHA-256>",
+  "size": 0,
+  "notes_url": "https://github.com/xiaoxiaoawei/test-hub/releases/tag/v0.5.0"
+}
+```
+
+示例中的 SHA 与 `size` 是占位说明，不可直接发布；实际清单必须来自同次打包输出。版本仅接受三段稳定版本，下载地址、标签及 EXE 名称必须指向同一版本和仓库；大小限制为 64 字节至 32 MiB。客户端只将更高版本视为更新，不自动降级或选择预发布版本。下载还需符合 HTTPS 与允许的 GitHub 发布资产重定向规则，不允许服务端任意改用其他网站。
+
+更新网络不携带翻译 API Key、配置或所选文字，翻译服务地址不是更新源。首次未发布 Release、缺少清单或网络失败不能被伪报为“已是最新”；具体错误按客户端状态与验证记录核对。
+
+## 标签、CI 产物与草稿
+
+检查和评审通过后，再给目标提交创建版本标签；已公开标签不应移动，修复应递增版本。
 
 ```powershell
 git switch lingoleaf
 git status --short
-python tools/release.py --check --tag v0.4.2
-git tag -a v0.4.2 -m "LingoLeaf 0.4.2"
+python tools/release.py --check --tag v0.5.0
+git tag -a v0.5.0 -m "LingoLeaf 0.5.0"
 git push origin lingoleaf
-git push origin v0.4.2
+git push origin v0.5.0
 ```
 
-发布过的版本标签不应移动；需要修复时递增版本并创建新标签。可在 GitHub Actions 的 **Build, check and package** 运行页面下载 `lingoleaf-windows-x64` 产物。没有标签也可以从该工作流页面手动运行开发分支构建；手动构建不会自动创建标签或 Release。
+Actions 的 Windows 任务生成 `lingoleaf-windows-x64` 产物。普通分支或手动构建不创建 Release；版本标签的草稿发布任务仅在 Windows 与可移植检查都通过后执行，先下载并验证产物校验和，再把 EXE、ZIP、清单和校验和上传到该标签的草稿。
 
-## 更新与回退
+只有该发布任务具有 `contents: write` 权限，其余任务保持只读。重跑可刷新未公开草稿；发现同版本已公开时任务停止，不覆盖现有公开资产，避免同一版本的更新内容漂移。
 
-更新时先从系统托盘退出旧版本，确认旧进程已经退出，再将新版解压到新的目录并启动。关闭设置页只会隐藏窗口，不能替代退出程序。
+## 公开后客户端才可发现
 
-配置保存在当前用户的 `%LOCALAPPDATA%\LingoLeaf`，不随 EXE 目录移动。0.4.2 保留原有服务、模型、DPAPI 密钥、划词模式与图标外观；从更早版本升级时，为缺少的字段补充点击翻译模式、32 逻辑像素和圆角形状。新增 `compatibility_capture` 默认为 `false`，包括已经使用直接显示模式的旧配置，升级不会自动允许临时复制；须在设置勾选后保存才能启用。原有 `selection_button` 总开关继续有效，关闭状态不会因升级改变；升级不会自动启用直接发送选区的模式。内存翻译缓存不落盘，重启后清空。不要把配置文件或密钥复制到分发包中。
+发布者需核对草稿的标签、源码提交、EXE 内嵌版本、清单下载地址、大小与 SHA、随包验证记录以及 Windows 验收范围，再将草稿公开。不要把开发分支、Actions 下载链接或草稿链接当作客户端可用更新源。
 
-发布前对 0.4.2 额外核对：“兼容取词（网页 / PDF，临时复制）”默认和旧配置均关闭，勾选保存、关闭保存及重启后状态正确。默认只读路径不得模拟复制；启用后仅在明确物理划选、UIA 失败且来源为已知浏览器文档/PDF 时尝试一次 Ctrl + C。分别检查点击模式仍在点击图标后才发送 API，直接模式会在获取本次有效选区后自动发送。
+草稿公开后，应从未登录环境验证固定 `latest/download/update.json` 可访问，并用旧版客户端完成检查、确认下载、校验、确认重启及新版启动。尚未做这些步骤时保持“远端更新源未验收”，不能用本地模拟 HTTP 或 Wine helper 测试代替。若 GitHub 的 latest 指向不是预期稳定版本，应先修正发布设置；不要为补救而放宽客户端地址或版本校验。
 
-兼容取词需分别验证可完整快照的文本、HTML、RTF、DIB 等格式恢复，未知私有格式及无法完整恢复的 GDI/OLE 数据拒绝；取消、来源窗口改变或剪贴板序列变化时不覆盖用户新内容。恢复指当前剪贴板，不应宣称可回滚 Windows 剪贴板历史或其他程序已观察到的复制事件。快捷键已有受限复制回退和手动“翻译剪贴板”需各自回归，不混淆为自动兼容路径。
+当前仍未签名，也没有安装器或后台静默升级服务。应用内更新需要用户确认下载与重启。
 
-Chrome 和 Edge 的真实网页、文本 PDF 应分别在 Windows 上测试首次与重复划词、长文档、跨行选区和地址栏旧选区，区分默认 UIA 结果与开启兼容取词后的结果。搜索祖先截止、预算及 Raw View 缓存的修正不能直接归因为已证实的 Edge 根因。本轮 Edge 官方安装包 CDN 受云网络策略返回 403，未完成 Edge 实机验证；Chrome 的测试结果应独立记录，不能填作 Edge 通过。
+## 安装、更新与回退
 
-继续回归两种模式复用紧凑小框、同词异位置、A → B 连续划词及旧响应隔离，以及关闭总开关、图标外观、取色取消、无残影和混合 DPI，完整步骤见 [Windows 验证清单](windows-validation.md)。未执行项目保持未执行；构建、单元测试或 Wine 结果不能替代真实浏览器验收。README 中保留的截图来自 0.4.0，不能作为 0.4.2 新功能已验收的证据。
+0.4.2 或更早 EXE 没有本轮更新器，第一次升级至 0.5.0 必须先从系统托盘退出旧版，再手动解压或下载运行本版。关闭设置页只隐藏窗口，不能替代退出程序。
 
-回退时同样先退出新版本，再运行保留的旧 EXE。新加入的兼容取词及此前增加的大小、形状和划词模式在旧版中可能不生效；旧版再次保存配置可能丢弃新字段。回退到未验证版本前，先备份当前用户的配置文件；不要将回退视为已验证的迁移流程。DPAPI 密钥与 Windows 用户绑定，备份配置不等于可跨机器使用密钥。
+使用 0.5.0 后，启动会后台检查，也可手动检查；发现可用版本先提示下载，校验成功后再确认重启。确认后更新助手等待父进程退出再替换当前 EXE 并启动新版；新版未完成启动确认时尝试回滚旧版。不可写目录不自行请求管理员权限，应手动下载到可写位置。不要在下载或替换期间移动、删除正在使用的程序及更新文件。
+
+配置仍在 `%LOCALAPPDATA%\LingoLeaf`，更新不会要求复制密钥文件。保留服务、模型、DPAPI 密钥、划词模式、兼容取词和图标外观；旧配置缺少 `theme_mode` 时默认为暗夜。兼容取词缺失时保持 `false`，旧总开关关闭状态不变，不隐式启用自动发送或复制。主题按钮只保存主题偏好，API 表单须点保存；保存成功后新设置立即用于后续请求。
+
+发布前对 0.5.0 重点验证：每次启动及重复运行的显示器居中、草稿保留、保存成功/失败提示、无需重启的 API 与模式切换、两种主题即时切换及重启恢复、启动与手动检查、公开源不存在/离线/无更新/有更新、错误下载拒绝、确认重启及失败回滚。继续回归既有划词、剪贴板、图标与混合 DPI，未测项目不标通过，完整步骤见 [Windows 验证清单](windows-validation.md)。
+
+手动回退同样先退出当前版本，再运行保留的旧 EXE。旧版本保存设置可能丢失新字段，先备份当前用户配置；DPAPI 密钥仍与 Windows 用户绑定，备份不代表可以跨机器使用。更新助手保留旧版本用于本次启动失败恢复，不应把所有操作系统错误、断电或用户手动删除都宣传为可以无条件恢复。

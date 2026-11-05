@@ -93,9 +93,9 @@ mod windows {
         let source = Source::start()?;
         let mut app = Application::start(executable, &directory)?;
         let background = app.window(BACKGROUND)?;
-        // The hidden HWND is created before App state is installed. A posted
-        // settings command is handled only once startup enters its message loop.
-        unsafe { PostMessageW(background, WM_APP + 4, 0, 0) };
+        // Settings is shown automatically after App state is installed. Do not
+        // post a second Open command: it could reopen settings after WM_CLOSE
+        // and take foreground focus from the owned source during the gesture.
         let settings = app.window(SETTINGS)?;
         wait_for("the startup settings barrier", || {
             Ok(unsafe { IsWindowVisible(settings) } != 0)

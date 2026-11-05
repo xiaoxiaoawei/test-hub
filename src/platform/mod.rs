@@ -7,3 +7,4 @@ mod popup;
 pub mod selection;
 mod selection_events;
 mod theme;
+pub mod update_install;

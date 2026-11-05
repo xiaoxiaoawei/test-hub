@@ -5,6 +5,7 @@
 //! the user to copy explicitly and use “Translate clipboard”.
 
 use std::{
+    cell::RefCell,
     mem::size_of,
     ptr, thread,
     time::{Duration, Instant},
@@ -17,12 +18,29 @@ use windows::{
             CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
             COINIT_MULTITHREADED,
         },
+        System::Ole::{
+            SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetDim, SafeArrayGetElemsize,
+            SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
+        },
         UI::Accessibility::{
-            CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement,
-            IUIAutomationTextPattern, IUIAutomationTreeWalker, UIA_TextPatternId,
+            CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2,
+            IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationTextPattern,
+            IUIAutomationTextPattern2, IUIAutomationTextRange, IUIAutomationTreeWalker,
+            SupportedTextSelection_None, TreeScope_Element, UIA_BoundingRectanglePropertyId,
+            UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
+            UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+            UIA_IsTextPattern2AvailablePropertyId, UIA_IsTextPatternAvailablePropertyId,
+            UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_TextPattern2Id,
+            UIA_TextPatternId,
         },
     },
 };
+
+#[path = "selection/probe.rs"]
+mod probe;
+#[cfg(test)]
+#[path = "selection/provider_tests.rs"]
+mod provider_tests;
 use windows_sys::Win32::{
     Foundation::{GetLastError, GlobalFree, SetLastError, HGLOBAL, HWND, POINT},
     System::{
@@ -39,9 +57,9 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetAncestor, GetClassNameW, GetForegroundWindow,
-            GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageTimeoutW,
-            WindowFromPoint, ES_PASSWORD, GA_ROOT, GUITHREADINFO, GWL_STYLE, HWND_MESSAGE,
-            SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, WM_GETTEXT,
+            GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId, IsChild,
+            SendMessageTimeoutW, WindowFromPoint, ES_PASSWORD, GA_ROOT, GUITHREADINFO, GWL_STYLE,
+            HWND_MESSAGE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, WM_GETTEXT,
         },
     },
 };
@@ -49,6 +67,8 @@ use windows_sys::Win32::{
 const UNICODE_TEXT: u32 = 13;
 const MAX_SELECTION_UNITS: usize = 32_000;
 const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
+const NO_SELECTION_MESSAGE: &str = "未读取到选中文字，请重新选择。";
+const PROTECTED_MESSAGE: &str = "不会读取密码字段或无法确认安全属性的文本控件。";
 
 #[derive(Debug, Clone)]
 pub struct CapturedText {
@@ -66,18 +86,35 @@ enum UiaFailure {
 /// Capture the current foreground selection. Automatic mouse selection must pass
 /// `false`; only a deliberate user hotkey is allowed to pass `true`.
 pub fn capture_selection(allow_clipboard_fallback: bool) -> Result<CapturedText, String> {
-    capture(None, allow_clipboard_fallback)
+    capture(None, None, allow_clipboard_fallback)
 }
 
 /// Read a mouse selection without changing the clipboard. Hit testing matters
 /// for documents whose text selection does not move Windows keyboard focus.
 pub fn capture_selection_at(point: POINT) -> Result<CapturedText, String> {
-    capture(Some(point), false)
+    capture(Some(point), None, false)
 }
 
-fn capture(point: Option<POINT>, allow_copy: bool) -> Result<CapturedText, String> {
+/// Associate a mouse selection with its physical gesture so that an old address
+/// bar selection cannot win over the PDF region where the drag occurred.
+pub fn capture_selection_for_gesture(
+    origin: Option<POINT>,
+    point: POINT,
+) -> Result<CapturedText, String> {
+    capture(Some(point), origin, false)
+}
+
+fn capture(
+    point: Option<POINT>,
+    origin: Option<POINT>,
+    allow_copy: bool,
+) -> Result<CapturedText, String> {
     let target = Target::foreground()?;
-    let point_window = point.map(|point| unsafe { WindowFromPoint(point) });
+    let source_point = source_hit_point(&target, point, origin);
+    if point.is_some() && source_point.is_none() {
+        return Err(no_selection());
+    }
+    let point_window = source_point.map(|point| unsafe { WindowFromPoint(point) });
     let focus_window = target.focus_window();
     // A true EDIT selection is more direct and cheaper than COM, and also works
     // when an old application does not expose a UIA TextPattern provider.
@@ -97,7 +134,7 @@ fn capture(point: Option<POINT>, allow_copy: bool) -> Result<CapturedText, Strin
         }
     }
 
-    let uia = capture_uia(&target, point);
+    let uia = capture_uia(&target, point, origin);
     match uia {
         Ok(text) => target.finish(text, "UI Automation"),
         Err(UiaFailure::Protected) => Err(protected_message()),
@@ -107,10 +144,17 @@ fn capture(point: Option<POINT>, allow_copy: bool) -> Result<CapturedText, Strin
                 UiaFailure::Unavailable(reason) => (reason, allow_copy),
                 UiaFailure::Protected => unreachable!("protected candidate handled above"),
             };
-            // Focused native controls are a secondary source for a drag whose
-            // pointer ends outside the document. Never cross the foreground root.
+            // A focused toolbar EDIT can retain an old selection while the user
+            // drags in a PDF. Automatic fallback needs an actual gesture hit on
+            // that control (or a child), not just the same foreground root.
             if let Some(window) = focus_window {
-                if Some(window) != native_first {
+                let hits = [point, origin]
+                    .into_iter()
+                    .flatten()
+                    .map(|point| unsafe { WindowFromPoint(point) });
+                if Some(window) != native_first
+                    && focused_native_fallback_allowed(&target, window, point.is_some(), hits)
+                {
                     match native_edit_selection(&target, window) {
                         Ok(NativeSelection::Text(text)) => {
                             return target.finish(text, "原生文本选区")
@@ -130,11 +174,50 @@ fn capture(point: Option<POINT>, allow_copy: bool) -> Result<CapturedText, Strin
     }
 }
 
+fn focused_native_fallback_allowed(
+    target: &Target,
+    focused: HWND,
+    automatic: bool,
+    hits: impl IntoIterator<Item = HWND>,
+) -> bool {
+    target.owns_window(focused)
+        && (!automatic
+            || hits.into_iter().any(|hit| {
+                target.owns_window(hit) && (hit == focused || unsafe { IsChild(focused, hit) } != 0)
+            }))
+}
+
 fn no_selection() -> String {
-    "未读取到选中文字，请重新选择。".into()
+    NO_SELECTION_MESSAGE.into()
 }
 fn protected_message() -> String {
-    "不会读取密码字段或无法确认安全属性的文本控件。".into()
+    PROTECTED_MESSAGE.into()
+}
+
+fn source_hit_point(target: &Target, end: Option<POINT>, origin: Option<POINT>) -> Option<POINT> {
+    // A nonactivating translation popup can cover the drag's release point.
+    // Locate the source at the original press instead; never probe our popup
+    // or accept a UIA element merely because it belongs to this process.
+    choose_source_point(end, origin, |point| {
+        target.owns_window(unsafe { WindowFromPoint(point) })
+    })
+}
+
+fn choose_source_point(
+    end: Option<POINT>,
+    origin: Option<POINT>,
+    mut owned: impl FnMut(POINT) -> bool,
+) -> Option<POINT> {
+    end.filter(|point| owned(*point))
+        .or_else(|| origin.filter(|point| owned(*point)))
+}
+
+pub fn is_no_selection_error(message: &str) -> bool {
+    message == NO_SELECTION_MESSAGE
+}
+
+pub fn is_protected_error(message: &str) -> bool {
+    message == PROTECTED_MESSAGE
 }
 
 struct Target {
@@ -323,159 +406,646 @@ impl Drop for ComApartment {
 }
 
 const UIA_BUDGET: Duration = Duration::from_millis(900);
-const MAX_ANCESTORS: usize = 10;
+const MAX_ANCESTORS: usize = 12;
 
-fn capture_uia(target: &Target, point: Option<POINT>) -> Result<String, UiaFailure> {
-    let _apartment = ComApartment::initialize()?;
-    // UIA timeouts bound individual provider transactions. They cannot make a
-    // misbehaving COM provider synchronously cancellable; the UI never waits here.
-    let deadline = Instant::now() + UIA_BUDGET;
-    unsafe {
-        let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
-                .or_else(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))
-                .map_err(|_| UiaFailure::Unavailable("此窗口暂时无法读取选区。".into()))?;
-        if let Ok(settings) = automation.cast::<IUIAutomation2>() {
-            let _ = settings.SetConnectionTimeout(400);
-            let _ = settings.SetTransactionTimeout(500);
+// Keep the apartment and automation object on their creating thread. Repeated
+// drags and delayed PDF-provider retries should not reconnect COM each time.
+thread_local! {
+    static UIA_SESSION: RefCell<Option<UiaSession>> = const { RefCell::new(None) };
+}
+
+struct UiaSession {
+    automation: IUIAutomation,
+    cache: IUIAutomationCacheRequest,
+    raw: IUIAutomationTreeWalker,
+    control: IUIAutomationTreeWalker,
+    // Fields drop in declaration order: release the COM objects before COM.
+    _apartment: ComApartment,
+}
+
+impl UiaSession {
+    fn new() -> Result<Self, UiaFailure> {
+        let apartment = ComApartment::initialize()?;
+        unsafe {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+                    .or_else(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))
+                    .map_err(|_| UiaFailure::Unavailable("此窗口暂时无法读取选区。".into()))?;
+            if let Ok(settings) = automation.cast::<IUIAutomation2>() {
+                let _ = settings.SetConnectionTimeout(300);
+                let _ = settings.SetTransactionTimeout(200);
+            }
+            let cache = automation.CreateCacheRequest().map_err(uia_setup_error)?;
+            cache
+                .SetTreeScope(TreeScope_Element)
+                .map_err(uia_setup_error)?;
+            // One provider transaction returns the geometry and safety metadata.
+            // No Name, Value, DocumentRange or document text is cached.
+            for property in [
+                UIA_ProcessIdPropertyId,
+                UIA_NativeWindowHandlePropertyId,
+                UIA_IsPasswordPropertyId,
+                UIA_BoundingRectanglePropertyId,
+                UIA_IsOffscreenPropertyId,
+                UIA_ControlTypePropertyId,
+                UIA_IsTextPatternAvailablePropertyId,
+                UIA_IsTextPattern2AvailablePropertyId,
+            ] {
+                cache.AddProperty(property).map_err(uia_setup_error)?;
+            }
+            let raw = automation.RawViewWalker().map_err(uia_setup_error)?;
+            let control = automation.ControlViewWalker().map_err(uia_setup_error)?;
+            Ok(Self {
+                automation,
+                cache,
+                raw,
+                control,
+                _apartment: apartment,
+            })
         }
-        let walker = automation.ControlViewWalker().ok();
-        let mut unverified = false;
-        if let Some(point) = point {
-            if target.owns_window(WindowFromPoint(point)) && Instant::now() < deadline {
-                if let Ok(element) =
-                    automation.ElementFromPoint(windows::Win32::Foundation::POINT {
+    }
+}
+
+fn uia_setup_error(_: windows::core::Error) -> UiaFailure {
+    UiaFailure::Unavailable("此窗口暂时无法读取选区。".into())
+}
+
+fn with_uia<T>(
+    operation: impl FnOnce(&UiaSession) -> Result<T, UiaFailure>,
+) -> Result<T, UiaFailure> {
+    UIA_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(UiaSession::new()?);
+        }
+        operation(slot.as_ref().expect("initialized UIA session"))
+    })
+}
+
+#[derive(Clone)]
+struct UiaNode {
+    element: IUIAutomationElement,
+    native: HWND,
+    pid: i32,
+    password: Option<bool>,
+    text_available: Option<bool>,
+    text2_available: Option<bool>,
+    metadata: probe::Metadata,
+}
+
+#[derive(Default)]
+struct ProbeFailures {
+    unverified: bool,
+    unavailable: Option<String>,
+}
+
+impl ProbeFailures {
+    fn observe(
+        &mut self,
+        result: Result<Option<String>, UiaFailure>,
+    ) -> Result<Option<String>, UiaFailure> {
+        match result {
+            Err(UiaFailure::Protected) => Err(UiaFailure::Protected),
+            Err(UiaFailure::Unverified) => {
+                self.unverified = true;
+                Ok(None)
+            }
+            Err(UiaFailure::Unavailable(reason)) => {
+                self.unavailable = Some(reason);
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+}
+
+impl UiaNode {
+    fn may_have_text(&self) -> bool {
+        self.text_available != Some(false) || self.text2_available != Some(false)
+    }
+
+    unsafe fn cached(element: IUIAutomationElement) -> Self {
+        unsafe {
+            let bounds = element
+                .CachedBoundingRectangle()
+                .ok()
+                .map(|rect| probe::Bounds {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                });
+            let kind = element.CachedControlType().ok();
+            Self {
+                native: element
+                    .CachedNativeWindowHandle()
+                    .ok()
+                    .map(|window| window.0)
+                    .unwrap_or(ptr::null_mut()),
+                pid: element.CachedProcessId().unwrap_or(0),
+                password: element.CachedIsPassword().ok().map(|value| value.as_bool()),
+                text_available: cached_bool(&element, UIA_IsTextPatternAvailablePropertyId),
+                text2_available: cached_bool(&element, UIA_IsTextPattern2AvailablePropertyId),
+                metadata: probe::Metadata {
+                    bounds,
+                    offscreen: element
+                        .CachedIsOffscreen()
+                        .is_ok_and(|value| value.as_bool()),
+                    document: kind == Some(UIA_DocumentControlTypeId),
+                    edit: kind == Some(UIA_EditControlTypeId),
+                },
+                element,
+            }
+        }
+    }
+}
+
+unsafe fn cached_bool(
+    element: &IUIAutomationElement,
+    property: windows::Win32::UI::Accessibility::UIA_PROPERTY_ID,
+) -> Option<bool> {
+    let value = unsafe { element.GetCachedPropertyValue(property) }.ok()?;
+    bool::try_from(&value).ok()
+}
+
+/// Connect browser accessibility before a drag, without reading any text. This
+/// belongs on the capture worker; a provider call must never run in a UI hook.
+/// Chromium PDF accessibility trees may still load asynchronously after this.
+pub fn warm_selection_provider(foreground: isize) {
+    let Ok(target) = Target::foreground() else {
+        return;
+    };
+    if target.foreground as isize != foreground || !browser_window(target.root) {
+        return;
+    }
+    let _ = with_uia(|session| unsafe {
+        let deadline = Instant::now() + Duration::from_millis(350);
+        let element = session
+            .automation
+            .ElementFromHandleBuildCache(
+                windows::Win32::Foundation::HWND(target.root),
+                &session.cache,
+            )
+            .map_err(uia_setup_error)?;
+        let root = UiaNode::cached(element);
+        if root.native != target.root {
+            return Ok(());
+        }
+        // Requesting TextPattern activates inline-text accessibility in Chromium;
+        // merely looking at the browser shell does not. Do not call GetSelection.
+        search_subtree(
+            &target,
+            session,
+            &session.raw,
+            root,
+            SearchOptions {
+                point: None,
+                deadline,
+                read_text: false,
+                gesture: None,
+            },
+            &mut probe::Budget::new(24, 6),
+        )?;
+        Ok(())
+    });
+}
+
+fn browser_window(window: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let count = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+    let class = String::from_utf16_lossy(&class[..count.max(0) as usize]);
+    class.starts_with("Chrome_WidgetWin_") || class == "MozillaWindowClass"
+}
+
+fn capture_uia(
+    target: &Target,
+    point: Option<POINT>,
+    origin: Option<POINT>,
+) -> Result<String, UiaFailure> {
+    with_uia(|session| unsafe {
+        // A transaction can exceed this soft deadline inside an external COM
+        // provider. The worker remains isolated from painting and mouse hooks.
+        let deadline = Instant::now() + UIA_BUDGET;
+        let gesture = point.map(|end| probe::Gesture {
+            origin: origin.map(|start| (start.x, start.y)),
+            end: (end.x, end.y),
+        });
+        let anchor = source_hit_point(target, point, origin);
+        let mut failures = ProbeFailures::default();
+        let mut point_scope = None;
+        if let Some(point) = anchor {
+            if target.owns_window(WindowFromPoint(point)) {
+                if let Ok(element) = session.automation.ElementFromPointBuildCache(
+                    windows::Win32::Foundation::POINT {
                         x: point.x,
                         y: point.y,
-                    })
-                {
-                    match candidate_text(target, element, walker.as_ref(), deadline) {
-                        Ok(Some(text)) => return Ok(text),
-                        Err(UiaFailure::Unverified) => unverified = true,
-                        Err(failure) => return Err(failure),
-                        Ok(None) => {}
+                    },
+                    &session.cache,
+                ) {
+                    let first = UiaNode::cached(element);
+                    let mut chain = scoped_chain(
+                        target,
+                        first.clone(),
+                        session,
+                        &session.raw,
+                        (Instant::now() + Duration::from_millis(180)).min(deadline),
+                    );
+                    if chain.is_empty() && Instant::now() < deadline {
+                        chain = scoped_chain(
+                            target,
+                            first,
+                            session,
+                            &session.control,
+                            (Instant::now() + Duration::from_millis(120)).min(deadline),
+                        );
+                    }
+                    if let Some(text) = failures.observe(chain_text(
+                        &chain,
+                        Some(point),
+                        gesture,
+                        (Instant::now() + Duration::from_millis(160)).min(deadline),
+                    ))? {
+                        return Ok(text);
+                    }
+                    point_scope = subtree_scope(&chain);
+                }
+                // A PDF's TextPattern may be on an embedded descendant of the
+                // hit-tested host, rather than on a hit/focus ancestor. Reserve
+                // time for this before querying unrelated keyboard focus.
+                if let Some(scope) = point_scope.clone() {
+                    if let Some(text) = failures.observe(search_subtree(
+                        target,
+                        session,
+                        &session.raw,
+                        scope,
+                        SearchOptions::capture(
+                            Some(point),
+                            gesture,
+                            (Instant::now() + Duration::from_millis(300)).min(deadline),
+                        ),
+                        &mut probe::Budget::new(48, 12),
+                    ))? {
+                        return Ok(text);
+                    }
+                }
+                if let Some(scope) = point_scope.take() {
+                    if let Some(text) = failures.observe(search_subtree(
+                        target,
+                        session,
+                        &session.control,
+                        scope,
+                        SearchOptions::capture(
+                            Some(point),
+                            gesture,
+                            (Instant::now() + Duration::from_millis(200)).min(deadline),
+                        ),
+                        &mut probe::Budget::new(32, 10),
+                    ))? {
+                        return Ok(text);
                     }
                 }
             }
         }
         if Instant::now() < deadline {
-            if let Ok(element) = automation.GetFocusedElement() {
-                match candidate_text(target, element, walker.as_ref(), deadline) {
-                    Ok(Some(text)) => return Ok(text),
-                    Err(UiaFailure::Unverified) => unverified = true,
-                    Err(failure) => return Err(failure),
-                    Ok(None) => {}
+            if let Ok(element) = session
+                .automation
+                .GetFocusedElementBuildCache(&session.cache)
+            {
+                let chain = scoped_chain(
+                    target,
+                    UiaNode::cached(element),
+                    session,
+                    &session.control,
+                    (Instant::now() + Duration::from_millis(160)).min(deadline),
+                );
+                if let Some(text) = failures.observe(chain_text(
+                    &chain,
+                    anchor,
+                    gesture,
+                    (Instant::now() + Duration::from_millis(140)).min(deadline),
+                ))? {
+                    return Ok(text);
+                }
+                if let Some(scope) = subtree_scope(&chain) {
+                    if let Some(text) = failures.observe(search_subtree(
+                        target,
+                        session,
+                        &session.control,
+                        scope,
+                        SearchOptions::capture(anchor, gesture, deadline),
+                        &mut probe::Budget::new(32, 10),
+                    ))? {
+                        return Ok(text);
+                    }
                 }
             }
         }
-        if unverified {
-            return Err(UiaFailure::Unverified);
+        // Raw view includes plugin bridges omitted from Control view. Conversely
+        // Control view can reach the Document without hundreds of raw glyphs.
+        // Use only the verified foreground HWND as a final scope; never use the
+        // desktop automation root. The point scope was already tried in both.
+        if Instant::now() < deadline {
+            let scope = {
+                let point_is_owned = point.is_none() || anchor.is_some();
+                point_is_owned
+                    .then(|| {
+                        session
+                            .automation
+                            .ElementFromHandleBuildCache(
+                                windows::Win32::Foundation::HWND(target.root),
+                                &session.cache,
+                            )
+                            .ok()
+                    })
+                    .flatten()
+                    .map(|element| UiaNode::cached(element))
+            };
+            if let Some(scope) = scope {
+                if let Some(text) = failures.observe(search_subtree(
+                    target,
+                    session,
+                    &session.control,
+                    scope,
+                    SearchOptions::capture(anchor, gesture, deadline),
+                    &mut probe::Budget::new(32, 10),
+                ))? {
+                    return Ok(text);
+                }
+            }
         }
-    }
-    Err(UiaFailure::Unavailable(
-        "未读取到选中文字；请重新划选或使用快捷键。".into(),
-    ))
+        if failures.unverified {
+            Err(UiaFailure::Unverified)
+        } else if let Some(reason) = failures.unavailable {
+            Err(UiaFailure::Unavailable(reason))
+        } else {
+            Err(UiaFailure::Unavailable(
+                "未读取到选中文字；PDF 文字接口可能仍在加载，请重新划选或手动复制后翻译。".into(),
+            ))
+        }
+    })
 }
 
-unsafe fn candidate_text(
-    target: &Target,
-    first: IUIAutomationElement,
-    walker: Option<&IUIAutomationTreeWalker>,
+unsafe fn chain_text(
+    chain: &[UiaNode],
+    anchor: Option<POINT>,
+    gesture: Option<probe::Gesture>,
     deadline: Instant,
 ) -> Result<Option<String>, UiaFailure> {
-    let chain = unsafe { scoped_chain(target, first, walker, deadline) };
     let mut verified_leaf = false;
-    for element in chain {
+    let mut failures = ProbeFailures::default();
+    for node in chain {
         if Instant::now() >= deadline {
             break;
         }
-        match unsafe { element.CurrentIsPassword() } {
+        if probe::priority(node.metadata, anchor.map(|point| (point.x, point.y)), 0, 0).is_none() {
+            continue;
+        }
+        match node.password {
+            Some(true) => return Err(UiaFailure::Protected),
+            Some(false) => {}
+            None if verified_leaf => continue,
+            None => return Err(UiaFailure::Unverified),
+        }
+        match unsafe { node.element.CurrentIsPassword() } {
             Ok(value) if value.as_bool() => return Err(UiaFailure::Protected),
             Ok(_) => verified_leaf = true,
-            // An unknown first candidate is unsafe to read. After a known-safe
-            // leaf, skip an unsupported ancestor and try its next ancestor;
-            // never extract text from the unknown element itself.
             Err(_) if verified_leaf => continue,
             Err(_) => return Err(UiaFailure::Unverified),
         }
-        if Instant::now() >= deadline {
-            break;
+        if !node.may_have_text() {
+            continue;
         }
-        if let Ok(pattern) =
-            unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }
-        {
-            if let Some(text) = unsafe { selected_text(&pattern, deadline)? } {
+        if let Some(pattern) = unsafe { text_pattern(node, false) } {
+            if let Some(text) =
+                failures.observe(unsafe { selected_text(&pattern, gesture, deadline) })?
+            {
                 return Ok(Some(text));
             }
         }
     }
-    Ok(None)
+    failures
+        .unavailable
+        .map_or(Ok(None), |reason| Err(UiaFailure::Unavailable(reason)))
 }
 
 unsafe fn scoped_chain(
     target: &Target,
-    first: IUIAutomationElement,
-    walker: Option<&IUIAutomationTreeWalker>,
+    first: UiaNode,
+    session: &UiaSession,
+    walker: &IUIAutomationTreeWalker,
     deadline: Instant,
-) -> Vec<IUIAutomationElement> {
-    let initial_pid = unsafe { first.CurrentProcessId() }.ok().unwrap_or(0);
-    let mut scoped = false;
+) -> Vec<UiaNode> {
+    let initial_pid = first.pid;
     let mut chain = Vec::new();
-    let mut element = first;
+    let mut node = first;
     for _ in 0..MAX_ANCESTORS {
         if Instant::now() >= deadline {
             break;
         }
-        let native = unsafe { element.CurrentNativeWindowHandle() }
-            .ok()
-            .map(|window| window.0);
-        if let Some(native) = native.filter(|window| !window.is_null()) {
-            if !target.owns_window(native) {
-                return Vec::new();
-            }
-            scoped = true;
+        if !node.native.is_null() && !target.owns_window(node.native) {
+            return Vec::new();
         }
-        let at_root = native == Some(target.root);
-        let pid = unsafe { element.CurrentProcessId() }.ok().unwrap_or(0);
-        chain.push((element.clone(), pid));
-        if at_root {
-            break;
+        let proven = !node.native.is_null();
+        chain.push(node.clone());
+        // A native child HWND already proves the foreground root. Walking on to
+        // the entire browser shell costs time needed by an embedded document.
+        if proven {
+            return chain;
         }
-        let Some(walker) = walker else { break };
-        if Instant::now() >= deadline {
-            break;
-        }
-        let Ok(parent) = (unsafe { walker.GetParentElement(&element) }) else {
+        let Ok(parent) =
+            (unsafe { walker.GetParentElementBuildCache(&node.element, &session.cache) })
+        else {
             break;
         };
-        // Hosted browsers can cross renderer/host PIDs within one foreground
-        // root. Native HWND ancestry is stronger evidence than PID equality.
-        element = parent;
+        node = unsafe { UiaNode::cached(parent) };
     }
-    // Some providers do not expose HWNDs. A same-process candidate returned by
-    // the foreground's hit test/focus is still useful, but never accept an
-    // unproven cross-process document or walk into another root window.
-    if scoped {
-        chain.into_iter().map(|(element, _)| element).collect()
-    } else if initial_pid == target.pid as i32 {
+    if initial_pid == target.pid as i32 {
         chain
             .into_iter()
-            .take_while(|(_, pid)| *pid == target.pid as i32)
-            .map(|(element, _)| element)
+            .take_while(|node| node.pid == target.pid as i32)
             .collect()
     } else {
+        // A renderer with another PID is accepted only with the HWND ancestry
+        // proof above, not just because it is an accessibility descendant.
         Vec::new()
+    }
+}
+
+fn subtree_scope(chain: &[UiaNode]) -> Option<UiaNode> {
+    chain
+        .iter()
+        .find(|node| node.metadata.document)
+        .or_else(|| chain.last())
+        .cloned()
+}
+
+struct PendingNode {
+    node: UiaNode,
+    priority: probe::Priority,
+    depth: usize,
+    unknown_bounds: usize,
+}
+
+struct SearchOptions {
+    point: Option<POINT>,
+    deadline: Instant,
+    read_text: bool,
+    gesture: Option<probe::Gesture>,
+}
+
+impl SearchOptions {
+    fn capture(point: Option<POINT>, gesture: Option<probe::Gesture>, deadline: Instant) -> Self {
+        Self {
+            point,
+            deadline,
+            read_text: true,
+            gesture,
+        }
+    }
+}
+
+unsafe fn search_subtree(
+    target: &Target,
+    session: &UiaSession,
+    walker: &IUIAutomationTreeWalker,
+    root: UiaNode,
+    options: SearchOptions,
+    budget: &mut probe::Budget,
+) -> Result<Option<String>, UiaFailure> {
+    let SearchOptions {
+        point,
+        deadline,
+        read_text,
+        gesture,
+    } = options;
+    let point = point.map(|point| (point.x, point.y));
+    let Some((priority, unknown_bounds)) = probe::priority(root.metadata, point, 0, 0) else {
+        return Ok(None);
+    };
+    let mut pending = vec![PendingNode {
+        node: root,
+        priority,
+        depth: 0,
+        unknown_bounds,
+    }];
+    let mut failures = ProbeFailures::default();
+    while !pending.is_empty() && Instant::now() < deadline {
+        if unsafe { GetForegroundWindow() } != target.foreground {
+            return Ok(None);
+        }
+        let index = pending
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, node)| node.priority)
+            .map(|(index, _)| index)
+            .expect("nonempty frontier");
+        let current = pending.swap_remove(index);
+        let node = current.node;
+        if node.password != Some(false)
+            || (!node.native.is_null() && !target.owns_window(node.native))
+        {
+            // An unknown/password/cross-root branch is never queried for text.
+            continue;
+        }
+        let probe_pattern = if read_text {
+            node.may_have_text()
+        } else {
+            node.metadata.document || node.metadata.edit
+        };
+        if probe_pattern && budget.pattern() {
+            if read_text
+                && !matches!(unsafe { node.element.CurrentIsPassword() }, Ok(value) if !value.as_bool())
+            {
+                continue;
+            }
+            if let Some(pattern) = unsafe { text_pattern(&node, !read_text) } {
+                if read_text {
+                    if let Some(text) =
+                        failures.observe(unsafe { selected_text(&pattern, gesture, deadline) })?
+                    {
+                        return Ok(Some(text));
+                    }
+                }
+            }
+        }
+        if current.depth >= probe::MAX_DEPTH || !budget.has_nodes() || Instant::now() >= deadline {
+            continue;
+        }
+        let mut child =
+            unsafe { walker.GetFirstChildElementBuildCache(&node.element, &session.cache) }.ok();
+        for _ in 0..probe::MAX_SIBLINGS {
+            if Instant::now() >= deadline || !budget.node() {
+                break;
+            }
+            let Some(element) = child else { break };
+            let child_node = unsafe { UiaNode::cached(element) };
+            if let Some((priority, unknown_bounds)) = probe::priority(
+                child_node.metadata,
+                point,
+                current.depth + 1,
+                current.unknown_bounds,
+            ) {
+                pending.push(PendingNode {
+                    node: child_node.clone(),
+                    priority,
+                    depth: current.depth + 1,
+                    unknown_bounds,
+                });
+            }
+            if Instant::now() >= deadline || !budget.has_nodes() {
+                break;
+            }
+            child = unsafe {
+                walker.GetNextSiblingElementBuildCache(&child_node.element, &session.cache)
+            }
+            .ok();
+        }
+    }
+    failures
+        .unavailable
+        .map_or(Ok(None), |reason| Err(UiaFailure::Unavailable(reason)))
+}
+
+unsafe fn text_pattern(node: &UiaNode, warming: bool) -> Option<IUIAutomationTextPattern> {
+    unsafe {
+        // TextPattern2 inherits the same selection contract. Accept the newer
+        // pattern ID too; never substitute caret/whole-document extraction or
+        // LegacyIAccessible.Value for an unavailable selection.
+        (node.text_available != Some(false) || warming)
+            .then(|| {
+                node.element
+                    .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                    .ok()
+            })
+            .flatten()
+            .or_else(|| {
+                (node.text2_available != Some(false))
+                    .then(|| {
+                        node.element
+                            .GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+                            .ok()
+                            .map(|pattern| IUIAutomationTextPattern::clone(&pattern))
+                    })
+                    .flatten()
+            })
     }
 }
 
 unsafe fn selected_text(
     pattern: &IUIAutomationTextPattern,
+    gesture: Option<probe::Gesture>,
     deadline: Instant,
 ) -> Result<Option<String>, UiaFailure> {
     if Instant::now() >= deadline {
-        return Err(UiaFailure::Unavailable(
-            "选区读取暂时超时，请重新划选。".into(),
-        ));
+        return Ok(None);
+    }
+    // Unsupported selection must not be interpreted as an entire document or
+    // as an instruction to read LegacyIAccessible.Value/Name.
+    if unsafe { pattern.SupportedTextSelection() }.ok() == Some(SupportedTextSelection_None) {
+        return Ok(None);
+    }
+    if Instant::now() >= deadline {
+        return Ok(None);
     }
     let Ok(ranges) = (unsafe { pattern.GetSelection() }) else {
         return Ok(None);
@@ -488,18 +1058,29 @@ unsafe fn selected_text(
     }
     let mut text = String::new();
     let mut units = 0;
+    let mut selected_ranges = Vec::new();
+    let mut geometry_matches = false;
+    let mut geometry_unavailable = false;
     for index in 0..count.max(0) {
         if Instant::now() >= deadline {
-            return Err(UiaFailure::Unavailable(
-                "选区读取暂时超时，请重新划选。".into(),
-            ));
+            return Ok(None);
         }
         let range = unsafe { ranges.GetElement(index) }
             .map_err(|_| UiaFailure::Unavailable("选区已失效，请重新选择文字。".into()))?;
+        if let Some(gesture) = gesture {
+            match unsafe { range_matches_gesture(&range, gesture) } {
+                Some(matches) => geometry_matches |= matches,
+                None => geometry_unavailable = true,
+            }
+        }
+        selected_ranges.push(range);
+    }
+    if gesture.is_some() && !geometry_matches && !geometry_unavailable {
+        return Ok(None);
+    }
+    for range in selected_ranges {
         if Instant::now() >= deadline {
-            return Err(UiaFailure::Unavailable(
-                "选区读取暂时超时，请重新划选。".into(),
-            ));
+            return Ok(None);
         }
         let selected = unsafe { range.GetText((MAX_SELECTION_UNITS + 1) as i32) }
             .map_err(|_| UiaFailure::Unavailable("无法读取这段选区，请尝试手动复制。".into()))?;
@@ -519,6 +1100,51 @@ unsafe fn selected_text(
     }
     let text = text.trim().to_owned();
     Ok((!text.is_empty()).then_some(text))
+}
+
+unsafe fn range_matches_gesture(
+    range: &IUIAutomationTextRange,
+    gesture: probe::Gesture,
+) -> Option<bool> {
+    // The caller owns the returned SAFEARRAY. Validate its shape and element
+    // width before creating any Rust slice, and bound multi-line rectangles.
+    let array = unsafe { range.GetBoundingRectangles() }.ok()?;
+    if array.is_null() {
+        return None;
+    }
+    struct OwnedArray(*mut windows::Win32::System::Com::SAFEARRAY);
+    impl Drop for OwnedArray {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = SafeArrayDestroy(self.0);
+            }
+        }
+    }
+    let array = OwnedArray(array);
+    unsafe {
+        if SafeArrayGetDim(array.0) != 1 || SafeArrayGetElemsize(array.0) != size_of::<f64>() as u32
+        {
+            return None;
+        }
+        let lower = SafeArrayGetLBound(array.0, 1).ok()?;
+        let upper = SafeArrayGetUBound(array.0, 1).ok()?;
+        let count = i64::from(upper) - i64::from(lower) + 1;
+        if !(4..=4096).contains(&count) || count % 4 != 0 {
+            return None;
+        }
+        let mut data = ptr::null_mut();
+        SafeArrayAccessData(array.0, &mut data).ok()?;
+        let result = if data.is_null() {
+            None
+        } else {
+            gesture.intersects_rectangles(std::slice::from_raw_parts(
+                data.cast::<f64>(),
+                count as usize,
+            ))
+        };
+        let _ = SafeArrayUnaccessData(array.0);
+        result
+    }
 }
 
 struct ClipboardLock;
@@ -812,12 +1438,13 @@ fn capture_by_copy(foreground: HWND) -> Result<CapturedText, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_unicode, native_edit_selection, NativeSelection, Target, UiaFailure,
-        MAX_SELECTION_UNITS,
+        choose_source_point, decode_unicode, focused_native_fallback_allowed,
+        is_no_selection_error, is_protected_error, native_edit_selection, no_selection,
+        protected_message, NativeSelection, Target, UiaFailure, MAX_SELECTION_UNITS,
     };
     use std::ptr;
     use windows_sys::Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, POINT},
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetAncestor, GetWindowThreadProcessId, SendMessageW,
             ES_MULTILINE, ES_PASSWORD, GA_ROOT, WM_SETTEXT, WS_CHILD,
@@ -896,6 +1523,97 @@ mod tests {
         unsafe {
             SendMessageW(window, 0x00B1, start, end as isize);
         }
+    }
+
+    #[test]
+    fn popup_covered_release_uses_source_origin_and_never_foreign_points() {
+        let origin = POINT { x: 100, y: 250 };
+        let end = POINT { x: 300, y: 280 };
+        let point = choose_source_point(Some(end), Some(origin), |point| point.x == 100).unwrap();
+        assert_eq!((point.x, point.y), (100, 250));
+        let point = choose_source_point(Some(end), Some(origin), |_| true).unwrap();
+        assert_eq!((point.x, point.y), (300, 280));
+        assert!(choose_source_point(Some(end), Some(origin), |_| false).is_none());
+        assert!(choose_source_point(Some(end), None, |_| false).is_none());
+    }
+
+    #[test]
+    fn no_selection_and_protected_classification_is_exact() {
+        assert!(is_no_selection_error(&no_selection()));
+        assert!(!is_no_selection_error("UIA PDF provider is still loading"));
+        assert!(is_protected_error(&protected_message()));
+        assert!(!is_protected_error(&format!(
+            "{} other provider details",
+            protected_message()
+        )));
+        assert!(!is_protected_error(&no_selection()));
+    }
+
+    #[test]
+    fn automatic_native_fallback_rejects_same_root_toolbar_selection_without_a_gesture_hit() {
+        let (root, toolbar, target) = edit("old toolbar text", false);
+        select(toolbar, 0, 3);
+        // An ancestor/sibling hit proves only the browser window, not which
+        // control the user's current PDF gesture selected.
+        assert!(!focused_native_fallback_allowed(
+            &target,
+            toolbar,
+            true,
+            [root.0]
+        ));
+        assert!(focused_native_fallback_allowed(
+            &target,
+            toolbar,
+            true,
+            [toolbar]
+        ));
+        assert!(focused_native_fallback_allowed(&target, toolbar, false, []));
+
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let nested = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                ptr::null(),
+                WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                toolbar,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        assert!(!nested.is_null());
+        assert!(focused_native_fallback_allowed(
+            &target,
+            toolbar,
+            true,
+            [nested]
+        ));
+        let (_popup, foreign, _) = edit("translation popup", false);
+        // Release over our popup still permits the source origin; a foreign
+        // release alone must never revive the focused toolbar's old selection.
+        assert!(focused_native_fallback_allowed(
+            &target,
+            toolbar,
+            true,
+            [foreign, toolbar]
+        ));
+        assert!(!focused_native_fallback_allowed(
+            &target,
+            toolbar,
+            true,
+            [foreign]
+        ));
+        assert!(!focused_native_fallback_allowed(
+            &target,
+            foreign,
+            false,
+            []
+        ));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Native Windows message loop. UIA and HTTP never run on this thread.
-use super::{icons, mouse, picker, popup, selection, theme};
+use super::{icons, mouse, picker, popup, selection, selection_events, theme};
 use crate::{cache::TranslationCache, config, mailbox, translation};
 use std::{
     cell::{Cell, RefCell},
@@ -40,6 +40,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_WORK: u32 = WM_APP + 2;
 const WM_SELECTION: u32 = WM_APP + 3;
 const WM_SETTINGS: u32 = WM_APP + 4;
+const WM_ACCESSIBILITY: u32 = WM_APP + 5;
 const HOTKEY: i32 = 1;
 const TIMER_SELECTION: usize = 1;
 const TIMER_CHIP: usize = 2;
@@ -96,6 +97,11 @@ struct CaptureJob {
     kind: CaptureKind,
     foreground: isize,
     point: POINT,
+    origin: Option<POINT>,
+}
+enum CaptureWork {
+    Warm(isize),
+    Capture(CaptureJob),
 }
 struct TranslationJob {
     generation: u64,
@@ -104,6 +110,7 @@ struct TranslationJob {
     test: bool,
 }
 enum Event {
+    Warmed,
     Captured {
         job: CaptureJob,
         result: Result<selection::CapturedText, String>,
@@ -168,7 +175,7 @@ struct App {
     settings: config::Settings,
     events: mpsc::Receiver<Event>,
     ui_events: mpsc::Sender<Event>,
-    capture: mpsc::Sender<CaptureJob>,
+    capture: mpsc::Sender<CaptureWork>,
     network: mailbox::Sender<TranslationJob>,
     generation: u64,
     capture_generation: u64,
@@ -176,12 +183,19 @@ struct App {
     latest_translation: Arc<AtomicU64>,
     latest_test: Arc<AtomicU64>,
     capture_busy: bool,
+    warm_busy: bool,
+    warmed_foreground: isize,
     pending: Option<CaptureJob>,
     auto_point: POINT,
     auto_foreground: isize,
+    auto_source_root: isize,
+    auto_origin: Option<POINT>,
+    auto_pressed: bool,
+    auto_strong: bool,
     auto_started: Option<Instant>,
     auto_attempt: usize,
-    last_auto: Option<(isize, String)>,
+    auto_text: Option<String>,
+    pending_icon_click: bool,
     chip_deadline: Option<Instant>,
     chip_pixels: Option<icons::IconPixels>,
     chip_dpi: u32,
@@ -189,6 +203,8 @@ struct App {
     chip_text: String,
     chip_foreground: isize,
     translated: String,
+    rendered_text: String,
+    display_pending: bool,
     taskbar_created: u32,
     tray: NOTIFYICONDATAW,
     settings_scroll: i32,
@@ -333,20 +349,31 @@ unsafe fn run_inner() -> Result<(), String> {
     let appearance_ui = make_appearance(appearance_window);
     let (events_tx, events) = mpsc::channel();
     let ui_events = events_tx.clone();
-    let (capture_tx, capture_rx) = mpsc::channel::<CaptureJob>();
+    let (capture_tx, capture_rx) = mpsc::channel::<CaptureWork>();
     let (network_tx, network_rx) = mailbox::channel::<TranslationJob>();
     let destination = main as isize;
     let capture_events = events_tx.clone();
     thread::Builder::new()
         .name("selection".into())
         .spawn(move || {
-            for job in capture_rx {
+            for work in capture_rx {
+                let job = match work {
+                    CaptureWork::Warm(foreground) => {
+                        selection::warm_selection_provider(foreground);
+                        if capture_events.send(Event::Warmed).is_err() {
+                            break;
+                        }
+                        PostMessageW(destination as HWND, WM_WORK, 0, 0);
+                        continue;
+                    }
+                    CaptureWork::Capture(job) => job,
+                };
                 let result = if job.kind == CaptureKind::Clipboard {
                     selection::read_clipboard_text()
                 } else if GetForegroundWindow() as isize != job.foreground {
                     Err("前台窗口已改变，请重新选择文字。".into())
                 } else if job.kind == CaptureKind::Auto {
-                    selection::capture_selection_at(job.point)
+                    selection::capture_selection_for_gesture(job.origin, job.point)
                 } else {
                     selection::capture_selection(true)
                 };
@@ -454,6 +481,7 @@ unsafe fn run_inner() -> Result<(), String> {
     ) != 0;
     mouse::set_enabled(settings.selection_button);
     let hook = mouse::install(main as isize, WM_SELECTION);
+    let accessibility = selection_events::install(main as isize, WM_ACCESSIBILITY);
     let hook_error = hook.as_ref().err().cloned();
     let first_run = !config::has_saved_settings();
     let app = App {
@@ -481,12 +509,19 @@ unsafe fn run_inner() -> Result<(), String> {
         latest_translation,
         latest_test,
         capture_busy: false,
+        warm_busy: false,
+        warmed_foreground: 0,
         pending: None,
         auto_point: POINT { x: 0, y: 0 },
         auto_foreground: 0,
+        auto_source_root: 0,
+        auto_origin: None,
+        auto_pressed: false,
+        auto_strong: false,
         auto_started: None,
         auto_attempt: 0,
-        last_auto: None,
+        auto_text: None,
+        pending_icon_click: false,
         chip_deadline: None,
         chip_pixels: None,
         chip_dpi: 0,
@@ -494,6 +529,8 @@ unsafe fn run_inner() -> Result<(), String> {
         chip_text: String::new(),
         chip_foreground: 0,
         translated: String::new(),
+        rendered_text: String::new(),
+        display_pending: false,
         taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
         tray,
         settings_scroll: 0,
@@ -506,6 +543,7 @@ unsafe fn run_inner() -> Result<(), String> {
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(|app| {
+        warm_foreground(app, GetForegroundWindow() as isize);
         layout_settings(app);
         layout_result(app);
         layout_appearance(app);
@@ -542,7 +580,11 @@ unsafe fn run_inner() -> Result<(), String> {
                 || root == appearance_window
                 || root == inline_window
             {
-                ShowWindow(root, SW_HIDE);
+                if root == inline_window {
+                    with_app(|app| close_inline(app));
+                } else {
+                    ShowWindow(root, SW_HIDE);
+                }
                 continue;
             }
         }
@@ -570,6 +612,7 @@ unsafe fn run_inner() -> Result<(), String> {
             with_app(|app| ensure_settings_focus_visible(app));
         }
     }
+    drop(accessibility);
     drop(hook);
     UnregisterHotKey(main, HOTKEY);
     APP.with(|cell| {
@@ -791,20 +834,61 @@ unsafe extern "system" fn window_proc(
             }
             WM_SELECTION => {
                 if lparam == isize::MIN {
-                    cancel_automatic(app);
+                    begin_automatic_press(app, mouse::press_point(wparam));
                     handled = true;
                     return;
                 }
                 if app.settings.selection_button && !app.picking_color {
-                    cancel_automatic(app);
+                    let foreground = GetForegroundWindow();
+                    if !app.auto_pressed {
+                        handled = true;
+                        return;
+                    }
+                    if app.auto_source_root == 0
+                        || GetAncestor(foreground, GA_ROOT) as isize != app.auto_source_root
+                    {
+                        cancel_automatic(app);
+                        handled = true;
+                        return;
+                    }
                     app.auto_point = POINT {
                         x: wparam as i32,
                         y: lparam as i32,
                     };
-                    app.auto_foreground = GetForegroundWindow() as isize;
+                    app.auto_pressed = false;
+                    app.auto_strong = mouse::is_selection_gesture(wparam);
+                    app.auto_foreground = foreground as isize;
                     app.auto_started = Some(Instant::now());
                     app.auto_attempt = 0;
-                    SetTimer(app.main, TIMER_SELECTION, 90, None);
+                    if app.auto_strong {
+                        show_selection_pending(app);
+                    }
+                    SetTimer(app.main, TIMER_SELECTION, 60, None);
+                }
+                handled = true;
+            }
+            WM_ACCESSIBILITY => {
+                let window = lparam as HWND;
+                let foreground = GetForegroundWindow();
+                if wparam as u32 == selection_events::FOREGROUND {
+                    if window == foreground {
+                        warm_foreground(app, foreground as isize);
+                    }
+                } else if wparam as u32 == selection_events::SELECTION
+                    && app.settings.selection_button
+                    && !app.picking_color
+                    && !app.auto_pressed
+                    && app
+                        .auto_started
+                        .is_some_and(|time| time.elapsed() < Duration::from_secs(5))
+                    && foreground as isize == app.auto_foreground
+                    && GetAncestor(window, GA_ROOT) == GetAncestor(foreground, GA_ROOT)
+                    && !is_our_window(window)
+                {
+                    // A provider may publish a PDF selection after mouse-up.
+                    // Coalesce hints; only the recent physical gesture grants
+                    // permission to inspect it, never the WinEvent alone.
+                    SetTimer(app.main, TIMER_SELECTION, 20, None);
                 }
                 handled = true;
             }
@@ -813,11 +897,20 @@ unsafe extern "system" fn window_proc(
                 if app.settings.selection_button
                     && app
                         .auto_started
-                        .is_some_and(|time| time.elapsed() < Duration::from_secs(2))
+                        .is_some_and(|time| time.elapsed() < Duration::from_secs(5))
                     && app.auto_foreground == GetForegroundWindow() as isize
                     && !app.picking_color
                 {
                     request_capture(app, CaptureKind::Auto, app.auto_point);
+                } else if app.auto_started.is_some() {
+                    if !app.settings.selection_button
+                        || app.picking_color
+                        || app.auto_foreground != GetForegroundWindow() as isize
+                    {
+                        cancel_automatic(app);
+                    } else {
+                        retry_automatic(app);
+                    }
                 }
                 handled = true;
             }
@@ -1025,8 +1118,11 @@ unsafe fn command(app: &mut App, id: u16) {
                 return;
             }
             let text = app.chip_text.clone();
+            app.pending_icon_click = true;
             if !text.is_empty() {
-                start_translation(app, text, "划词选区", cursor());
+                start_translation_in(app, text, "划词选区", app.auto_point, true);
+            } else if app.auto_started.is_some() {
+                show_selection_pending(app);
             }
         }
         ID_SAVE => {
@@ -1054,7 +1150,6 @@ unsafe fn command(app: &mut App, id: u16) {
                         || settings.selection_mode != app.settings.selection_mode
                     {
                         cancel_automatic(app);
-                        app.last_auto = None;
                         if app.inline_active {
                             app.generation += 1;
                             app.latest_translation
@@ -1100,25 +1195,94 @@ unsafe fn command(app: &mut App, id: u16) {
 }
 
 unsafe fn cancel_automatic(app: &mut App) {
+    reset_automatic(app);
+    ShowWindow(app.inline_window, SW_HIDE);
+}
+
+unsafe fn reset_automatic(app: &mut App) {
     KillTimer(app.main, TIMER_SELECTION);
     KillTimer(app.main, TIMER_CHIP);
     ShowWindow(app.chip, SW_HIDE);
-    if app.inline_active {
-        ShowWindow(app.inline_window, SW_HIDE);
-    }
+    ShowWindow(app.result_window, SW_HIDE);
     app.chip_deadline = None;
+    app.chip_text.clear();
     app.capture_generation += 1;
     app.pending = None;
     app.auto_started = None;
     app.auto_attempt = 0;
+    app.auto_text = None;
+    app.auto_origin = None;
+    app.auto_source_root = 0;
+    app.auto_pressed = false;
+    app.auto_strong = false;
+    app.pending_icon_click = false;
+    // Keep the network model alive for cache/in-flight reuse. Detach its view
+    // immediately so an older stream cannot paint over a new selection.
+    app.display_pending = true;
+}
+
+unsafe fn begin_automatic_press(app: &mut App, point: POINT) {
+    if !app.settings.selection_button || app.picking_color {
+        return;
+    }
+    let reuse = app.inline_active && IsWindowVisible(app.inline_window) != 0;
+    reset_automatic(app);
+    app.auto_origin = Some(point);
+    app.auto_source_root = GetAncestor(WindowFromPoint(point), GA_ROOT) as isize;
+    app.auto_pressed = true;
+    if reuse {
+        selection_pending_text(app);
+        SetTimer(app.main, TIMER_CHIP, 200, None);
+    }
+}
+
+unsafe fn selection_pending_text(app: &mut App) {
+    app.rendered_text.clear();
+    set_text(app.inline_ui.translated, "正在读取选区…");
+    translation_copy_enabled(app, false);
+    EnableWindow(GetDlgItem(app.inline_window, ID_INLINE_EXPAND as i32), 0);
+    translation_status(app, "正在读取新选区");
+}
+
+unsafe fn show_selection_pending(app: &mut App) {
+    app.chip_foreground = app.auto_foreground;
+    if app.settings.selection_mode == config::SelectionMode::Direct || app.pending_icon_click {
+        selection_pending_text(app);
+        present_translation(app, true, app.auto_point);
+    } else {
+        ShowWindow(app.inline_window, SW_HIDE);
+        let _ = show_chip(app, app.auto_point);
+    }
+}
+
+unsafe fn warm_foreground(app: &mut App, foreground: isize) {
+    if foreground == 0
+        || is_our_window(foreground as HWND)
+        || foreground == app.warmed_foreground
+        || app.warm_busy
+        || app.capture_busy
+        || app.auto_pressed
+        || app
+            .auto_started
+            .is_some_and(|time| time.elapsed() < Duration::from_secs(5))
+    {
+        return;
+    }
+    if app.capture.send(CaptureWork::Warm(foreground)).is_ok() {
+        app.warmed_foreground = foreground;
+        app.warm_busy = true;
+    }
 }
 
 unsafe fn retry_automatic(app: &mut App) {
-    const DELAYS: [u32; 3] = [110, 220, 360];
+    const DELAYS: [u32; 7] = [80, 140, 240, 400, 650, 900, 1200];
+    // A plain click often only moves the caret. Reserve the longer PDF-loading
+    // tail for an actual drag, multi-click or Shift selection gesture.
+    let attempts = if app.auto_strong { DELAYS.len() } else { 1 };
     if app
         .auto_started
-        .is_some_and(|started| started.elapsed() < Duration::from_secs(2))
-        && app.auto_attempt < DELAYS.len()
+        .is_some_and(|started| started.elapsed() < Duration::from_secs(5))
+        && app.auto_attempt < attempts
         && app.settings.selection_button
         && GetForegroundWindow() as isize == app.auto_foreground
         && !app.picking_color
@@ -1128,7 +1292,18 @@ unsafe fn retry_automatic(app: &mut App) {
         SetTimer(app.main, TIMER_SELECTION, delay, None);
     } else {
         app.auto_started = None;
-        app.last_auto = None;
+        if app.auto_text.is_none() {
+            ShowWindow(app.chip, SW_HIDE);
+            if app.auto_strong || app.pending_icon_click {
+                app.chip_foreground = app.auto_foreground;
+                set_text(app.inline_ui.translated, "此页面暂未提供可读取的文字选区。");
+                translation_status(app, "可复制文字后，右击托盘选择“翻译剪贴板”");
+                translation_copy_enabled(app, false);
+                present_translation(app, true, app.auto_point);
+            } else {
+                ShowWindow(app.inline_window, SW_HIDE);
+            }
+        }
     }
 }
 
@@ -1184,7 +1359,6 @@ unsafe fn present_translation(app: &mut App, inline: bool, point: POINT) {
 }
 
 unsafe fn close_inline(app: &mut App) {
-    app.last_auto = None;
     ShowWindow(app.inline_window, SW_HIDE);
     app.inline_active = false;
     app.streaming = false;
@@ -1243,11 +1417,8 @@ unsafe fn update_mode_hint(app: &App) {
 
 unsafe fn request_capture(app: &mut App, kind: CaptureKind, point: POINT) {
     if kind != CaptureKind::Auto {
-        KillTimer(app.main, TIMER_SELECTION);
-        app.auto_started = None;
-        app.auto_attempt = 0;
+        cancel_automatic(app);
     }
-    app.capture_generation += 1;
     let foreground = GetForegroundWindow();
     if kind != CaptureKind::Clipboard && is_our_window(foreground) {
         return;
@@ -1257,13 +1428,18 @@ unsafe fn request_capture(app: &mut App, kind: CaptureKind, point: POINT) {
         kind,
         foreground: foreground as isize,
         point,
+        origin: if kind == CaptureKind::Auto {
+            app.auto_origin
+        } else {
+            None
+        },
     };
     if app.capture_busy {
         app.pending = Some(job);
         return;
     }
     app.capture_busy = true;
-    if app.capture.send(job).is_err() {
+    if app.capture.send(CaptureWork::Capture(job)).is_err() {
         app.capture_busy = false;
     }
 }
@@ -1271,6 +1447,10 @@ unsafe fn request_capture(app: &mut App, kind: CaptureKind, point: POINT) {
 unsafe fn drain_events(app: &mut App) {
     while let Ok(event) = app.events.try_recv() {
         match event {
+            Event::Warmed => {
+                app.warm_busy = false;
+                warm_foreground(app, GetForegroundWindow() as isize);
+            }
             Event::Captured { job, result } => {
                 app.capture_busy = false;
                 if job.generation == app.capture_generation
@@ -1280,23 +1460,23 @@ unsafe fn drain_events(app: &mut App) {
                     match result {
                         Ok(captured) if !captured.text.trim().is_empty() => {
                             if captured.text.chars().count() > translation::MAX_TEXT_CHARS {
-                                if job.kind != CaptureKind::Auto {
+                                if job.kind == CaptureKind::Auto {
+                                    cancel_automatic(app);
+                                } else {
                                     show_error(app, "选区过长，请缩小选择范围后重试。", job.point);
                                 }
                             } else if job.kind == CaptureKind::Auto && app.settings.selection_button
                             {
-                                app.auto_started = None;
+                                KillTimer(app.main, TIMER_SELECTION);
                                 app.chip_foreground = job.foreground;
-                                if app.settings.selection_mode == config::SelectionMode::Direct {
-                                    let duplicate =
-                                        app.last_auto.as_ref().is_some_and(|(foreground, text)| {
-                                            *foreground == job.foreground && text == &captured.text
-                                        }) && app.active_text == captured.text.trim()
-                                            && app.active_epoch == app.settings_epoch;
-                                    app.last_auto = Some((job.foreground, captured.text.clone()));
-                                    if duplicate {
-                                        present_translation(app, true, job.point);
-                                    } else {
+                                // Notification/probe duplicates within one gesture
+                                // are harmless. A later physical gesture always
+                                // performs the normal cache/TTL/request binding.
+                                if app.auto_text.as_deref() != Some(captured.text.trim()) {
+                                    app.auto_text = Some(captured.text.trim().to_owned());
+                                    if app.settings.selection_mode == config::SelectionMode::Direct
+                                        || app.pending_icon_click
+                                    {
                                         start_translation_in(
                                             app,
                                             captured.text,
@@ -1304,10 +1484,11 @@ unsafe fn drain_events(app: &mut App) {
                                             job.point,
                                             true,
                                         );
+                                    } else {
+                                        app.chip_text = captured.text;
+                                        ShowWindow(app.inline_window, SW_HIDE);
+                                        let _ = show_chip(app, job.point);
                                     }
-                                } else {
-                                    app.chip_text = captured.text;
-                                    let _ = show_chip(app, job.point);
                                 }
                             } else if job.kind != CaptureKind::Auto {
                                 start_translation(app, captured.text, captured.source, job.point);
@@ -1315,21 +1496,30 @@ unsafe fn drain_events(app: &mut App) {
                         }
                         Ok(_) => {
                             if job.kind == CaptureKind::Auto {
-                                retry_automatic(app);
+                                cancel_automatic(app);
                             }
                         }
                         Err(error) if job.kind != CaptureKind::Auto => {
                             show_error(app, &error, job.point)
                         }
-                        Err(_) => retry_automatic(app),
+                        Err(error) => {
+                            if selection::is_no_selection_error(&error)
+                                || selection::is_protected_error(&error)
+                            {
+                                cancel_automatic(app);
+                            } else {
+                                retry_automatic(app);
+                            }
+                        }
                     }
                 }
                 if let Some(pending) = app.pending.take() {
-                    if GetForegroundWindow() as isize == pending.foreground
-                        || pending.kind == CaptureKind::Clipboard
+                    if pending.generation == app.capture_generation
+                        && (GetForegroundWindow() as isize == pending.foreground
+                            || pending.kind == CaptureKind::Clipboard)
                     {
                         app.capture_busy = true;
-                        if app.capture.send(pending).is_err() {
+                        if app.capture.send(CaptureWork::Capture(pending)).is_err() {
                             app.capture_busy = false;
                         }
                     }
@@ -1363,7 +1553,7 @@ unsafe fn drain_events(app: &mut App) {
                     app.streaming = false;
                     match result {
                         Ok(text) => {
-                            render_translation(app, &text);
+                            app.translated = text.clone();
                             let elapsed = app
                                 .active_started
                                 .take()
@@ -1374,24 +1564,30 @@ unsafe fn drain_events(app: &mut App) {
                             } else {
                                 format!("翻译完成 · {:.2} 秒", elapsed.as_secs_f64())
                             };
-                            translation_status(app, &status);
-                            translation_copy_enabled(app, true);
+                            if !app.display_pending {
+                                render_translation(app, &text);
+                                translation_status(app, &status);
+                                translation_copy_enabled(app, true);
+                            }
                         }
                         Err(error) => {
-                            app.last_auto = None;
-                            if !translation::is_cancelled_error(&error) {
+                            if !app.display_pending && !translation::is_cancelled_error(&error) {
+                                app.rendered_text.clear();
                                 set_text(app.result_ui.translated, &error);
                                 set_text(app.inline_ui.translated, &error);
+                                translation_status(app, "翻译失败，请检查设置");
                             }
-                            translation_status(app, "翻译失败，请检查设置");
                         }
                     }
                 }
             }
             Event::Progress { generation, text } => {
                 if generation == app.generation && app.streaming {
-                    render_translation(app, &text);
-                    translation_status(app, "正在翻译 · 实时显示");
+                    app.translated = text.clone();
+                    if !app.display_pending {
+                        render_translation(app, &text);
+                        translation_status(app, "正在翻译 · 实时显示");
+                    }
                 }
             }
             Event::PickedColor(result) => {
@@ -1411,7 +1607,6 @@ unsafe fn drain_events(app: &mut App) {
 }
 
 unsafe fn start_translation(app: &mut App, text: String, source: &str, point: POINT) {
-    app.last_auto = None;
     start_translation_in(app, text, source, point, false);
 }
 
@@ -1422,8 +1617,19 @@ unsafe fn start_translation_in(
     point: POINT,
     inline: bool,
 ) {
+    app.display_pending = false;
+    EnableWindow(GetDlgItem(app.inline_window, ID_INLINE_EXPAND as i32), 1);
     if app.streaming && app.active_epoch == app.settings_epoch && app.active_text == text.trim() {
-        ShowWindow(app.chip, SW_HIDE);
+        if app.translated.is_empty() {
+            app.rendered_text.clear();
+            set_text(app.result_ui.translated, "正在翻译…");
+            set_text(app.inline_ui.translated, "正在翻译…");
+        } else {
+            let text = app.translated.clone();
+            render_translation(app, &text);
+        }
+        translation_status(app, &format!("{source} · 正在翻译"));
+        translation_copy_enabled(app, false);
         present_translation(app, inline, point);
         return;
     }
@@ -1432,6 +1638,7 @@ unsafe fn start_translation_in(
         .store(app.generation, Ordering::Release);
     ShowWindow(app.chip, SW_HIDE);
     app.translated.clear();
+    app.rendered_text.clear();
     app.active_text = text.trim().to_owned();
     app.active_epoch = app.settings_epoch;
     app.active_started = Some(Instant::now());
@@ -1480,12 +1687,13 @@ unsafe fn start_translation_in(
 }
 
 unsafe fn show_error(app: &mut App, error: &str, point: POINT) {
-    app.last_auto = None;
+    app.display_pending = false;
     app.streaming = false;
     app.generation += 1;
     app.latest_translation
         .store(app.generation, Ordering::Release);
     app.translated.clear();
+    app.rendered_text.clear();
     translation_copy_enabled(app, false);
     set_text(app.result_ui.original, "未获取到可翻译的选区");
     set_text(app.result_ui.translated, error);
@@ -1499,7 +1707,7 @@ unsafe fn show_error(app: &mut App, error: &str, point: POINT) {
 }
 
 unsafe fn render_translation(app: &mut App, text: &str) {
-    let previous = native_text(&app.translated);
+    let previous = native_text(&app.rendered_text);
     let current = native_text(text);
     for editor in [app.result_ui.translated, app.inline_ui.translated] {
         if !previous.is_empty() && current.starts_with(&previous) {
@@ -1512,6 +1720,7 @@ unsafe fn render_translation(app: &mut App, text: &str) {
         }
     }
     app.translated = text.to_owned();
+    app.rendered_text = text.to_owned();
 }
 
 unsafe fn translation_status(app: &App, message: &str) {

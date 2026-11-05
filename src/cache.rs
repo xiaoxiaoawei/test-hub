@@ -1,7 +1,8 @@
 //! Small, memory-only LRU for completed translations. No selection or credential
-//! is written to disk. A cache belongs to one service/model/credential at a time.
+//! is written to disk. A cache belongs to one service/model/credential and
+//! source/target language pair at a time.
 
-use crate::config::{parse_endpoint, Endpoint, Settings};
+use crate::config::{parse_endpoint, Endpoint, Language, Settings};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,8 @@ struct Namespace {
     endpoint: Endpoint,
     model: String,
     api_key: String,
+    source_language: Language,
+    target_language: Language,
 }
 
 impl Namespace {
@@ -21,6 +24,8 @@ impl Namespace {
         self.endpoint == *endpoint
             && self.model == settings.model.trim()
             && self.api_key == settings.api_key
+            && self.source_language == settings.source_language
+            && self.target_language == settings.target_language
     }
 }
 
@@ -93,6 +98,8 @@ impl TranslationCache {
             endpoint,
             model: settings.model.trim().to_owned(),
             api_key: settings.api_key.clone(),
+            source_language: settings.source_language,
+            target_language: settings.target_language,
         });
         true
     }
@@ -162,7 +169,7 @@ impl TranslationCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IconStyle;
+    use crate::config::{IconShape, IconStyle, SelectionMode, ThemeMode};
 
     fn settings() -> Settings {
         Settings {
@@ -328,8 +335,13 @@ mod tests {
             model: " translation-model ".into(),
             icon_style: IconStyle::Letter,
             icon_color: 0x123456,
+            icon_shape: IconShape::Circle,
+            icon_size: 48,
+            theme_mode: ThemeMode::Light,
             timeout_seconds: 55,
             selection_button: false,
+            selection_mode: SelectionMode::Direct,
+            compatibility_capture: true,
             ..original
         };
         assert_eq!(
@@ -347,6 +359,39 @@ mod tests {
         };
         cache.insert(&short_ip, "Local text", "本地译文");
         assert_eq!(cache.get(&long_ip, "Local text"), Some("本地译文".into()));
+    }
+
+    #[test]
+    fn changing_either_language_never_reuses_another_translation_pair() {
+        let original = settings();
+        for changed in [
+            Settings {
+                source_language: Language::Auto,
+                ..original.clone()
+            },
+            Settings {
+                source_language: Language::Japanese,
+                ..original.clone()
+            },
+            Settings {
+                target_language: Language::English,
+                ..original.clone()
+            },
+            Settings {
+                target_language: Language::TraditionalChinese,
+                ..original.clone()
+            },
+        ] {
+            let mut cache = TranslationCache::new();
+            cache.insert(&original, "Same text", "简体中文译文");
+            assert!(cache.get(&changed, "Same text").is_none());
+            cache.insert(&changed, "Same text", "Different language result");
+            assert_eq!(
+                cache.get(&changed, "Same text"),
+                Some("Different language result".into())
+            );
+            assert!(cache.get(&original, "Same text").is_none());
+        }
     }
 
     #[test]

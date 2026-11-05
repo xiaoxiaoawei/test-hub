@@ -165,7 +165,7 @@ impl SseDecoder {
         check_cancel(should_cancel)?;
         let error = std::mem::take(&mut self.event_error);
         if error {
-            return Err("翻译服务在流式响应中返回错误，请检查服务配置和额度。".into());
+            return Err("服务在流式响应中返回错误，请检查服务配置和额度。".into());
         }
         if self.event_data.is_empty() {
             return Ok(());
@@ -221,7 +221,7 @@ impl SseDecoder {
             self.dispatch(should_cancel, on_progress)?;
         }
         if !self.done && !self.finished {
-            return Err("流式译文在完成前断开，请重试。".into());
+            return Err("流式内容在完成前断开，请重试。".into());
         }
         check_cancel(should_cancel)?;
         finish_translation(&self.translated)

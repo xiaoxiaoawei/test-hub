@@ -38,7 +38,7 @@ mod windows {
             AttachThreadInput, CreateEventW, GetCurrentThreadId, GetProcessTimes,
             WaitForSingleObject,
         },
-        UI::Input::KeyboardAndMouse::SetFocus,
+        UI::Input::KeyboardAndMouse::{IsWindowEnabled, SetFocus},
         UI::WindowsAndMessaging::{
             FindWindowExW, FindWindowW, GetCursorPos, GetDlgItem, GetForegroundWindow,
             GetGUIThreadInfo, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow,
@@ -51,9 +51,9 @@ mod windows {
     };
 
     const CLASS: &str = "LingoLeaf.NativeWindow";
-    const SETTINGS_TITLE: &str = "轻译 · 翻译服务设置";
+    const SETTINGS_TITLE: &str = "轻译 · 设置";
     const BACKGROUND_TITLE: &str = "轻译 · 后台";
-    const APPEARANCE_TITLE: &str = "轻译 · 图标外观";
+    const APPEARANCE_TITLE: &str = "轻译 · 划词图标";
     const PROVIDER: i32 = 208;
     const KEY: i32 = 211;
     const SAVE: i32 = 105;
@@ -70,6 +70,10 @@ mod windows {
     const THEME: i32 = 109;
     const UPDATE: i32 = 110;
     const UPDATE_STATUS: i32 = 219;
+    const SERVICE_TAB: i32 = 270;
+    const PREFERENCES_TAB: i32 = 271;
+    const SOURCE_LANGUAGE: i32 = 272;
+    const TARGET_LANGUAGE: i32 = 273;
     const SAVE_TITLE: &str = "轻译 · 保存成功";
     const SAVE_BODY: &str = "设置保存成功，已立即生效。";
 
@@ -95,6 +99,15 @@ mod windows {
             std::env::temp_dir().join(format!("lingoleaf-ui-smoke-{}-{nonce}", std::process::id()));
         fs::create_dir(&directory)
             .map_err(|error| format!("Cannot create an isolated test directory: {error}"))?;
+        // Exercise an actual pre-language profile. The application must migrate
+        // missing preferences to English -> Simplified Chinese without a key.
+        let config_directory = directory.join("LingoLeaf");
+        fs::create_dir(&config_directory).map_err(|error| error.to_string())?;
+        fs::write(
+            config_directory.join("settings.json"),
+            br#"{"version":1,"base_url":"https://api.openai.com/v1","model":"gpt-4o-mini","timeout_seconds":20,"api_key_encrypted":[]}"#,
+        )
+        .map_err(|error| error.to_string())?;
         let restart_nonce = format!("{nonce:032x}");
         let ready = unsafe {
             CreateEventW(
@@ -137,9 +150,15 @@ mod windows {
             return Err("Opening settings took over five seconds; startup update checking may be blocking the UI.".into());
         }
         require_centered(settings)?;
-        for id in [THEME, UPDATE, UPDATE_STATUS] {
+        for id in [THEME, SERVICE_TAB, PREFERENCES_TAB, SAVE] {
             require_visible(settings, id)?;
         }
+        require_visible(settings, PROVIDER)?;
+        require_hidden(settings, SOURCE_LANGUAGE)?;
+        show_preferences(settings)?;
+        require_combo(settings, SOURCE_LANGUAGE, 1)?;
+        require_combo(settings, TARGET_LANGUAGE, 1)?;
+        show_service(settings)?;
         check_repeated_launch(&mut owned, settings)?;
         let ui_thread = window_thread(settings, owned.child.id())?;
         focus_settings_root(settings, ui_thread)?;
@@ -193,6 +212,7 @@ mod windows {
         require_visible(settings, SAVE)?;
         println!("Provider presets, credential clearing, model label and Save visibility passed.");
 
+        let settings = check_languages(&mut owned, settings)?;
         check_live_save(&mut owned, settings)?;
         let settings = check_theme(&mut owned, settings)?;
         check_icon_appearance(&mut owned, settings)?;
@@ -432,6 +452,7 @@ mod windows {
     }
 
     fn check_live_save(owned: &mut OwnedApplication, settings: HWND) -> Result<(), String> {
+        show_service(settings)?;
         select_provider(settings, 0)?;
         save_settings(owned, settings)?;
         set_control_text(settings, 212, "ui-smoke-unsaved-draft")?;
@@ -455,6 +476,76 @@ mod windows {
         Ok(())
     }
 
+    fn check_languages(owned: &mut OwnedApplication, settings: HWND) -> Result<HWND, String> {
+        show_preferences(settings)?;
+        require_combo(settings, SOURCE_LANGUAGE, 1)?;
+        require_combo(settings, TARGET_LANGUAGE, 1)?;
+        select_combo(settings, SOURCE_LANGUAGE, 0)?;
+        select_combo(settings, TARGET_LANGUAGE, 3)?;
+        save_settings(owned, settings)?;
+        let saved = saved_settings(owned)?;
+        if saved["source_language"] != "auto" || saved["target_language"] != "japanese" {
+            return Err("Saving language preferences did not persist Auto -> Japanese.".into());
+        }
+        // A provider preset changes API fields while preserving the selected
+        // language pair, including preferences in the hidden pane.
+        show_service(settings)?;
+        select_provider(settings, 0)?;
+        select_provider(settings, 1)?;
+        save_settings(owned, settings)?;
+        let preset_saved = saved_settings(owned)?;
+        if preset_saved["source_language"] != "auto"
+            || preset_saved["target_language"] != "japanese"
+        {
+            return Err("Switching API presets changed the language preferences.".into());
+        }
+        let settings = owned.restart()?;
+        show_preferences(settings)?;
+        require_combo(settings, SOURCE_LANGUAGE, 0)?;
+        require_combo(settings, TARGET_LANGUAGE, 3)?;
+        show_service(settings)?;
+        println!("Legacy English -> Chinese defaults, language saves, API preset preservation and restart restoration passed.");
+        Ok(settings)
+    }
+
+    fn show_service(settings: HWND) -> Result<(), String> {
+        click(settings, SERVICE_TAB)?;
+        for id in [PROVIDER, KEY, 210, 212, 213, 106] {
+            require_visible(settings, id)?;
+        }
+        for id in [
+            SOURCE_LANGUAGE,
+            TARGET_LANGUAGE,
+            SELECTION_MODE,
+            COMPATIBILITY_CAPTURE,
+            APPEARANCE,
+            UPDATE,
+            UPDATE_STATUS,
+        ] {
+            require_hidden(settings, id)?;
+        }
+        Ok(())
+    }
+
+    fn show_preferences(settings: HWND) -> Result<(), String> {
+        click(settings, PREFERENCES_TAB)?;
+        for id in [
+            SOURCE_LANGUAGE,
+            TARGET_LANGUAGE,
+            SELECTION_MODE,
+            COMPATIBILITY_CAPTURE,
+            APPEARANCE,
+            UPDATE,
+            UPDATE_STATUS,
+        ] {
+            require_visible(settings, id)?;
+        }
+        for id in [PROVIDER, KEY, 210, 212, 213, 106] {
+            require_hidden(settings, id)?;
+        }
+        Ok(())
+    }
+
     fn background_lightness(settings: HWND) -> Result<u32, String> {
         let dc = unsafe { GetDC(settings) };
         if dc.is_null() {
@@ -469,11 +560,11 @@ mod windows {
     }
 
     fn check_theme(owned: &mut OwnedApplication, settings: HWND) -> Result<HWND, String> {
-        require_text(settings, THEME, "白天模式")?;
+        require_text(settings, THEME, "切换到白天模式")?;
         let dark = background_lightness(settings)?;
         let baseline = saved_settings(owned)?;
         click(settings, THEME)?;
-        require_text(settings, THEME, "暗夜模式")?;
+        require_text(settings, THEME, "切换到暗夜模式")?;
         let deadline = Instant::now() + Duration::from_secs(3);
         while background_lightness(settings)? < dark + 300 {
             if Instant::now() >= deadline {
@@ -489,12 +580,12 @@ mod windows {
             );
         }
         let settings = owned.restart()?;
-        require_text(settings, THEME, "暗夜模式")?;
+        require_text(settings, THEME, "切换到暗夜模式")?;
         if background_lightness(settings)? < dark + 300 {
             return Err("The saved day palette was not restored on automatic startup.".into());
         }
         click(settings, THEME)?;
-        require_text(settings, THEME, "白天模式")?;
+        require_text(settings, THEME, "切换到白天模式")?;
         if saved_settings(owned)? != baseline {
             return Err("Switching back to night did not preserve the saved settings.".into());
         }
@@ -507,6 +598,7 @@ mod windows {
     fn check_icon_appearance(owned: &mut OwnedApplication, settings: HWND) -> Result<(), String> {
         // Save a key-free baseline first. Appearance saves must preserve every
         // unrelated field, including provider, timeout and selection preference.
+        show_preferences(settings)?;
         require_visible(settings, APPEARANCE)?;
         require_visible(settings, SELECTION_MODE)?;
         require_visible(settings, COMPATIBILITY_CAPTURE)?;
@@ -535,8 +627,10 @@ mod windows {
         // Drive the owner-drawn checkbox through its real command path. Provider
         // presets must preserve this choice, as must the appearance saves below.
         click(settings, COMPATIBILITY_CAPTURE)?;
+        show_service(settings)?;
         select_provider(settings, 0)?;
         select_provider(settings, 1)?;
+        show_preferences(settings)?;
         save_settings(owned, settings)?;
         let enabled = saved_settings(owned)?;
         baseline["compatibility_capture"] = serde_json::Value::Bool(true);
@@ -590,6 +684,7 @@ mod windows {
         let settings = owned.restart()?;
         require_text(settings, 210, "https://api.openai.com/v1")?;
         require_text(settings, 212, "gpt-4o-mini")?;
+        show_preferences(settings)?;
         require_combo(settings, SELECTION_MODE, 1)?;
         // A second click must disable the choice restored from disk. Checking
         // the whole document also protects mode, provider and saved icon values.
@@ -615,6 +710,7 @@ mod windows {
             }
         }
         require_same_nonappearance_settings(&baseline, &restored)?;
+        close_appearance(appearance, settings)?;
         select_combo(settings, SELECTION_MODE, 0)?;
         save_settings(owned, settings)?;
         if saved_settings(owned)?
@@ -671,8 +767,46 @@ mod windows {
     }
 
     fn open_appearance(owned: &mut OwnedApplication, settings: HWND) -> Result<HWND, String> {
-        send(settings, WM_COMMAND, APPEARANCE as usize, 0)?;
-        owned.wait_for_window(APPEARANCE_TITLE, true)
+        show_preferences(settings)?;
+        click(settings, APPEARANCE)?;
+        let appearance = owned.wait_for_window(APPEARANCE_TITLE, true)?;
+        if unsafe { GetWindow(appearance, GW_OWNER) } != settings
+            || unsafe { IsWindowEnabled(settings) } != 0
+        {
+            return Err("Icon appearance is not modal and owned by settings.".into());
+        }
+        let mut child: RECT = unsafe { zeroed() };
+        let mut parent: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(appearance, &mut child) } == 0
+            || unsafe { GetWindowRect(settings, &mut parent) } == 0
+            || (i64::from(child.left) + i64::from(child.right)
+                - i64::from(parent.left)
+                - i64::from(parent.right))
+            .abs()
+                > 8
+            || (i64::from(child.top) + i64::from(child.bottom)
+                - i64::from(parent.top)
+                - i64::from(parent.bottom))
+            .abs()
+                > 8
+        {
+            return Err("Icon appearance was not centered over its settings owner.".into());
+        }
+        Ok(appearance)
+    }
+
+    fn close_appearance(appearance: HWND, settings: HWND) -> Result<(), String> {
+        send(appearance, WM_CLOSE, 0, 0)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { IsWindowVisible(appearance) } != 0
+            || unsafe { IsWindowEnabled(settings) } == 0
+        {
+            if Instant::now() >= deadline {
+                return Err("Closing icon appearance did not restore its settings owner.".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
     }
 
     fn click(parent: HWND, id: i32) -> Result<(), String> {
@@ -846,6 +980,15 @@ mod windows {
             || bounds.bottom <= bounds.top
         {
             return Err(format!("Settings control {id} is not visibly laid out."));
+        }
+        Ok(())
+    }
+
+    fn require_hidden(settings: HWND, id: i32) -> Result<(), String> {
+        if unsafe { IsWindowVisible(control(settings, id)?) } != 0 {
+            return Err(format!(
+                "Control {id} leaked from the inactive settings pane."
+            ));
         }
         Ok(())
     }

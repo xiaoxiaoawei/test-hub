@@ -48,6 +48,92 @@ pub enum ThemeMode {
     Light,
 }
 
+/// Supported translation preferences. Automatic detection is source-only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Language {
+    Auto,
+    #[default]
+    English,
+    SimplifiedChinese,
+    TraditionalChinese,
+    Japanese,
+    Korean,
+    French,
+    German,
+    Spanish,
+    Russian,
+    Portuguese,
+    Italian,
+}
+
+impl Language {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动检测",
+            Self::English => "英语",
+            Self::SimplifiedChinese => "简体中文",
+            Self::TraditionalChinese => "繁体中文",
+            Self::Japanese => "日语",
+            Self::Korean => "韩语",
+            Self::French => "法语",
+            Self::German => "德语",
+            Self::Spanish => "西班牙语",
+            Self::Russian => "俄语",
+            Self::Portuguese => "葡萄牙语",
+            Self::Italian => "意大利语",
+        }
+    }
+
+    /// A fixed, non-user-editable name for request instructions. Callers should
+    /// handle Auto separately and ask the service to detect the source language.
+    pub const fn prompt_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto-detect",
+            Self::English => "English",
+            Self::SimplifiedChinese => "Simplified Chinese",
+            Self::TraditionalChinese => "Traditional Chinese",
+            Self::Japanese => "Japanese",
+            Self::Korean => "Korean",
+            Self::French => "French",
+            Self::German => "German",
+            Self::Spanish => "Spanish",
+            Self::Russian => "Russian",
+            Self::Portuguese => "Portuguese",
+            Self::Italian => "Italian",
+        }
+    }
+}
+
+pub const SOURCE_LANGUAGES: &[Language] = &[
+    Language::Auto,
+    Language::English,
+    Language::SimplifiedChinese,
+    Language::TraditionalChinese,
+    Language::Japanese,
+    Language::Korean,
+    Language::French,
+    Language::German,
+    Language::Spanish,
+    Language::Russian,
+    Language::Portuguese,
+    Language::Italian,
+];
+
+pub const TARGET_LANGUAGES: &[Language] = &[
+    Language::English,
+    Language::SimplifiedChinese,
+    Language::TraditionalChinese,
+    Language::Japanese,
+    Language::Korean,
+    Language::French,
+    Language::German,
+    Language::Spanish,
+    Language::Russian,
+    Language::Portuguese,
+    Language::Italian,
+];
+
 #[derive(Clone)]
 pub struct Settings {
     pub base_url: String,
@@ -60,6 +146,8 @@ pub struct Settings {
     /// Explicit opt-in to temporarily copy a selection when UIA cannot read it.
     pub compatibility_capture: bool,
     pub theme_mode: ThemeMode,
+    pub source_language: Language,
+    pub target_language: Language,
     pub icon_style: IconStyle,
     pub icon_shape: IconShape,
     /// Floating icon size in logical pixels, before per-monitor DPI scaling.
@@ -79,6 +167,8 @@ impl Default for Settings {
             selection_mode: SelectionMode::default(),
             compatibility_capture: false,
             theme_mode: ThemeMode::default(),
+            source_language: default_source_language(),
+            target_language: default_target_language(),
             icon_style: IconStyle::default(),
             icon_shape: IconShape::default(),
             icon_size: default_icon_size(),
@@ -107,6 +197,8 @@ impl fmt::Debug for Settings {
             .field("selection_mode", &self.selection_mode)
             .field("compatibility_capture", &self.compatibility_capture)
             .field("theme_mode", &self.theme_mode)
+            .field("source_language", &self.source_language)
+            .field("target_language", &self.target_language)
             .field("icon_style", &self.icon_style)
             .field("icon_shape", &self.icon_shape)
             .field("icon_size", &self.icon_size)
@@ -129,6 +221,9 @@ impl Settings {
 
     pub fn validate(&self) -> Result<(), String> {
         parse_endpoint(&self.base_url)?;
+        if self.target_language == Language::Auto {
+            return Err("目标语言不能选择自动检测。".into());
+        }
         if self.model.trim().is_empty() || self.model.chars().count() > 256 {
             return Err("请填写有效的模型名称（最多 256 个字符）。".into());
         }
@@ -166,6 +261,12 @@ fn default_timeout() -> u32 {
 fn default_selection_button() -> bool {
     true
 }
+fn default_source_language() -> Language {
+    Language::English
+}
+fn default_target_language() -> Language {
+    Language::SimplifiedChinese
+}
 fn default_icon_color() -> u32 {
     0xD6_A5_75
 }
@@ -191,6 +292,10 @@ struct StoredSettings {
     compatibility_capture: bool,
     #[serde(default)]
     theme_mode: ThemeMode,
+    #[serde(default = "default_source_language")]
+    source_language: Language,
+    #[serde(default = "default_target_language")]
+    target_language: Language,
     #[serde(default)]
     icon_style: IconStyle,
     #[serde(default)]
@@ -214,6 +319,8 @@ impl StoredSettings {
             selection_mode: settings.selection_mode,
             compatibility_capture: settings.compatibility_capture,
             theme_mode: settings.theme_mode,
+            source_language: settings.source_language,
+            target_language: settings.target_language,
             icon_style: settings.icon_style,
             icon_shape: settings.icon_shape,
             icon_size: settings.icon_size,
@@ -234,6 +341,8 @@ impl StoredSettings {
             selection_mode: self.selection_mode,
             compatibility_capture: self.compatibility_capture,
             theme_mode: self.theme_mode,
+            source_language: self.source_language,
+            target_language: self.target_language,
             icon_style: self.icon_style,
             icon_shape: self.icon_shape,
             icon_size: self.icon_size,
@@ -677,6 +786,8 @@ mod tests {
         assert_eq!(decoded.selection_mode, SelectionMode::Click);
         assert!(!decoded.compatibility_capture);
         assert_eq!(decoded.theme_mode, ThemeMode::Dark);
+        assert_eq!(decoded.source_language, Language::English);
+        assert_eq!(decoded.target_language, Language::SimplifiedChinese);
         assert_eq!(decoded.icon_style, IconStyle::Translate);
         assert_eq!(decoded.icon_shape, IconShape::Rounded);
         assert_eq!(decoded.icon_size, 32);
@@ -846,6 +957,126 @@ mod tests {
             assert_eq!(restored.icon_shape, settings.icon_shape);
             assert_eq!(restored.icon_size, settings.icon_size);
         }
+    }
+
+    #[test]
+    fn old_version_zero_five_configuration_keeps_english_to_simplified_chinese() {
+        let document = serde_json::json!({
+            "version": 1,
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "timeout_seconds": 30,
+            "selection_mode": "direct",
+            "compatibility_capture": true,
+            "theme_mode": "light",
+            "icon_style": "leaf",
+            "icon_shape": "circle",
+            "icon_size": 48,
+            "icon_color": 0x40_48_80,
+            "api_key_encrypted": [18, 42, 71]
+        });
+        let stored: StoredSettings = serde_json::from_value(document).unwrap();
+        let encrypted = stored.api_key_encrypted.clone();
+        let restored = stored.into_settings("test-only-key".into()).unwrap();
+        assert_eq!(restored.source_language, Language::English);
+        assert_eq!(restored.target_language, Language::SimplifiedChinese);
+        assert_eq!(restored.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(restored.model, "deepseek-chat");
+        assert_eq!(restored.timeout_seconds, 30);
+        assert_eq!(restored.selection_mode, SelectionMode::Direct);
+        assert!(restored.compatibility_capture);
+        assert_eq!(restored.theme_mode, ThemeMode::Light);
+        assert_eq!(restored.icon_style, IconStyle::Leaf);
+        assert_eq!(restored.icon_shape, IconShape::Circle);
+        assert_eq!(restored.icon_size, 48);
+        assert_eq!(restored.icon_color, 0x40_48_80);
+        let saved = StoredSettings::from_settings(&restored, encrypted);
+        assert_eq!(saved.api_key_encrypted, [18, 42, 71]);
+        assert_eq!(saved.version, 1);
+    }
+
+    #[test]
+    fn all_language_pairs_roundtrip_with_stable_values_and_existing_preferences() {
+        assert_eq!(Settings::default().source_language, Language::English);
+        assert_eq!(
+            Settings::default().target_language,
+            Language::SimplifiedChinese
+        );
+        for &source in SOURCE_LANGUAGES {
+            for &target in TARGET_LANGUAGES {
+                let settings = Settings {
+                    source_language: source,
+                    target_language: target,
+                    theme_mode: ThemeMode::Light,
+                    selection_mode: SelectionMode::Direct,
+                    compatibility_capture: true,
+                    icon_shape: IconShape::Circle,
+                    icon_size: 48,
+                    ..Settings::default()
+                };
+                settings.validate().unwrap();
+                let encoded = serde_json::to_value(StoredSettings::from_settings(
+                    &settings,
+                    vec![18, 42, 71],
+                ))
+                .unwrap();
+                assert_eq!(
+                    encoded["source_language"],
+                    serde_json::to_value(source).unwrap()
+                );
+                assert_eq!(
+                    encoded["target_language"],
+                    serde_json::to_value(target).unwrap()
+                );
+                let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
+                assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
+                let restored = stored.into_settings("test-only-key".into()).unwrap();
+                assert_eq!(restored.source_language, source);
+                assert_eq!(restored.target_language, target);
+                assert_eq!(restored.theme_mode, ThemeMode::Light);
+                assert_eq!(restored.selection_mode, SelectionMode::Direct);
+                assert!(restored.compatibility_capture);
+                assert_eq!(restored.icon_shape, IconShape::Circle);
+                assert_eq!(restored.icon_size, 48);
+                assert!(!source.label().is_empty());
+                assert!(!target.prompt_name().is_empty());
+            }
+        }
+        assert_eq!(serde_json::to_value(Language::English).unwrap(), "english");
+        assert_eq!(
+            serde_json::to_value(Language::SimplifiedChinese).unwrap(),
+            "simplified_chinese"
+        );
+        assert_eq!(
+            serde_json::to_value(Language::TraditionalChinese).unwrap(),
+            "traditional_chinese"
+        );
+        assert_eq!(serde_json::to_value(Language::Auto).unwrap(), "auto");
+    }
+
+    #[test]
+    fn automatic_language_is_source_only_and_unknown_preferences_are_rejected() {
+        let automatic_source = Settings {
+            source_language: Language::Auto,
+            ..Settings::default()
+        };
+        automatic_source.validate().unwrap();
+        assert!(!TARGET_LANGUAGES.contains(&Language::Auto));
+        let invalid_target = Settings {
+            target_language: Language::Auto,
+            ..Settings::default()
+        };
+        assert!(invalid_target.validate().is_err());
+        let stored = StoredSettings::from_settings(&invalid_target, vec![]);
+        assert!(stored.into_settings(String::new()).is_err());
+        assert!(serde_json::from_str::<StoredSettings>(
+            r#"{"source_language":"unknown-language"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<StoredSettings>(
+            r#"{"target_language":"unknown-language"}"#
+        )
+        .is_err());
     }
 
     #[test]

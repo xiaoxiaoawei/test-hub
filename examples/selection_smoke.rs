@@ -19,7 +19,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows {
-    use lingoleaf::config::{self, SelectionMode, Settings};
+    use lingoleaf::config::{self, Language, SelectionMode, Settings};
     use std::{
         fs,
         io::{Read, Write},
@@ -44,18 +44,42 @@ mod windows {
             LibraryLoader::GetModuleHandleW,
             Threading::{AttachThreadInput, GetCurrentThreadId},
         },
-        UI::{Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::*},
+        UI::{
+            Input::KeyboardAndMouse::{
+                IsWindowEnabled, SendInput, SetFocus, INPUT, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
+                MOUSEEVENTF_LEFTUP,
+            },
+            WindowsAndMessaging::*,
+        },
     };
 
     const CLASS: &str = "LingoLeaf.NativeWindow";
     const BACKGROUND: &str = "轻译 · 后台";
-    const SETTINGS: &str = "轻译 · 翻译服务设置";
+    const SETTINGS: &str = "轻译 · 设置";
     const INLINE: &str = "轻译 · 划词译文";
     const EM_GETSEL: u32 = 0xB0;
     const EM_SETSEL: u32 = 0xB1;
     const EM_POSFROMCHAR: u32 = 0xD6;
     const SELECTION: u32 = WM_APP + 3;
-    const SOURCE_TEXT: &str = "warm light.\r\nwarm light.";
+    const SOURCE_TEXT: &str = "warm light.\r\nwarm light. calm.";
+    const QUESTION: i32 = 260;
+    const ASK: i32 = 261;
+    const QUESTION_ONE: &str = "What does this word mean?";
+    const QUESTION_TWO: &str = "Give a short example.";
+    const QUESTION_OLD: &str = "Hold this old answer.";
+    const QUESTION_NEW: &str = "Explain the new word.";
+    const ANSWER_ONE: &str = "含义说明";
+    const ANSWER_TWO: &str = "例句说明";
+    const ANSWER_NEW: &str = "新词解释";
+    const ALL_REQUESTS: &[&str] = &[
+        "warm",
+        "light",
+        "question:first",
+        "question:followup",
+        "question:old",
+        "calm",
+        "question:new",
+    ];
 
     pub(super) fn run() -> Result<(), String> {
         let executable = std::env::args_os()
@@ -88,6 +112,8 @@ mod windows {
             base_url: format!("http://127.0.0.1:{}/v1", mock.port),
             model: "selection-smoke-model".into(),
             selection_mode: SelectionMode::Direct,
+            source_language: Language::Auto,
+            target_language: Language::Japanese,
             ..Settings::default()
         })?;
         let source = Source::start()?;
@@ -169,16 +195,164 @@ mod windows {
         require_same_inline(&app, inline)?;
         mock.require_requests(&["warm", "light"])?;
 
+        check_questions(&source, &app, background, inline, &mock)?;
+
         // Both an empty selection and a password selection must remain local.
         source.gesture(background, false, 4, 4)?;
         thread::sleep(Duration::from_millis(2400));
-        mock.require_requests(&["warm", "light"])?;
+        mock.require_requests(ALL_REQUESTS)?;
         source.gesture(background, true, 0, 5)?;
         thread::sleep(Duration::from_millis(2400));
-        mock.require_requests(&["warm", "light"])?;
+        mock.require_requests(ALL_REQUESTS)?;
         app.stop()?;
         println!("Selection controller passed: one compact HWND, updated positions, stale-progress isolation, in-flight/cache deduplication, and no requests for empty/password selections.");
-        println!("Two local mock POSTs; no real API credential or remote service was used. Mouse-hook behavior requires a separate actual-gesture check.");
+        println!("Questions passed: current source/translation reference data, two-turn history, independent translation while an old answer is blocked, and a fresh conversation after reselection.");
+        println!("Seven local mock POSTs (three translations and four questions); no real API credential or remote service was used. Mouse-hook and keyboard behavior require separate actual-input checks.");
+        Ok(())
+    }
+
+    fn check_questions(
+        source: &Source,
+        app: &Application,
+        background: HWND,
+        inline: HWND,
+        mock: &Mock,
+    ) -> Result<(), String> {
+        ask(inline, QUESTION_ONE)?;
+        let first = format!("新译文\n\n你：{QUESTION_ONE}\n轻译：{ANSWER_ONE}");
+        wait_for("the first complete answer", || {
+            Ok(text(inline, 251)? == first && text(inline, 254)?.contains("回答完成"))
+        })
+        .map_err(|error| question_failure(error, mock, inline))?;
+
+        ask(inline, QUESTION_TWO)?;
+        let second = format!("{first}\n\n你：{QUESTION_TWO}\n轻译：{ANSWER_TWO}");
+        wait_for("the answer with preceding conversation history", || {
+            Ok(text(inline, 251)? == second && text(inline, 254)?.contains("回答完成"))
+        })
+        .map_err(|error| question_failure(error, mock, inline))?;
+
+        ask(inline, QUESTION_OLD)?;
+        wait_for("a partial old answer before stream completion", || {
+            Ok(text(inline, 251)?.ends_with("轻译：过期"))
+        })
+        .map_err(|error| question_failure(error, mock, inline))?;
+        if mock.finish_answer.load(Ordering::Acquire) {
+            return Err("The old-answer stream gate opened before reselection.".into());
+        }
+
+        // Translation has its own worker: calm must finish even while the old
+        // question is still waiting for a response body on its separate stream.
+        source.gesture(background, false, 25, 29)?;
+        require_same_inline(app, inline)?;
+        wait_for(
+            "the new translation while an old question is blocked",
+            || Ok(text(inline, 251)? == "静译文" && text(inline, 254)?.contains("完成")),
+        )
+        .map_err(|error| question_failure(error, mock, inline))?;
+        if !text(inline, QUESTION)?.is_empty() {
+            return Err("Reselection did not clear the question input.".into());
+        }
+
+        mock.finish_answer.store(true, Ordering::Release);
+        let observe = Instant::now();
+        while observe.elapsed() < Duration::from_millis(350) {
+            if text(inline, 251)? != "静译文" {
+                return Err("An old answer or conversation replaced the new translation.".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        ask(inline, QUESTION_NEW)?;
+        let fresh = format!("静译文\n\n你：{QUESTION_NEW}\n轻译：{ANSWER_NEW}");
+        wait_for(
+            "a fresh answer containing no previous selection history",
+            || {
+                let output = text(inline, 251)?;
+                if output.contains(QUESTION_ONE)
+                    || output.contains(QUESTION_TWO)
+                    || output.contains(QUESTION_OLD)
+                    || output.contains("过期")
+                {
+                    return Err("An old conversation leaked into the new selected passage.".into());
+                }
+                Ok(output == fresh && text(inline, 254)?.contains("回答完成"))
+            },
+        )
+        .map_err(|error| question_failure(error, mock, inline))?;
+        mock.require_requests(ALL_REQUESTS)
+    }
+
+    fn question_failure(error: String, mock: &Mock, inline: HWND) -> String {
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(foreground, &mut pid) };
+        format!(
+            "{error}; {}; inline_visible={}; foreground={foreground:?}; foreground_root={:?}; foreground_pid={pid}; output={:?}; status={:?}",
+            mock.diagnostics(),
+            unsafe { IsWindowVisible(inline) },
+            unsafe { GetAncestor(foreground, GA_ROOT) },
+            text(inline, 251),
+            text(inline, 254),
+        )
+    }
+
+    fn ask(parent: HWND, question: &str) -> Result<(), String> {
+        let input = unsafe { GetDlgItem(parent, QUESTION) };
+        let submit = unsafe { GetDlgItem(parent, ASK) };
+        if input.is_null() || submit.is_null() {
+            return Err("The completed selection did not create a question composer.".into());
+        }
+        wait_for("the enabled question composer", || {
+            Ok(unsafe { IsWindowVisible(input) } != 0
+                && unsafe { IsWindowVisible(submit) } != 0
+                && unsafe { IsWindowEnabled(submit) } != 0)
+        })
+        .map_err(|error| {
+            format!(
+                "{error}; question={question:?}; input_visible={}; send_visible={}; send_enabled={}; output={:?}; status={:?}",
+                unsafe { IsWindowVisible(input) },
+                unsafe { IsWindowVisible(submit) },
+                unsafe { IsWindowEnabled(submit) },
+                text(parent, 251),
+                text(parent, 254),
+            )
+        })?;
+        // A compact translation first appears without activation. A real user
+        // clicks its editor before typing; merely BM_CLICK-ing an inactive
+        // button bypasses WM_MOUSEACTIVATE and is not that interaction.
+        let mut rect: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(input, &mut rect) } == 0
+            || unsafe { SetCursorPos((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2) }
+                == 0
+        {
+            return Err("Cannot point at the owned question editor.".into());
+        }
+        let mut clicks: [INPUT; 2] = unsafe { zeroed() };
+        for (event, flags) in clicks
+            .iter_mut()
+            .zip([MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP])
+        {
+            event.r#type = INPUT_MOUSE;
+            event.Anonymous.mi.dwFlags = flags;
+        }
+        if unsafe { SendInput(2, clicks.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
+            return Err("Cannot click the owned question editor.".into());
+        }
+        wait_for("question editor activation after a real click", || {
+            let mut info: GUITHREADINFO = unsafe { zeroed() };
+            info.cbSize = size_of::<GUITHREADINFO>() as u32;
+            Ok(unsafe { GetForegroundWindow() } == parent
+                && unsafe {
+                    GetGUIThreadInfo(GetWindowThreadProcessId(parent, null_mut()), &mut info)
+                } != 0
+                && info.hwndFocus == input)
+        })?;
+        let question = wide(question);
+        send(input, WM_SETTEXT, 0, question.as_ptr() as isize)?;
+        send(submit, BM_CLICK, 0, 0)?;
+        if !text(parent, QUESTION)?.is_empty() {
+            return Err("Submitting a question did not clear the input.".into());
+        }
         Ok(())
     }
 
@@ -483,6 +657,7 @@ mod windows {
         error: Arc<Mutex<Option<String>>>,
         finish_warm: Arc<AtomicBool>,
         finish_light: Arc<AtomicBool>,
+        finish_answer: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
     }
@@ -501,16 +676,18 @@ mod windows {
             let error = Arc::new(Mutex::new(None));
             let finish_warm = Arc::new(AtomicBool::new(false));
             let finish_light = Arc::new(AtomicBool::new(false));
+            let finish_answer = Arc::new(AtomicBool::new(false));
             let stop = Arc::new(AtomicBool::new(false));
             let state = (
                 requests.clone(),
                 error.clone(),
                 finish_warm.clone(),
                 finish_light.clone(),
+                finish_answer.clone(),
                 stop.clone(),
             );
             let worker = thread::spawn(move || {
-                let (requests, error, finish_warm, finish_light, stop) = state;
+                let (requests, error, finish_warm, finish_light, finish_answer, stop) = state;
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -520,11 +697,12 @@ mod windows {
                                 error.clone(),
                                 finish_warm.clone(),
                                 finish_light.clone(),
+                                finish_answer.clone(),
                                 stop.clone(),
                             );
                             handlers.push(thread::spawn(move || {
                                 if let Err(problem) =
-                                    serve(stream, &state.0, &state.2, &state.3, &state.4)
+                                    serve(stream, &state.0, &state.2, &state.3, &state.4, &state.5)
                                 {
                                     *state.1.lock().unwrap_or_else(|poison| poison.into_inner()) =
                                         Some(problem);
@@ -547,6 +725,7 @@ mod windows {
                 error,
                 finish_warm,
                 finish_light,
+                finish_answer,
                 stop,
                 worker: Some(worker),
             })
@@ -590,6 +769,7 @@ mod windows {
             self.stop.store(true, Ordering::Release);
             self.finish_warm.store(true, Ordering::Release);
             self.finish_light.store(true, Ordering::Release);
+            self.finish_answer.store(true, Ordering::Release);
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
@@ -600,6 +780,7 @@ mod windows {
         requests: &Mutex<Vec<String>>,
         warm: &AtomicBool,
         light: &AtomicBool,
+        answer: &AtomicBool,
         stop: &AtomicBool,
     ) -> Result<(), String> {
         stream
@@ -654,22 +835,33 @@ mod windows {
             .pointer("/messages/1/content")
             .and_then(serde_json::Value::as_str)
             .ok_or("Missing local selection text.")?;
-        if body["model"] != "selection-smoke-model"
-            || body["stream"] != true
-            || !matches!(source, "warm" | "light")
-        {
+        if body["model"] != "selection-smoke-model" || body["stream"] != true {
             return Err("Unexpected local selection request.".into());
+        }
+        let (label, first, last, gate) = match source {
+            "warm" => ("warm", "旧", "译文", Some(warm)),
+            "light" => ("light", "新", "译文", Some(light)),
+            "calm" => ("calm", "静", "译文", None),
+            _ => {
+                let (label, first, last, blocked) = question_response(&body)?;
+                (label, first, last, blocked.then_some(answer))
+            }
+        };
+        if matches!(label, "warm" | "light" | "calm")
+            && (body["messages"].as_array().map(Vec::len) != Some(2)
+                || body["messages"][0]["role"] != "system"
+                || body["messages"][1]["role"] != "user"
+                || !body["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|system| system.starts_with("Detect the source language and translate the user message to Japanese.")))
+        {
+            return Err("Unexpected local translation message roles.".into());
         }
         requests
             .lock()
             .map_err(|_| "Mock request lock failed.")?
-            .push(source.to_owned());
+            .push(label.to_owned());
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").map_err(|_| "Cannot write local response headers.")?;
-        let (first, last, gate) = if source == "warm" {
-            ("旧", "译文", warm)
-        } else {
-            ("新", "译文", light)
-        };
         let first = format!(
             "data: {}\n\n",
             serde_json::json!({"choices":[{"delta":{"content":first}}]})
@@ -682,7 +874,7 @@ mod windows {
             return Ok(());
         }
         let started = Instant::now();
-        while !gate.load(Ordering::Acquire)
+        while gate.is_some_and(|gate| !gate.load(Ordering::Acquire))
             && !stop.load(Ordering::Acquire)
             && started.elapsed() < Duration::from_secs(12)
         {
@@ -694,6 +886,83 @@ mod windows {
             write_chunk(&mut stream, tail.as_bytes()).and_then(|_| stream.write_all(b"0\r\n\r\n"));
         Ok(())
     }
+
+    fn question_response(
+        body: &serde_json::Value,
+    ) -> Result<(&'static str, &'static str, &'static str, bool), String> {
+        let messages = body["messages"]
+            .as_array()
+            .ok_or("Missing local question messages.")?;
+        let system = messages
+            .first()
+            .filter(|message| message["role"] == "system")
+            .and_then(|message| message["content"].as_str())
+            .ok_or("Missing local question system message.")?;
+        if !system.contains("primarily in Japanese")
+            || !system.contains("Infer the passage's source language")
+        {
+            return Err("The question did not preserve the target language preference.".into());
+        }
+        let context_message = messages
+            .get(1)
+            .filter(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .ok_or("Missing local question reference data.")?;
+        let context: serde_json::Value = serde_json::from_str(context_message)
+            .map_err(|_| "The question reference data was not a JSON object.")?;
+        let question = messages
+            .last()
+            .filter(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .ok_or("Missing local question text.")?;
+        let (label, first, last, blocked, history): (_, _, _, _, &[(&str, &str)]) = match question {
+            QUESTION_ONE => ("question:first", "含义", "说明", false, &[]),
+            QUESTION_TWO => (
+                "question:followup",
+                "例句",
+                "说明",
+                false,
+                &[(QUESTION_ONE, ANSWER_ONE)],
+            ),
+            QUESTION_OLD => (
+                "question:old",
+                "过期",
+                "回答",
+                true,
+                &[(QUESTION_ONE, ANSWER_ONE), (QUESTION_TWO, ANSWER_TWO)],
+            ),
+            QUESTION_NEW => ("question:new", "新词", "解释", false, &[]),
+            _ => return Err("Unexpected local question text.".into()),
+        };
+        let (source, translation) = if question == QUESTION_NEW {
+            ("calm", "静译文")
+        } else {
+            ("light", "新译文")
+        };
+        if context
+            != serde_json::json!({
+                "kind": "selection_context",
+                "source_text": source,
+                "translation": translation,
+            })
+        {
+            return Err(
+                "The question did not reference only the current selected text and translation."
+                    .into(),
+            );
+        }
+        let mut expected = Vec::new();
+        for (question, answer) in history {
+            expected.push(serde_json::json!({"role":"user","content":question}));
+            expected.push(serde_json::json!({"role":"assistant","content":answer}));
+        }
+        expected.push(serde_json::json!({"role":"user","content":question}));
+        if messages.len() != expected.len() + 2 || messages[2..] != expected {
+            return Err("The question conversation history omitted a completed turn or leaked a previous selection.".into());
+        }
+        Ok((label, first, last, blocked))
+    }
+
     fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
         write!(stream, "{:x}\r\n", bytes.len())?;
         stream.write_all(bytes)?;
@@ -744,7 +1013,9 @@ mod windows {
         if count >= buffer.len() {
             return Err("The compact text did not fit the bounded test buffer.".into());
         }
-        Ok(String::from_utf16_lossy(&buffer[..count]))
+        // Native multiline EDIT controls expose CRLF; compare the same logical
+        // text used by the conversation fixture and network request payloads.
+        Ok(String::from_utf16_lossy(&buffer[..count]).replace("\r\n", "\n"))
     }
     fn send(window: HWND, message: u32, wparam: usize, lparam: isize) -> Result<usize, String> {
         let mut result = 0;

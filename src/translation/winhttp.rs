@@ -298,7 +298,7 @@ fn remaining_ms(deadline: Instant) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translation::TranslationClient;
+    use crate::translation::{ConversationContext, ConversationTurn, TranslationClient};
     use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -486,6 +486,95 @@ mod tests {
                     .unwrap(),
                 "你好"
             );
+        }
+        service.join().unwrap();
+    }
+
+    #[test]
+    fn winhttp_streams_questions_with_reference_data_and_continuation_history() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = std::thread::spawn(move || {
+            // The same socket serves both exchanges, so the Q&A method also
+            // exercises the existing client's keep-alive connection reuse.
+            let mut socket = accept(&listener);
+            for number in 0..2 {
+                let request = read_request(&mut socket);
+                assert_eq!(request["stream"], true);
+                assert_eq!(request["model"], "mock-question-model");
+                let messages = request["messages"].as_array().unwrap();
+                assert!(messages[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("primarily in Simplified Chinese"));
+                let context: Value =
+                    serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    context,
+                    json!({"kind":"selection_context","source_text":"warm light","translation":"温暖的光"})
+                );
+                if number == 0 {
+                    assert_eq!(messages.len(), 3);
+                    assert_eq!(messages[2], json!({"role":"user","content":"Why warm?"}));
+                } else {
+                    assert_eq!(messages.len(), 5);
+                    assert_eq!(messages[2], json!({"role":"user","content":"Why warm?"}));
+                    assert_eq!(
+                        messages[3],
+                        json!({"role":"assistant","content":"描述色调。"})
+                    );
+                    assert_eq!(
+                        messages[4],
+                        json!({"role":"user","content":"Another example?"})
+                    );
+                }
+                let answer = if number == 0 {
+                    "描述色调。"
+                } else {
+                    "a warm glow。"
+                };
+                let response = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"delta":{"content":answer}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                );
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n", response.len()).unwrap();
+                socket.write_all(response.as_bytes()).unwrap();
+                socket.flush().unwrap();
+            }
+        });
+        let settings = Settings {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "mock-question-model".into(),
+            timeout_seconds: 5,
+            ..Settings::default()
+        };
+        let mut client = TranslationClient::new();
+        let mut history = Vec::new();
+        for (question, expected) in [
+            ("Why warm?", "描述色调。"),
+            ("Another example?", "a warm glow。"),
+        ] {
+            let mut progress = Vec::new();
+            let answer = client
+                .ask_streaming(
+                    &settings,
+                    ConversationContext {
+                        source: "warm light",
+                        translation: "温暖的光",
+                        history: &history,
+                    },
+                    question,
+                    || false,
+                    |text| progress.push(text.to_owned()),
+                )
+                .unwrap();
+            assert_eq!(answer, expected);
+            assert_eq!(progress.last().unwrap(), expected);
+            history.push(ConversationTurn {
+                question: question.to_owned(),
+                answer,
+            });
         }
         service.join().unwrap();
     }

@@ -1,0 +1,12 @@
+/target/
+/dist/
+*.pdb
+*.log
+.DS_Store
+Thumbs.db
+
+# Local editor settings and credentials do not belong in the repository.
+/.vscode/
+/.idea/
+.env
+.env.*

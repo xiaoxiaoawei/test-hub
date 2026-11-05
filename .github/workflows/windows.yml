@@ -1,0 +1,70 @@
+name: Build, check and package
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check version metadata
+        run: python tools/release.py --check
+      - name: Check version tag
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python tools/release.py --check --tag "$env:RELEASE_TAG"
+      - name: Prepare stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --locked --all-targets
+      - name: Check lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Package distribution
+        run: python tools/release.py --exe target/release/lingoleaf.exe --out-dir dist
+      - name: Upload distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: lingoleaf-windows-x64
+          path: |
+            dist/lingoleaf-*-windows-x64.exe
+            dist/lingoleaf-*-windows-x64.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  core-tests:
+    name: Portable logic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test distribution tooling
+        run: python -m unittest discover -s tools -p test_release.py
+      - name: Check version metadata
+        run: python tools/release.py --check
+      - name: Prepare stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run tests
+        run: cargo test --locked --all-targets

@@ -404,6 +404,15 @@ impl Theme {
         let selected = info.itemState & ODS_SELECTED != 0;
         let focused = info.itemState & ODS_FOCUS != 0;
         let mut rect = info.rcItem;
+        let collapsed = info.itemState & ODS_COMBOBOXEDIT != 0;
+        if collapsed {
+            let mut combo: windows_sys::Win32::UI::Controls::COMBOBOXINFO = std::mem::zeroed();
+            combo.cbSize = size_of::<windows_sys::Win32::UI::Controls::COMBOBOXINFO>() as u32;
+            if windows_sys::Win32::UI::Controls::GetComboBoxInfo(info.hwndItem, &mut combo) != 0 {
+                let native_arrow = (combo.rcButton.right - combo.rcButton.left).max(0);
+                rect.right -= (scale(info.hwndItem, 34) - native_arrow).max(0);
+            }
+        }
         FillRect(
             dc,
             &rect,
@@ -413,17 +422,8 @@ impl Theme {
                 self.surface
             },
         );
-        let collapsed = info.itemState & ODS_COMBOBOXEDIT != 0;
         if focused && !disabled && !collapsed {
             FrameRect(dc, &rect, self.accent);
-        }
-        if collapsed {
-            let mut combo: windows_sys::Win32::UI::Controls::COMBOBOXINFO = std::mem::zeroed();
-            combo.cbSize = size_of::<windows_sys::Win32::UI::Controls::COMBOBOXINFO>() as u32;
-            if windows_sys::Win32::UI::Controls::GetComboBoxInfo(info.hwndItem, &mut combo) != 0 {
-                let native_arrow = (combo.rcButton.right - combo.rcButton.left).max(0);
-                rect.right -= (scale(info.hwndItem, 34) - native_arrow).max(0);
-            }
         }
         let mut text: Vec<u16> = "选择服务\0".encode_utf16().collect();
         if info.itemID != u32::MAX {

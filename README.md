@@ -8,9 +8,11 @@
 
 发行文件统一使用 **`lingoleaf.exe`** 和 **`lingoleaf-windows-x64.zip`**，版本号保留在程序内部、标签和更新记录中。[发行页](https://github.com/xiaoxiaoawei/test-hub/releases) 提供已公开版本；已有 0.5.0 及之后客户端可继续通过“检查更新”升级；0.8.0 是否已公开，以发行页和构建记录为准。
 
-![0.7.0 旧版服务设置，Wine 兼容层截图](docs/images/settings-dark-0.7.0.png)
+![0.8.0 深海蓝设置，Wine 客户区截图](docs/images/settings-ocean-dark-0.8.0.png)
 
-上图来自 0.7.0，保留作旧版参考，不代表 0.8.0 的圆角、模板或布局已验收；本版截图与实际结果见构建记录。目标平台为 Windows 11 x64；Windows 10、Edge 和跨软件交互的实际状态见 [验证清单](docs/windows-validation.md)。Wine 回归、CI 构建和真实 Windows 桌面结果分别记录。
+![0.8.0 四套配色模板](docs/images/themes-0.8.0.png)
+
+上图来自 0.8.0 的 Wine 客户区，使用本地模拟服务与空密钥；实际系统标题栏、DWM 圆角和字体由 Windows 决定。完整测试范围见构建记录。目标平台为 Windows 11 x64；Windows 10、Edge 和跨软件交互的实际状态见 [验证清单](docs/windows-validation.md)。Wine 回归、CI 构建和真实 Windows 桌面结果分别记录。
 
 ## 开始使用
 

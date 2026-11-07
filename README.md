@@ -10,6 +10,16 @@
 
 目标平台为 Windows 11 x64；Windows 10、Edge、混合 DPI 和跨软件交互按 [验证清单](docs/windows-validation.md) 分别验收。Wine、原生 Windows CI 和真实 Windows 桌面结果分别记录，旧版截图不作为本版界面证据。
 
+## 界面预览
+
+以下为本版最终候选的 Wine 原生窗口截图，空密钥 / 模拟内容；Windows 11 系统圆角和真实声音的验收边界见构建记录。
+
+![精简翻译服务](docs/images/settings-dark-0.10.0.png)
+
+![单层配色模板](docs/images/appearance-0.10.0.png)
+
+![Markdown 译文](docs/images/markdown-0.10.0.png)
+
 ## 开始使用
 
 1. 双击 `lingoleaf.exe`，在鼠标所在显示器的工作区居中打开“翻译服务”。重复运行激活同一实例，保留已显示设置页中的未保存草稿。

@@ -28,6 +28,7 @@ OPTIONAL_DOCUMENTS = (
     "docs/images/markdown-0.10.0.png",
     "docs/images/appearance-0.10.0.png",
     "docs/images/settings-200pct-0.10.0.png",
+    "docs/images/selection-leaf-0.10.0.png",
     "docs/design-0.10.0.md",
 )
 

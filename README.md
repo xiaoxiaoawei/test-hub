@@ -6,7 +6,7 @@
 
 [**下载已公开最新版 lingoleaf.exe**](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe) · [发行页](https://github.com/xiaoxiaoawei/test-hub/releases)
 
-发行文件统一使用 **`lingoleaf.exe`** 和 **`lingoleaf-windows-x64.zip`**，版本号保留在程序内部、标签和更新记录中。[发行页](https://github.com/xiaoxiaoawei/test-hub/releases) 提供已公开版本；已有 0.5.0 及之后客户端可继续通过“检查更新”升级；0.8.0 是否已公开，以发行页和构建记录为准。
+发行文件统一使用 **`lingoleaf.exe`** 和 **`lingoleaf-windows-x64.zip`**，版本号保留在程序内部、标签和更新记录中。[发行页](https://github.com/xiaoxiaoawei/test-hub/releases) 提供已公开版本；已有 0.5.0 及之后客户端可继续通过“检查更新”升级；0.8.0 已公开并设为 latest。
 
 ![0.8.0 深海蓝设置，Wine 客户区截图](docs/images/settings-ocean-dark-0.8.0.png)
 

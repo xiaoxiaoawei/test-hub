@@ -19,8 +19,8 @@
 | 固定 150% / 200% DPI | 实际 144 / 192 DPI，字段 60 / 80 px，最小尺寸与真实滚动保存通过 |
 | 更新 helper 成功 / 回滚 | 0.10.1 固定夹具替换 / AppReady / 精确回滚与重启通过 |
 | 空白划选 | Direct / Click 共 8 负例零 Show / 零可见采样 / 零 POST；两例保持状态不变 |
-| 原生 Windows 完整测试 / 构建 / 打包 | [完整测试分支 CI 通过](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42348029373)，无过滤；标签发布任务待运行 |
-| 实际公开更新源 / 旧 0.9.0 升级 | 尚未发布，待公开资产验证 |
+| 原生 Windows 完整测试 / 构建 / 打包 | [v0.10.0 标签 CI 通过](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42348692129)，完整无过滤；Linux 与发布任务也成功 |
+| 实际公开更新源 / 旧 0.9.0 升级 | latest 实际 0.10.0；五资产 / 四 SHA / 13 项 ZIP 通过，旧版下载重启成功且配置逐字节保留 |
 | Windows 11 DWM / Edge / 混合 DPI / 实际远端声音 | 未执行；兼容层不能代替实机结果 |
 
 ## 本版重点
@@ -96,3 +96,25 @@ Wine WinHTTP 在某些 chunk header 边界可能同步阻塞。仅允许明确�
 ![原生 Markdown 阅读](images/markdown-0.10.0.png)
 
 ![默认 32px 叶片，含周围背景](images/selection-leaf-0.10.0.png)
+
+## 正式公开分发
+
+标签 `v0.10.0` 对应源码 `a2cc568` 的 [完整流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42348692129) 全部成功。Windows 无过滤测试、严格 Clippy、静态 CRT release、嵌入版本、打包与发布检查均通过；Linux 与发行工具检查也成功。未修改既有标签、已公开资产或更新协议。
+
+实际匿名 HTTPS 下载五项资产全部成功。主 EXE、兼容 EXE、ZIP 和 update.json 的四个 SHA 校验通过，两个 EXE 字节相同，ZIP 内的 EXE 也完全一致。ZIP CRC 与严格允许清单通过，13 项只包含程序、说明、当前文档和五张本版截图，不含配置、凭据、日志、测试助手、源码、DLL 或旧截图。文档按标签源码核对，只对 Windows checkout 的 Markdown 换行差异规范化。
+
+标签和 latest 更新清单逐字节相同，保持 schema 1 六字段及精确版本化兼容地址；无特殊缓存头的普通 latest 清单与主 EXE 请求也 HTTP 200，版本与字节一致。正式 MSVC EXE 为 **1153536 字节（约 1.10 MiB）**，仅依赖 Windows 系统 DLL（含音频输出 winmm），无需附带运行时。SHA-256：
+
+```text
+46092b74fa4061ef94aea447a5f1a14b6b302fe39ab0706a5eb4711102e9378a
+```
+
+主下载为 [lingoleaf.exe](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe)，压缩包为 `lingoleaf-windows-x64.zip`，名字不带版本。ZIP 保留打包时记录，本节是在公开验证后补入分支的结果，不覆盖发行资产。
+
+## 原始 0.9.0 升级正式 0.10.0
+
+使用原始公开 0.9.0 MSVC（1122816 字节、SHA `b019e4396c9982d998f78f733a59fd49172334275700e9456627f1089be6e31e`）和隔离 profile，经真实旧 GUI 自动发现、下载、校验、确认重启，约 3.60 秒完成。重启前独立核对缓存 payload 为正式 1153536 字节与上述 SHA；旧父进程退出 0，实际新 MSVC GUI 前台且 enabled，显示 0.10.0 / 已是最新。目标文件与公开资产相同，AppReady 后 backup、stage、安装票据均为 0。
+
+468 字节 settings.json 在整个过程和退出后逐字节相同，SHA `26c41851a02f6c72d6e080883d7bdad699b39d5999a75de7fb210743d3552cc0`。实际 GUI 保留 Auto → 日语的 0 / 3 语言索引、Direct 模式、37 秒、兼容取词、Nebula 白天及 `#F5F0FC` 背景。图标模态读取到样式 / 形状索引 2 / 2、48 px 与 `#D6A575`，证明自定义 Letter / Circle 在内存界面中也保留。缺少本版朗读、热键和默认图标标记字段的旧配置没有被自动保存、重置或迁移为新出厂外观；全程未点击保存。
+
+本次是 Wine 中对实际公开文件的本地 GET-only 传输回放，未改清单、URL、版本、哈希、安装票据、生产保护或启动 ACK。仅有旧 latest feed、精确正式兼容 EXE、新 latest feed 三条 GET，均无认证头；两个自有应用进程已退出。它证明旧客户端校验 / 替换 / 启动与配置保留；真实匿名 HTTPS 已由前述独立下载验证，不冒充目标 Windows 到 GitHub 的 WinHTTP 网络、Edge、混合屏幕、DWM 或实际音频发声验收。

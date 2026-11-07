@@ -353,7 +353,7 @@ impl<'a> Renderer<'a> {
                 let indent = self.indent() + 120;
                 let _ = write!(
                     self.rtf,
-                    "\\f1\\fs{}\\highlight4\\li{}\\ri120\\sb100\\sa100 ",
+                    "\\f1\\fs{}\\highlight4\\li{}\\ri120\\sb0\\sa0 ",
                     self.size.saturating_sub(2),
                     indent
                 );
@@ -461,9 +461,9 @@ impl<'a> Renderer<'a> {
                 TagEnd::CodeBlock => {
                     // CommonMark's code text includes the fence's final LF. Keep
                     // real inner blank lines, without adding an empty final line.
-                    if self.text.ends_with('\n') && self.rtf.ends_with("\\line ") {
+                    if self.text.ends_with('\n') && self.rtf.ends_with("\\sa0\\par ") {
                         self.text.pop();
-                        self.rtf.truncate(self.rtf.len() - "\\line ".len());
+                        self.rtf.truncate(self.rtf.len() - "\\sa0\\par ".len());
                     }
                     self.pending_paragraph = true;
                 }
@@ -532,7 +532,7 @@ impl<'a> Renderer<'a> {
         if self.pending_paragraph {
             if !self.text.is_empty() {
                 if !self.after_table_row {
-                    self.rtf.push_str("\\par\n");
+                    self.rtf.push_str("\\sa100\\par\n");
                 }
                 if !self.text.ends_with('\n') {
                     self.text.push('\n');
@@ -638,7 +638,7 @@ fn rtf_character(output: &mut String, value: char) {
             output.push('\\');
             output.push(value);
         }
-        '\n' => output.push_str("\\line "),
+        '\n' => output.push_str("\\sa0\\par "),
         '\t' => output.push_str("\\tab "),
         value if value.is_ascii() => output.push(value),
         value => {
@@ -866,5 +866,23 @@ mod tests {
                 "source: {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn multiline_text_and_code_use_copyable_paragraphs_without_soft_line_controls() {
+        let source = "第一行 😀\nsecond line\n\n```rs\nlet 中文 = 1;\nprintln!(\"😀\");\n```";
+        let value = document(source);
+        assert_eq!(
+            value.text,
+            "第一行 😀\nsecond line\nlet 中文 = 1;\nprintln!(\"😀\");"
+        );
+        let (commands, _) = controls(&value.rtf);
+        assert!(commands.iter().any(|control| control == "par"));
+        assert!(!commands.iter().any(|control| control == "line"));
+        let rtf = String::from_utf8(value.rtf).unwrap();
+        assert!(rtf.contains("\\sa0\\par "));
+        assert!(rtf.contains("\\ri120\\sb0\\sa0 "));
+        assert!(rtf.contains("\\u-10179?\\u-8704?"));
+        assert_eq!(plain_text(source), value.text);
     }
 }

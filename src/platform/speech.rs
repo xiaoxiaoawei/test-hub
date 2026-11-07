@@ -370,7 +370,7 @@ impl Sapi {
         }
         let Some((_, token)) = best else {
             return Err(format!(
-                "未找到{}本机语音，请在 Windows“时间和语言 → 语音”中安装对应语音后重试。",
+                "缺少{}语音，请先在 Windows 语音设置中安装。",
                 language.label()
             ));
         };

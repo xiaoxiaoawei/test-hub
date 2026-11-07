@@ -145,7 +145,7 @@ unsafe fn question_input(parent: HWND) -> HWND {
 }
 
 pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
-    child(parent, "STATIC", "轻译  LingoLeaf", SS_LEFT, 200);
+    child(parent, "STATIC", "轻译", SS_LEFT, 200);
     icon_button(parent, "切换主题", ID_THEME, "切换白天 / 暗夜");
     child(
         parent,
@@ -154,10 +154,30 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         SS_LEFT,
         201,
     );
-    child(parent, "BUTTON", "服务", WS_TABSTOP, ID_SERVICE_TAB);
-    child(parent, "BUTTON", "偏好", WS_TABSTOP, ID_PREFERENCES_TAB);
-    child(parent, "BUTTON", "外观", WS_TABSTOP, ID_APPEARANCE_TAB);
-    child(parent, "STATIC", "翻译服务", SS_LEFT, 202);
+    child(parent, "STATIC", "设置", SS_LEFT, 292);
+    child(parent, "STATIC", "Ctrl + Alt + T", SS_LEFT, 293);
+    child(parent, "STATIC", "翻译服务", SS_LEFT, 294);
+    child(
+        parent,
+        "STATIC",
+        "连接你常用的模型，开始自然流畅地阅读。",
+        SS_LEFT,
+        295,
+    );
+    child(parent, "STATIC", "其他更改请点击保存", SS_LEFT, 296);
+    child(parent, "STATIC", "日夜模式", SS_LEFT, 297);
+    child(parent, "STATIC", "翻译语言", SS_LEFT, 298);
+    child(parent, "STATIC", "划词行为", SS_LEFT, 299);
+    child(parent, "BUTTON", "翻译服务", WS_TABSTOP, ID_SERVICE_TAB);
+    child(parent, "BUTTON", "翻译偏好", WS_TABSTOP, ID_PREFERENCES_TAB);
+    child(
+        parent,
+        "BUTTON",
+        "外观与阅读",
+        WS_TABSTOP,
+        ID_APPEARANCE_TAB,
+    );
+    child(parent, "STATIC", "服务提供商", SS_LEFT, 202);
     let provider = combo(
         parent,
         ID_PROVIDER,
@@ -272,7 +292,7 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         SS_LEFT,
         215,
     );
-    child(parent, "BUTTON", "保存", WS_TABSTOP, ID_SAVE);
+    child(parent, "BUTTON", "保存设置", WS_TABSTOP, ID_SAVE);
     SettingsUi {
         source,
         target,
@@ -309,8 +329,9 @@ unsafe fn mark_cards(parent: HWND, ids: &[u16]) {
 
 pub(super) unsafe fn layout_settings(app: &mut App) {
     let hwnd = app.settings_window;
+    refresh_window_icons(app, hwnd);
     let scale = dpi(hwnd);
-    let face = font(scale, 14, FW_NORMAL as i32);
+    let face = font(scale, 16, FW_NORMAL as i32);
     let mut rect: RECT = zeroed();
     GetClientRect(hwnd, &mut rect);
     let height = rect.bottom * 96 / scale as i32;
@@ -329,14 +350,14 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
     SetScrollInfo(hwnd, SB_VERT, &scroll, 0);
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
-    let inner = (width - 48).max(280);
-    let content = inner - 40;
-    let tab_width = (inner - 16) / 3;
-    let template_width = (inner - 16) / 2;
+    let main_width = (width - 212).max(340);
+    let content = main_width - 48;
+    let template_width = (main_width - 16) / 2;
     let language_width = (content - 60) / 2;
-    let service = SETTINGS_PAGE.get() == SettingsPage::Service;
-    let preferences = SETTINGS_PAGE.get() == SettingsPage::Preferences;
-    let appearance = SETTINGS_PAGE.get() == SettingsPage::Appearance;
+    let page = SETTINGS_PAGE.get();
+    let service = page == SettingsPage::Service;
+    let preferences = page == SettingsPage::Preferences;
+    let appearance = page == SettingsPage::Appearance;
     page_visible(
         hwnd,
         &[
@@ -358,6 +379,8 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
     page_visible(
         hwnd,
         &[
+            298,
+            299,
             274,
             ID_SOURCE_LANGUAGE,
             275,
@@ -368,8 +391,6 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_COMPATIBILITY,
             ID_PAUSE,
             218,
-            ID_UPDATE,
-            219,
         ],
         preferences,
     );
@@ -387,9 +408,43 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
         ],
         appearance,
     );
+    // Navigation, version and update actions belong to the persistent sidebar.
+    page_visible(
+        hwnd,
+        &[
+            200,
+            201,
+            292,
+            293,
+            297,
+            ID_THEME,
+            ID_SERVICE_TAB,
+            ID_PREFERENCES_TAB,
+            ID_APPEARANCE_TAB,
+            ID_UPDATE,
+            219,
+            294,
+            295,
+            296,
+            215,
+            ID_SAVE,
+        ],
+        true,
+    );
     mark_cards(
         hwnd,
         &[
+            200,
+            201,
+            292,
+            293,
+            297,
+            ID_THEME,
+            ID_SERVICE_TAB,
+            ID_PREFERENCES_TAB,
+            ID_APPEARANCE_TAB,
+            ID_UPDATE,
+            219,
             202,
             ID_PROVIDER,
             204,
@@ -402,6 +457,8 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_TEST,
             206,
             213,
+            298,
+            299,
             274,
             ID_SOURCE_LANGUAGE,
             275,
@@ -412,95 +469,137 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_COMPATIBILITY,
             ID_PAUSE,
             218,
-            ID_UPDATE,
-            219,
             ID_APPEARANCE,
             276,
         ],
     );
+    let (title, subtitle) = match page {
+        SettingsPage::Service => ("翻译服务", "连接你常用的模型，开始自然流畅地阅读。"),
+        SettingsPage::Preferences => ("翻译偏好", "选择语言与触发方式，让翻译融入你的习惯。"),
+        SettingsPage::Appearance => ("外观与阅读", "用喜欢的色彩，构建舒适清晰的阅读空间。"),
+    };
+    set_text(GetDlgItem(hwnd, 294), title);
+    set_text(GetDlgItem(hwnd, 295), subtitle);
+    set_text(
+        GetDlgItem(hwnd, 296),
+        if appearance {
+            "模板选择即保存；其他更改请保存"
+        } else {
+            "更改会在保存后立即生效"
+        },
+    );
+    let footer = (height - 172).max(292);
     let positions = [
-        (200, 24, 18, inner - 48, 34),
-        (ID_THEME, width - 60, 20, 36, 36),
-        (201, 24, 60, inner, 20),
-        (ID_SERVICE_TAB, 24, 96, tab_width, 36),
-        (ID_PREFERENCES_TAB, 24 + tab_width + 8, 96, tab_width, 36),
-        (
-            ID_APPEARANCE_TAB,
-            24 + (tab_width + 8) * 2,
-            96,
-            inner - (tab_width + 8) * 2,
-            36,
-        ),
-        (202, 44, 164, content, 18),
-        (ID_PROVIDER, 44, 186, content, 200),
-        (204, 44, 230, content, 18),
-        (211, 44, 252, content - 44, 36),
-        (ID_KEY_VISIBILITY, width - 80, 252, 36, 36),
-        (203, 44, 296, content, 18),
-        (210, 44, 318, content, 36),
-        (205, 44, 362, content - 128, 18),
-        (206, width - 120, 362, 76, 18),
-        (212, 44, 384, content - 128, 36),
-        (ID_TEST, width - 164, 384, 36, 36),
-        (213, width - 120, 384, 76, 36),
-        (274, 44, 164, language_width, 18),
-        (275, 104 + language_width, 164, language_width, 18),
-        (ID_SOURCE_LANGUAGE, 44, 188, language_width, 210),
-        (ID_SWAP_LANGUAGES, 56 + language_width, 188, 36, 36),
+        (200, 20, 26, 116, 30),
+        (201, 20, 64, 116, 38),
+        (292, 20, 108, 116, 18),
+        (ID_SERVICE_TAB, 16, 128, 124, 40),
+        (ID_PREFERENCES_TAB, 16, 176, 124, 40),
+        (ID_APPEARANCE_TAB, 16, 224, 124, 40),
+        (293, 20, footer - 34, 116, 22),
+        (ID_THEME, 16, footer, 36, 36),
+        (297, 60, footer + 7, 80, 22),
+        (ID_UPDATE, 16, footer + 52, 124, 36),
+        (219, 20, footer + 100, 116, 56),
+        (294, 184, 24, main_width, 38),
+        (295, 184, 70, main_width, 24),
+        (202, 208, 134, content, 20),
+        (ID_PROVIDER, 208, 160, content, 220),
+        (204, 208, 208, content, 20),
+        (211, 208, 234, content - 48, 40),
+        (ID_KEY_VISIBILITY, width - 88, 236, 36, 36),
+        (203, 208, 282, content, 20),
+        (210, 208, 308, content, 40),
+        (205, 208, 356, content - 148, 20),
+        (206, width - 136, 356, 84, 20),
+        (212, 208, 382, content - 148, 40),
+        (ID_TEST, width - 188, 382, 40, 40),
+        (213, width - 136, 382, 84, 40),
+        (298, 208, 132, content, 24),
+        (274, 208, 164, language_width, 20),
+        (275, 268 + language_width, 164, language_width, 20),
+        (ID_SOURCE_LANGUAGE, 208, 190, language_width, 220),
+        (ID_SWAP_LANGUAGES, 220 + language_width, 192, 36, 36),
         (
             ID_TARGET_LANGUAGE,
-            104 + language_width,
-            188,
+            268 + language_width,
+            190,
             language_width,
-            210,
+            220,
         ),
-        (ID_AUTO, 44, 252, 164, 28),
-        (ID_SELECTION_MODE, 224, 248, content - 180, 170),
-        (ID_COMPATIBILITY, 44, 302, content - 116, 28),
-        (ID_PAUSE, width - 148, 296, 104, 36),
-        (218, 72, 340, content - 28, 32),
-        (ID_UPDATE, 44, 392, 112, 36),
-        (219, 172, 392, content - 128, 42),
-        (290, 24, 152, 144, 22),
-        (291, 176, 154, inner - 152, 20),
-        (ID_PRESET_OCEAN, 24, 184, template_width, 104),
+        (299, 208, 288, content, 24),
+        (ID_AUTO, 208, 328, 176, 30),
+        (ID_SELECTION_MODE, 400, 324, content - 192, 190),
+        (ID_COMPATIBILITY, 208, 378, content - 132, 30),
+        (ID_PAUSE, width - 164, 374, 112, 36),
+        (218, 236, 424, content - 28, 32),
+        (290, 184, 112, 160, 22),
+        (291, width - 240, 114, 212, 22),
+        (ID_PRESET_OCEAN, 184, 144, template_width, 104),
         (
             ID_PRESET_AURORA,
-            40 + template_width,
-            184,
+            200 + template_width,
+            144,
             template_width,
             104,
         ),
-        (ID_PRESET_NEBULA, 24, 300, template_width, 104),
+        (ID_PRESET_NEBULA, 184, 260, template_width, 104),
         (
             ID_PRESET_AMBER,
-            40 + template_width,
-            300,
+            200 + template_width,
+            260,
             template_width,
             104,
         ),
-        (ID_APPEARANCE, 44, 426, 112, 32),
-        (276, 172, 432, content - 128, 24),
-        (215, 24, 484, inner, 36),
-        (ID_SAVE, width - 136, 540, 112, 36),
+        (ID_APPEARANCE, 208, 412, 124, 36),
+        (276, 348, 418, content - 140, 24),
+        (215, 184, 496, main_width, 40),
+        (296, 184, 566, main_width - 148, 40),
+        (ID_SAVE, width - 148, 556, 120, 40),
     ];
     for (id, x, y, w, h) in positions {
         let control_font = match id {
-            200 => font(scale, 26, FW_SEMIBOLD as i32),
-            201 | 215 | 218 | 219 | 276 | 291 => font(scale, 12, FW_NORMAL as i32),
-            202..=206 | 274 | 275 => font(scale, 12, FW_NORMAL as i32),
-            290 => font(scale, 15, FW_SEMIBOLD as i32),
+            200 => font(scale, 20, FW_SEMIBOLD as i32),
+            294 => font(scale, 26, FW_SEMIBOLD as i32),
+            298 | 299 => font(scale, 15, FW_SEMIBOLD as i32),
+            ID_SERVICE_TAB | ID_PREFERENCES_TAB | ID_APPEARANCE_TAB => {
+                font(scale, 15, FW_NORMAL as i32)
+            }
+            ID_PRESET_OCEAN | ID_PRESET_AURORA | ID_PRESET_NEBULA | ID_PRESET_AMBER => {
+                font(scale, 16, FW_SEMIBOLD as i32)
+            }
+            201
+            | 202..=206
+            | 215
+            | 218
+            | 219
+            | 274
+            | 275
+            | 276
+            | 290
+            | 291
+            | 292
+            | 293
+            | 295
+            | 296
+            | 297 => font(scale, 13, FW_NORMAL as i32),
             _ => face,
         };
-        place(
-            GetDlgItem(hwnd, id as i32),
-            x,
-            y - app.settings_scroll,
-            w,
-            h,
-            scale,
-            control_font,
+        let sidebar = matches!(
+            id,
+            200 | 201
+                | 292
+                | 293
+                | 297
+                | ID_THEME
+                | ID_SERVICE_TAB
+                | ID_PREFERENCES_TAB
+                | ID_APPEARANCE_TAB
+                | ID_UPDATE
+                | 219
         );
+        let y = if sidebar { y } else { y - app.settings_scroll };
+        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
     }
     redraw_layout(hwnd);
 }
@@ -545,6 +644,7 @@ pub(super) unsafe fn make_appearance(parent: HWND) -> AppearanceUi {
 
 pub(super) unsafe fn layout_appearance(app: &mut App) {
     let hwnd = app.appearance_window;
+    refresh_window_icons(app, hwnd);
     let scale = dpi(hwnd);
     let face = font(scale, 14, FW_NORMAL as i32);
     let mut rect: RECT = zeroed();
@@ -598,7 +698,7 @@ pub(super) unsafe fn layout_appearance(app: &mut App) {
     for (id, x, y, w, h) in positions {
         let control_font = match id {
             240 => font(scale, 22, FW_SEMIBOLD as i32),
-            241 | 235 | 242 | 245 | 246 | 243 => font(scale, 12, FW_NORMAL as i32),
+            241 | 235 | 242 | 245 | 246 | 243 => font(scale, 13, FW_NORMAL as i32),
             _ => face,
         };
         place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
@@ -611,7 +711,7 @@ pub(super) unsafe fn make_inline(parent: HWND) -> InlineUi {
     tooltip(parent, heading, "拖动标题可移动译文框");
     let translated = child(
         parent,
-        "EDIT",
+        super::super::rich_text::CLASS,
         "",
         (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_VSCROLL | WS_TABSTOP,
         251,
@@ -635,6 +735,13 @@ pub(super) unsafe fn make_inline(parent: HWND) -> InlineUi {
     );
     icon_button(parent, "展开", ID_INLINE_EXPAND, "展开翻译窗口");
     icon_button(parent, "关闭", ID_INLINE_CLOSE, "关闭翻译窗口");
+    icon_button(parent, "朗读译文", ID_SPEAK, "朗读当前译文；再次点击停止");
+    icon_button(
+        parent,
+        "检查润色",
+        ID_POLISH,
+        "调用当前模型检查译文，提供更自然的表达",
+    );
     let question = question_input(parent);
     let send = icon_button(
         parent,
@@ -656,26 +763,28 @@ pub(super) unsafe fn make_inline(parent: HWND) -> InlineUi {
 pub(super) unsafe fn layout_inline(app: &mut App) {
     let hwnd = app.inline_window;
     let scale = dpi(hwnd);
-    let face = font(scale, 14, FW_NORMAL as i32);
+    let face = font(scale, 16, FW_NORMAL as i32);
     let mut rect: RECT = zeroed();
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
     let height = rect.bottom * 96 / scale as i32;
     let positions = [
-        (250, 16, 14, width - 196, 24),
-        (ID_RETRY, width - 172, 12, 28, 28),
-        (ID_PIN, width - 140, 12, 28, 28),
-        (ID_COPY, width - 108, 12, 28, 28),
-        (ID_INLINE_EXPAND, width - 76, 12, 28, 28),
-        (ID_INLINE_CLOSE, width - 44, 12, 28, 28),
-        (251, 16, 52, width - 32, (height - 128).max(48)),
-        (254, 16, height - 68, width - 32, 18),
-        (ID_QUESTION, 16, height - 44, width - 72, 30),
-        (ID_SEND, width - 44, height - 44, 28, 30),
+        (250, 20, 16, width - 112, 24),
+        (ID_INLINE_EXPAND, width - 88, 12, 32, 32),
+        (ID_INLINE_CLOSE, width - 48, 12, 32, 32),
+        (ID_RETRY, 20, 56, 32, 32),
+        (ID_PIN, 60, 56, 32, 32),
+        (ID_COPY, 100, 56, 32, 32),
+        (ID_SPEAK, 140, 56, 32, 32),
+        (ID_POLISH, 180, 56, 32, 32),
+        (251, 20, 100, width - 40, (height - 196).max(60)),
+        (254, 20, height - 84, width - 40, 20),
+        (ID_QUESTION, 20, height - 52, width - 80, 36),
+        (ID_SEND, width - 52, height - 52, 32, 36),
     ];
     for (id, x, y, w, h) in positions {
         let control_font = if id == 254 {
-            font(scale, 12, FW_NORMAL as i32)
+            font(scale, 13, FW_NORMAL as i32)
         } else {
             face
         };
@@ -697,7 +806,7 @@ pub(super) unsafe fn make_result(parent: HWND) -> ResultUi {
     child(parent, "STATIC", "译文", SS_LEFT, 223);
     let translated = child(
         parent,
-        "EDIT",
+        super::super::rich_text::CLASS,
         "",
         (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_VSCROLL | WS_TABSTOP,
         224,
@@ -718,6 +827,13 @@ pub(super) unsafe fn make_result(parent: HWND) -> ResultUi {
         "复制译文；右键可复制选区或全部问答",
     );
     icon_button(parent, "设置", ID_SETTINGS, "打开设置");
+    icon_button(parent, "朗读译文", ID_SPEAK, "朗读当前译文；再次点击停止");
+    icon_button(
+        parent,
+        "检查润色",
+        ID_POLISH,
+        "调用当前模型检查译文，提供更自然的表达",
+    );
     let question = question_input(parent);
     let send = icon_button(
         parent,
@@ -739,31 +855,34 @@ pub(super) unsafe fn make_result(parent: HWND) -> ResultUi {
 
 pub(super) unsafe fn layout_result(app: &mut App) {
     let hwnd = app.result_window;
+    refresh_window_icons(app, hwnd);
     let scale = dpi(hwnd);
-    let face = font(scale, 14, FW_NORMAL as i32);
+    let face = font(scale, 16, FW_NORMAL as i32);
     let mut rect: RECT = zeroed();
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
     let height = rect.bottom * 96 / scale as i32;
     let inner = width - 48;
     let positions = [
-        (220, 24, 20, inner - 168, 28),
-        (ID_RETRY, width - 164, 17, 32, 32),
-        (ID_PIN, width - 128, 17, 32, 32),
-        (ID_COPY, width - 92, 17, 32, 32),
-        (ID_SETTINGS, width - 56, 17, 32, 32),
-        (221, 24, 66, inner, 18),
-        (222, 24, 90, inner, 64),
-        (223, 24, 170, inner, 18),
-        (224, 24, 194, inner, (height - 286).max(48)),
-        (225, 24, height - 80, inner, 18),
-        (ID_QUESTION, 24, height - 48, inner - 44, 32),
-        (ID_SEND, width - 56, height - 48, 32, 32),
+        (220, 24, 20, inner - 48, 28),
+        (ID_SETTINGS, width - 56, 18, 32, 32),
+        (ID_RETRY, 24, 64, 32, 32),
+        (ID_PIN, 64, 64, 32, 32),
+        (ID_COPY, 104, 64, 32, 32),
+        (ID_SPEAK, 144, 64, 32, 32),
+        (ID_POLISH, 184, 64, 32, 32),
+        (221, 24, 112, inner, 20),
+        (222, 24, 138, inner, 80),
+        (223, 24, 236, inner, 20),
+        (224, 24, 262, inner, (height - 354).max(64)),
+        (225, 24, height - 78, inner, 20),
+        (ID_QUESTION, 24, height - 48, inner - 44, 36),
+        (ID_SEND, width - 56, height - 48, 32, 36),
     ];
     for (id, x, y, w, h) in positions {
         let control_font = match id {
             220 => font(scale, 18, FW_SEMIBOLD as i32),
-            221 | 223 | 225 => font(scale, 12, FW_NORMAL as i32),
+            221 | 223 | 225 => font(scale, 13, FW_NORMAL as i32),
             _ => face,
         };
         place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);

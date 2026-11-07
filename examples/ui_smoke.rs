@@ -645,7 +645,17 @@ mod windows {
 
     fn show_service(settings: HWND) -> Result<(), String> {
         click(settings, SERVICE_TAB)?;
-        for id in [PROVIDER, KEY, KEY_VISIBILITY, 210, 212, 213, 106] {
+        for id in [
+            PROVIDER,
+            KEY,
+            KEY_VISIBILITY,
+            210,
+            212,
+            213,
+            106,
+            UPDATE,
+            UPDATE_STATUS,
+        ] {
             require_visible(settings, id)?;
         }
         for id in [
@@ -656,8 +666,6 @@ mod windows {
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
             APPEARANCE,
-            UPDATE,
-            UPDATE_STATUS,
             281,
             282,
             283,
@@ -703,7 +711,7 @@ mod windows {
 
     fn show_appearance_page(settings: HWND) -> Result<(), String> {
         click(settings, APPEARANCE_TAB)?;
-        for id in [APPEARANCE, 281, 282, 283, 284] {
+        for id in [APPEARANCE, 281, 282, 283, 284, UPDATE, UPDATE_STATUS] {
             require_visible(settings, id)?;
         }
         for id in [
@@ -720,8 +728,6 @@ mod windows {
             PAUSE_SELECTION,
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
-            UPDATE,
-            UPDATE_STATUS,
         ] {
             require_hidden(settings, id)?;
         }
@@ -733,7 +739,12 @@ mod windows {
         if dc.is_null() {
             return Err("Cannot sample settings palette.".into());
         }
-        let color = unsafe { GetPixel(dc, 8, 8) };
+        let mut client: RECT = unsafe { zeroed() };
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(settings, &mut client)
+        };
+        // The rail now has a raised surface; sample the clear main-page gutter.
+        let color = unsafe { GetPixel(dc, client.right / 2, 8) };
         unsafe { ReleaseDC(settings, dc) };
         if color == u32::MAX {
             return Err("The settings background pixel is unavailable.".into());

@@ -62,7 +62,7 @@ mod windows {
     const EM_SETSEL: u32 = 0xB1;
     const EM_POSFROMCHAR: u32 = 0xD6;
     const SELECTION: u32 = WM_APP + 3;
-    const SOURCE_TEXT: &str = "warm light.\r\nwarm light. calm. scroll wait retry manual.";
+    const SOURCE_TEXT: &str = "warm light.\r\nwarm light. calm. scroll wait retry manual. markdown";
     const QUESTION: i32 = 260;
     const ASK: i32 = 261;
     const ACTION: i32 = 262;
@@ -73,6 +73,9 @@ mod windows {
 
     mod question_actions {
         include!("support/selection_questions_070.rs");
+    }
+    mod markdown_actions {
+        include!("support/selection_markdown_090.rs");
     }
     const QUESTION_ONE: &str = "What does this word mean?";
     const QUESTION_TWO: &str = "Give a short example.";
@@ -219,6 +222,7 @@ mod windows {
         check_questions(&source, &app, background, inline, &mock)?;
         question_actions::check(inline, &mock)?;
         check_controls(&source, &app, background, inline, &mock)?;
+        markdown_actions::check(&source, &app, background, inline, &mock)?;
         let expected = all_requests();
 
         // Both an empty selection and a password selection must remain local.
@@ -236,6 +240,18 @@ mod windows {
         Ok(())
     }
 
+    // New reading layout: the user's literal question follows its label; the
+    // assistant label and answer are separate paragraphs so Markdown headings
+    // and code fences can begin at a real block boundary. Visual paragraph
+    // spacing is native RTF, rather than redundant empty text lines.
+    fn displayed_conversation(base: &str, turns: &[(&str, &str)]) -> String {
+        let mut output = base.to_owned();
+        for (question, answer) in turns {
+            output.push_str(&format!("\n你： {question}\n轻译：\n{answer}"));
+        }
+        output
+    }
+
     fn check_questions(
         source: &Source,
         app: &Application,
@@ -244,14 +260,17 @@ mod windows {
         mock: &Mock,
     ) -> Result<(), String> {
         ask(inline, QUESTION_ONE)?;
-        let first = format!("新译文\n\n你：{QUESTION_ONE}\n轻译：{ANSWER_ONE}");
+        let first = displayed_conversation("新译文", &[(QUESTION_ONE, ANSWER_ONE)]);
         wait_for("the first complete answer", || {
             Ok(text(inline, 251)? == first && text(inline, 254)?.contains("回答完成"))
         })
         .map_err(|error| question_failure(error, mock, inline))?;
 
         ask(inline, QUESTION_TWO)?;
-        let second = format!("{first}\n\n你：{QUESTION_TWO}\n轻译：{ANSWER_TWO}");
+        let second = displayed_conversation(
+            "新译文",
+            &[(QUESTION_ONE, ANSWER_ONE), (QUESTION_TWO, ANSWER_TWO)],
+        );
         wait_for("the answer with preceding conversation history", || {
             Ok(text(inline, 251)? == second && text(inline, 254)?.contains("回答完成"))
         })
@@ -259,7 +278,7 @@ mod windows {
 
         ask(inline, QUESTION_OLD)?;
         wait_for("a partial old answer before stream completion", || {
-            Ok(text(inline, 251)?.ends_with("轻译：过期"))
+            Ok(text(inline, 251)?.ends_with("轻译：\n过期"))
         })
         .map_err(|error| question_failure(error, mock, inline))?;
         if mock.finish_answer.load(Ordering::Acquire) {
@@ -288,7 +307,7 @@ mod windows {
         }
         let restarted = Instant::now();
         ask(inline, QUESTION_NEW)?;
-        let fresh = format!("静译文\n\n你：{QUESTION_NEW}\n轻译：{ANSWER_NEW}");
+        let fresh = displayed_conversation("静译文", &[(QUESTION_NEW, ANSWER_NEW)]);
         wait_for(
             "a fresh answer containing no previous selection history",
             || {
@@ -342,6 +361,7 @@ mod windows {
             .iter()
             .chain(question_actions::REQUESTS.iter())
             .chain(CONTROL_REQUESTS.iter())
+            .chain(markdown_actions::REQUESTS.iter())
             .copied()
             .collect()
     }
@@ -514,8 +534,8 @@ mod windows {
         })?;
         let popup = owned_menu(app.child.id()).ok_or("The native context menu disappeared.")?;
         if let Some(count) = native_menu_count(popup) {
-            if count != 3 {
-                return Err(format!("The editor opened the default {count}-item menu instead of three translation actions."));
+            if count != 4 {
+                return Err(format!("The editor opened the default {count}-item menu instead of four translation actions."));
             }
         } else {
             println!("Native menu count API is unavailable in this runtime; the actual second action and unchanged selection are checked below.");
@@ -1247,6 +1267,9 @@ mod windows {
         if body["model"] != "selection-smoke-model" || body["stream"] != true {
             return Err("Unexpected local selection request.".into());
         }
+        if markdown_actions::try_serve(&body, &mut stream, requests, light, control, stop)? {
+            return Ok(());
+        }
         if question_actions::try_serve(&body, &mut stream, requests, control, stop)? {
             return Ok(());
         }
@@ -1499,7 +1522,9 @@ mod windows {
         }
         // Native multiline EDIT controls expose CRLF; compare the same logical
         // text used by the conversation fixture and network request payloads.
-        Ok(String::from_utf16_lossy(&buffer[..count]).replace("\r\n", "\n"))
+        Ok(String::from_utf16_lossy(&buffer[..count])
+            .replace("\r\n", "\n")
+            .replace('\r', "\n"))
     }
     fn send(window: HWND, message: u32, wparam: usize, lparam: isize) -> Result<usize, String> {
         let mut result = 0;

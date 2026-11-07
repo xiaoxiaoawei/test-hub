@@ -1,7 +1,7 @@
 //! Native Windows message loop. UIA and HTTP never run on this thread.
 use super::{
-    clipboard_copy, icons, mouse, picker, popup, selection, selection_events, surfaces, symbols,
-    theme, update_install,
+    clipboard_copy, icons, mouse, picker, popup, rich_text, selection, selection_events, speech,
+    surfaces, symbols, theme, update_install,
 };
 use crate::{cache::TranslationCache, config, mailbox, translation, update};
 use std::{
@@ -100,15 +100,18 @@ const ID_PRESET_OCEAN: u16 = 281;
 const ID_PRESET_AURORA: u16 = 282;
 const ID_PRESET_NEBULA: u16 = 283;
 const ID_PRESET_AMBER: u16 = 284;
+const ID_SPEAK: u16 = 285;
+const ID_POLISH: u16 = 286;
+const ID_COPY_MARKDOWN: u16 = 287;
 const APPEARANCE_WIDTH: i32 = 440;
 const APPEARANCE_HEIGHT: i32 = 380;
-const INLINE_WIDTH: i32 = 400;
-const INLINE_HEIGHT: i32 = 286;
-const SETTINGS_WIDTH: i32 = 520;
-const SETTINGS_HEIGHT: i32 = 636;
-const SETTINGS_CONTENT_HEIGHT: i32 = 588;
-const RESULT_WIDTH: i32 = 500;
-const RESULT_HEIGHT: i32 = 500;
+const INLINE_WIDTH: i32 = 460;
+const INLINE_HEIGHT: i32 = 356;
+const SETTINGS_WIDTH: i32 = 760;
+const SETTINGS_HEIGHT: i32 = 680;
+const SETTINGS_CONTENT_HEIGHT: i32 = 636;
+const RESULT_WIDTH: i32 = 600;
+const RESULT_HEIGHT: i32 = 620;
 
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsPage {
@@ -119,6 +122,7 @@ enum SettingsPage {
 
 thread_local! {
     static TRANSLATION_STREAMING: Cell<bool> = const { Cell::new(false) };
+    static SPEECH_BUSY: Cell<bool> = const { Cell::new(false) };
     static CONVERSATION_BUSY: Cell<bool> = const { Cell::new(false) };
     static WINDOW_PINNED: Cell<bool> = const { Cell::new(false) };
     static KEY_VISIBLE: Cell<bool> = const { Cell::new(false) };
@@ -171,6 +175,7 @@ struct TranslationJob {
 }
 enum Event {
     Conversation(conversation_ui::Event),
+    Speech(speech::Event),
     Warmed,
     Captured {
         job: CaptureJob,
@@ -249,6 +254,8 @@ struct InlineUi {
     copy: HWND,
 }
 
+type WindowIconKey = (u32, config::IconStyle, u32, config::IconShape, u32);
+
 struct App {
     main: HWND,
     settings_window: HWND,
@@ -263,6 +270,7 @@ struct App {
     appearance_ui: AppearanceUi,
     icons: icons::IconSet,
     preview_icons: Option<icons::IconSet>,
+    window_icons: HashMap<isize, (WindowIconKey, icons::IconSet)>,
     settings_ui: SettingsUi,
     result_ui: ResultUi,
     settings: config::Settings,
@@ -298,6 +306,9 @@ struct App {
     chip_text: String,
     chip_foreground: isize,
     conversation: conversation_ui::State,
+    speech: speech::Speech,
+    speech_token: u64,
+    speaking: bool,
     translation_ready: bool,
     translated: String,
     rendered_text: String,
@@ -352,6 +363,7 @@ unsafe fn run_inner() -> Result<(), String> {
     };
     CURRENT_THEME.set(settings.theme_mode);
     CURRENT_PRESET.set(settings.theme_preset);
+    rich_text::load()?;
     let instance = GetModuleHandleW(null());
     // Win32 integer resource ID, not an address that will be dereferenced.
     let mut icon = LoadIconW(instance, std::ptr::without_provenance(1));
@@ -624,6 +636,14 @@ unsafe fn run_inner() -> Result<(), String> {
     let accessibility = selection_events::install(main as isize, WM_ACCESSIBILITY);
     let hook_error = hook.as_ref().err().cloned();
     let conversation = conversation_ui::State::new(main, ui_events.clone())?;
+    let speech_sender = ui_events.clone();
+    let speech_window = main as isize;
+    let speech = speech::Speech::new(move |event| {
+        let _ = speech_sender.send(Event::Speech(event));
+        unsafe {
+            PostMessageW(speech_window as HWND, WM_WORK, 0, 0);
+        }
+    })?;
     let app = App {
         main,
         settings_window,
@@ -638,6 +658,7 @@ unsafe fn run_inner() -> Result<(), String> {
         appearance_ui,
         icons: runtime_icons,
         preview_icons: None,
+        window_icons: HashMap::new(),
         settings_ui,
         result_ui,
         settings,
@@ -673,6 +694,9 @@ unsafe fn run_inner() -> Result<(), String> {
         chip_text: String::new(),
         chip_foreground: 0,
         conversation,
+        speech,
+        speech_token: 0,
+        speaking: false,
         translation_ready: false,
         translated: String::new(),
         rendered_text: String::new(),
@@ -698,6 +722,14 @@ unsafe fn run_inner() -> Result<(), String> {
         layout_appearance(app);
         layout_inline(app);
         layout_chip(app);
+        for window in [
+            app.main,
+            app.settings_window,
+            app.result_window,
+            app.appearance_window,
+        ] {
+            refresh_window_icons(app, window);
+        }
         fill_settings(app);
         refresh_translation_actions(app);
         let mut problems = Vec::new();
@@ -864,7 +896,7 @@ unsafe fn paint_message(
                 SetBkMode(dc, OPAQUE as i32);
                 SetTextColor(
                     dc,
-                    if surface || matches!(id, 200 | 220 | 250 | 290) {
+                    if surface || matches!(id, 200 | 220 | 250 | 290 | 294 | 298 | 299) {
                         palette.text_color
                     } else {
                         palette.muted_color
@@ -882,7 +914,7 @@ unsafe fn paint_message(
         WM_MEASUREITEM if lparam != 0 => {
             let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
             if item.CtlType == ODT_COMBOBOX {
-                item.itemHeight = scaled(30, dpi(hwnd)) as u32;
+                item.itemHeight = scaled(32, dpi(hwnd)) as u32;
                 Some(1)
             } else {
                 None
@@ -899,6 +931,17 @@ unsafe fn paint_message(
                     palette.draw_combo(item, face);
                 } else if let Some(preset) = preset_for_control(item.CtlID as u16) {
                     palette.draw_preset(item, face, preset, preset == CURRENT_PRESET.get());
+                } else if matches!(
+                    item.CtlID as u16,
+                    ID_SERVICE_TAB | ID_PREFERENCES_TAB | ID_APPEARANCE_TAB
+                ) {
+                    let selected = matches!(
+                        (item.CtlID as u16, SETTINGS_PAGE.get()),
+                        (ID_SERVICE_TAB, SettingsPage::Service)
+                            | (ID_PREFERENCES_TAB, SettingsPage::Preferences)
+                            | (ID_APPEARANCE_TAB, SettingsPage::Appearance)
+                    );
+                    palette.draw_navigation(item, face, selected);
                 } else if item.CtlID == ID_AUTO as u32 {
                     palette.draw_checkbox(item, face, AUTO_CHECKED.get());
                 } else if item.CtlID == ID_COMPATIBILITY as u32 {
@@ -952,32 +995,44 @@ fn preset_for_control(id: u16) -> Option<config::ThemePreset> {
 
 unsafe fn paint_panels(hwnd: HWND, dc: HDC, palette: &theme::Theme, client: &RECT) {
     let scale = dpi(hwnd);
-    let logical_width = client.right * 96 / scale as i32;
-    let (left, top, right, bottom, scroll) = if hwnd as isize == SETTINGS_WINDOW.get() {
+    let width = client.right * 96 / scale as i32;
+    let (panels, scroll) = if hwnd as isize == SETTINGS_WINDOW.get() {
+        let sidebar = RECT {
+            left: 0,
+            top: 0,
+            right: scaled(156, scale),
+            bottom: client.bottom,
+        };
+        FillRect(dc, &sidebar, palette.card);
         let mut info: SCROLLINFO = zeroed();
         info.cbSize = size_of::<SCROLLINFO>() as u32;
         info.fMask = SIF_POS;
         GetScrollInfo(hwnd, SB_VERT, &mut info);
-        if SETTINGS_PAGE.get() == SettingsPage::Appearance {
-            (24, 416, logical_width - 24, 468, info.nPos)
-        } else {
-            (24, 148, logical_width - 24, 448, info.nPos)
-        }
+        let panels = match SETTINGS_PAGE.get() {
+            SettingsPage::Service => vec![(184, 112, width - 28, 452)],
+            SettingsPage::Preferences => {
+                vec![(184, 112, width - 28, 252), (184, 268, width - 28, 468)]
+            }
+            SettingsPage::Appearance => vec![(184, 392, width - 28, 468)],
+        };
+        (panels, info.nPos)
     } else if hwnd as isize == APPEARANCE_WINDOW.get() {
-        (20, 84, logical_width - 20, 244, 0)
+        (vec![(20, 84, width - 20, 244)], 0)
     } else {
         return;
     };
-    palette.draw_card(
-        dc,
-        RECT {
-            left: scaled(left, scale),
-            top: scaled(top - scroll, scale),
-            right: scaled(right, scale),
-            bottom: scaled(bottom - scroll, scale),
-        },
-        scaled(16, scale),
-    );
+    for (left, top, right, bottom) in panels {
+        palette.draw_card(
+            dc,
+            RECT {
+                left: scaled(left, scale),
+                top: scaled(top - scroll, scale),
+                right: scaled(right, scale),
+                bottom: scaled(bottom - scroll, scale),
+            },
+            scaled(12, scale),
+        );
+    }
 }
 
 fn button_symbol(id: u32) -> Option<symbols::Symbol> {
@@ -990,6 +1045,14 @@ fn button_symbol(id: u32) -> Option<symbols::Symbol> {
                 Symbol::Moon
             }
         }
+        ID_SPEAK => {
+            if SPEECH_BUSY.get() {
+                Symbol::SpeakStop
+            } else {
+                Symbol::Speak
+            }
+        }
+        ID_POLISH => Symbol::Polish,
         ID_COPY => Symbol::Copy,
         ID_TEST => Symbol::Connection,
         ID_SEND => {
@@ -1048,16 +1111,14 @@ unsafe fn update_language_labels(app: &App) {
         app.settings.source_language.label(),
         app.settings.target_language.label()
     );
+    set_text(GetDlgItem(app.settings_window, 201), &pair);
     set_text(
-        GetDlgItem(app.settings_window, 201),
-        &format!(
-            "{pair}  ·  {}",
-            if app.selection_paused {
-                "已暂停划词"
-            } else {
-                "Ctrl + Alt + T"
-            }
-        ),
+        GetDlgItem(app.settings_window, 293),
+        if app.selection_paused {
+            "已暂停划词"
+        } else {
+            "Ctrl + Alt + T"
+        },
     );
     set_text(GetDlgItem(app.inline_window, 250), &pair);
     set_text(GetDlgItem(app.result_window, 220), &pair);
@@ -1215,6 +1276,7 @@ unsafe fn mask_api_key(app: &App) {
 }
 
 unsafe fn refresh_translation_actions(app: &App) {
+    refresh_speech_actions(app);
     let changed = TRANSLATION_STREAMING.replace(app.streaming) != app.streaming;
     let pin_changed = WINDOW_PINNED.replace(app.window_pinned) != app.window_pinned;
     for button in [app.inline_ui.action, app.result_ui.action] {
@@ -1246,6 +1308,79 @@ unsafe fn refresh_translation_actions(app: &App) {
             );
             InvalidateRect(button, null(), 0);
         }
+    }
+}
+
+unsafe fn refresh_speech_actions(app: &App) {
+    let changed = SPEECH_BUSY.replace(app.speaking) != app.speaking;
+    let ready = app.translation_ready
+        && !app.display_pending
+        && !app.streaming
+        && !app.translated.trim().is_empty();
+    for window in [app.inline_window, app.result_window] {
+        let button = GetDlgItem(window, ID_SPEAK as i32);
+        EnableWindow(button, (ready || app.speaking) as i32);
+        if changed || text(button).is_empty() {
+            set_text(
+                button,
+                if app.speaking {
+                    "停止朗读"
+                } else {
+                    "朗读译文"
+                },
+            );
+            InvalidateRect(button, null(), 0);
+        }
+    }
+}
+
+unsafe fn stop_speech(app: &mut App) {
+    if app.speaking {
+        app.speech_token = app.speech.stop();
+        app.speaking = false;
+        refresh_speech_actions(app);
+    }
+}
+
+unsafe fn toggle_speech(app: &mut App) {
+    if app.speaking {
+        stop_speech(app);
+        translation_status(app, "已停止朗读");
+    } else if app.translation_ready && !app.display_pending && !app.streaming {
+        let spoken = crate::markdown::plain_text(&app.translated);
+        if !spoken.trim().is_empty() {
+            app.speech_token = app.speech.start(spoken, app.settings.target_language);
+            app.speaking = true;
+            refresh_speech_actions(app);
+        }
+    }
+}
+
+unsafe fn handle_speech(app: &mut App, event: speech::Event) {
+    if event.token != app.speech_token {
+        return;
+    }
+    let status = match event.result {
+        Ok(speech::Outcome::Started) => {
+            app.speaking = true;
+            "正在朗读译文".to_owned()
+        }
+        Ok(speech::Outcome::Finished) => {
+            app.speaking = false;
+            "朗读完成".to_owned()
+        }
+        Ok(speech::Outcome::Stopped) => {
+            app.speaking = false;
+            "已停止朗读".to_owned()
+        }
+        Err(error) => {
+            app.speaking = false;
+            error
+        }
+    };
+    refresh_speech_actions(app);
+    if !app.streaming && !conversation_ui::is_busy(&app.conversation) {
+        translation_status(app, &status);
     }
 }
 
@@ -1318,6 +1453,12 @@ unsafe fn copy_menu(app: &mut App, target: HWND, position: LPARAM) {
         ID_COPY_CONVERSATION as usize,
         wide("复制译文与问答").as_ptr(),
     );
+    AppendMenuW(
+        menu,
+        flags,
+        ID_COPY_MARKDOWN as usize,
+        wide("复制 Markdown 原文").as_ptr(),
+    );
     let point = if position == -1 {
         cursor()
     } else {
@@ -1349,48 +1490,14 @@ unsafe fn copy_menu(app: &mut App, target: HWND, position: LPARAM) {
 /// Preserve selection and reading position while a stream grows. Only follow
 /// new content when the user was already at the bottom without a text selection.
 unsafe fn render_editor(editor: HWND, previous: &str, current: &str, fresh: bool) {
-    let mut start = 0u32;
-    let mut end = 0u32;
-    SendMessageW(
+    rich_text::render(
         editor,
-        EM_GETSEL,
-        &mut start as *mut u32 as usize,
-        &mut end as *mut u32 as isize,
+        previous,
+        current,
+        fresh,
+        CURRENT_THEME.get(),
+        CURRENT_PRESET.get(),
     );
-    let first_line = SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0);
-    let mut scroll: SCROLLINFO = zeroed();
-    scroll.cbSize = size_of::<SCROLLINFO>() as u32;
-    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    let at_bottom = GetScrollInfo(editor, SB_VERT, &mut scroll) == 0
-        || scroll.nPos as i64 + scroll.nPage as i64 >= scroll.nMax as i64;
-    let follow = fresh || (start == end && at_bottom);
-    let redraw = !follow && IsWindowVisible(editor) != 0;
-    if redraw {
-        SendMessageW(editor, WM_SETREDRAW, 0, 0);
-    }
-    if !previous.is_empty() && current.starts_with(previous) {
-        SendMessageW(editor, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
-        SendMessageW(
-            editor,
-            EM_REPLACESEL,
-            0,
-            wide(&current[previous.len()..]).as_ptr() as isize,
-        );
-    } else {
-        SetWindowTextW(editor, wide(current).as_ptr());
-    }
-    if follow {
-        SendMessageW(editor, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
-        SendMessageW(editor, EM_SCROLLCARET, 0, 0);
-    } else {
-        SendMessageW(editor, EM_SETSEL, start as usize, end as isize);
-        let now = SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0);
-        SendMessageW(editor, EM_LINESCROLL, 0, first_line - now);
-    }
-    if redraw {
-        SendMessageW(editor, WM_SETREDRAW, 1, 0);
-        InvalidateRect(editor, null(), 0);
-    }
 }
 
 fn provider_index(base_url: &str) -> usize {
@@ -1589,6 +1696,7 @@ unsafe extern "system" fn window_proc(
                     && foreground as isize != app.chip_foreground
                     && GetAncestor(foreground, GA_ROOT) != app.inline_window
                 {
+                    stop_speech(app);
                     ShowWindow(app.inline_window, SW_HIDE);
                 }
                 if IsWindowVisible(app.chip) == 0 && IsWindowVisible(app.inline_window) == 0 {
@@ -1692,7 +1800,7 @@ unsafe extern "system" fn window_proc(
                 let dpi = dpi(hwnd);
                 info.ptMinTrackSize = POINT {
                     x: scaled(400, dpi),
-                    y: scaled(400, dpi),
+                    y: scaled(480, dpi),
                 };
                 handled = true;
             }
@@ -1700,6 +1808,7 @@ unsafe extern "system" fn window_proc(
                 handled = true;
             }
             WM_DPICHANGED => {
+                refresh_window_icons(app, hwnd);
                 let rect = &*(lparam as *const RECT);
                 SetWindowPos(
                     hwnd,
@@ -1715,7 +1824,7 @@ unsafe extern "system" fn window_proc(
                 } else if hwnd == app.settings_window {
                     layout_settings(app);
                 } else if hwnd == app.appearance_window {
-                    layout_appearance(app);
+                    refresh_icon_preview(app);
                 } else if hwnd == app.inline_window {
                     layout_inline(app);
                 } else {
@@ -1824,8 +1933,17 @@ unsafe fn command(app: &mut App, id: u16) {
             let visible = !KEY_VISIBLE.get();
             set_api_key_visibility(app, visible);
         }
-        ID_COPY_CONVERSATION => {
+        ID_SPEAK => toggle_speech(app),
+        ID_POLISH => conversation_ui::polish(app),
+        ID_COPY_MARKDOWN => {
             let value = conversation_ui::display_text(app);
+            match write_clipboard(app.result_window, &value) {
+                Ok(()) => translation_status(app, "Markdown 原文已复制"),
+                Err(error) => translation_status(app, &error),
+            }
+        }
+        ID_COPY_CONVERSATION => {
+            let value = crate::markdown::plain_text(&conversation_ui::display_text(app));
             match write_clipboard(app.result_window, &value) {
                 Ok(()) => translation_status(app, "译文与问答已复制"),
                 Err(error) => translation_status(app, &error),
@@ -1883,7 +2001,10 @@ unsafe fn command(app: &mut App, id: u16) {
         ID_CANCEL => {
             ShowWindow(app.settings_window, SW_HIDE);
         }
-        ID_COPY => match write_clipboard(app.result_window, &app.translated) {
+        ID_COPY => match write_clipboard(
+            app.result_window,
+            &crate::markdown::plain_text(&app.translated),
+        ) {
             Ok(()) => translation_status(app, "译文已复制"),
             Err(error) => translation_status(app, &error),
         },
@@ -2303,6 +2424,7 @@ unsafe fn drain_events(app: &mut App) {
     while let Ok(event) = app.events.try_recv() {
         match event {
             Event::Conversation(event) => conversation_ui::handle_event(app, event),
+            Event::Speech(event) => handle_speech(app, event),
             Event::Warmed => {
                 app.warm_busy = false;
                 warm_foreground(app, GetForegroundWindow() as isize);
@@ -2746,13 +2868,38 @@ unsafe extern "system" fn retheme_child(window: HWND, _data: LPARAM) -> BOOL {
     let mut class = [0u16; 64];
     let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
     let class = String::from_utf16_lossy(&class[..length.max(0) as usize]);
-    if class.eq_ignore_ascii_case("EDIT") {
+    if class.eq_ignore_ascii_case(rich_text::CLASS) {
+        theme::style_edit(window, CURRENT_THEME.get());
+        rich_text::restyle(window, CURRENT_THEME.get(), CURRENT_PRESET.get());
+        surfaces::layout_control(window);
+    } else if class.eq_ignore_ascii_case("EDIT") {
         theme::style_edit(window, CURRENT_THEME.get());
         surfaces::layout_control(window);
     } else if class.eq_ignore_ascii_case("COMBOBOX") {
         surfaces::install_combo(window);
     }
     1
+}
+
+unsafe fn refresh_window_icons(app: &mut App, window: HWND) {
+    let key = (
+        dpi(window),
+        app.settings.icon_style,
+        app.settings.icon_color,
+        app.settings.icon_shape,
+        app.settings.icon_size,
+    );
+    if app
+        .window_icons
+        .get(&(window as isize))
+        .is_some_and(|(old, _)| *old == key)
+    {
+        return;
+    }
+    if let Ok(next) = icons::IconSet::new(key.1, key.2, key.3, key.4, key.0) {
+        set_window_icons(window, &next);
+        app.window_icons.insert(window as isize, (key, next));
+    }
 }
 
 unsafe fn set_window_icons(hwnd: HWND, icon: &icons::IconSet) {
@@ -2819,7 +2966,6 @@ unsafe fn show_appearance(app: &mut App) {
         0,
     );
     DRAFT_ICON_COLOR.set(app.settings.icon_color);
-    refresh_icon_preview(app);
     if IsWindowVisible(app.settings_window) == 0 {
         show_settings(app);
     }
@@ -2830,7 +2976,7 @@ unsafe fn show_appearance(app: &mut App) {
         APPEARANCE_WIDTH,
         APPEARANCE_HEIGHT,
     );
-    layout_appearance(app);
+    refresh_icon_preview(app);
     ShowWindow(app.appearance_window, SW_SHOW);
     SetForegroundWindow(app.appearance_window);
 }
@@ -2898,13 +3044,14 @@ unsafe fn apply_appearance(app: &mut App) {
         set_text(app.appearance_ui.status, &error);
         return;
     }
+    app.settings = settings;
     for window in [
         app.main,
         app.settings_window,
         app.result_window,
         app.appearance_window,
     ] {
-        set_window_icons(window, &next);
+        refresh_window_icons(app, window);
     }
     app.tray.hIcon = next.small();
     let notified = Shell_NotifyIconW(NIM_MODIFY, &app.tray) != 0;
@@ -2912,7 +3059,6 @@ unsafe fn apply_appearance(app: &mut App) {
     ShowWindow(app.chip, SW_HIDE);
     // All native users have been updated before the previous owned HICON drops.
     app.icons = next;
-    app.settings = settings;
     update_appearance_summary(app);
     InvalidateRect(app.chip, null(), 0);
     set_text(
@@ -3112,6 +3258,7 @@ unsafe extern "system" fn translation_edit_proc(
         return SendMessageW(GetParent(window), message, window as usize, lparam);
     }
     if message == WM_NCDESTROY {
+        rich_text::cleanup(window);
         RemoveWindowSubclass(window, Some(translation_edit_proc), subclass_id);
     }
     DefSubclassProc(window, message, wparam, lparam)
@@ -3137,7 +3284,7 @@ unsafe fn child(parent: HWND, class: &str, label: &str, style: u32, id: u16) -> 
         GetModuleHandleW(null()),
         null(),
     );
-    if class == "EDIT" {
+    if class == "EDIT" || class == rich_text::CLASS {
         if matches!(id, 224 | 251) {
             SetWindowSubclass(hwnd, Some(translation_edit_proc), 1, 0);
         }
@@ -3150,6 +3297,9 @@ unsafe fn child(parent: HWND, class: &str, label: &str, style: u32, id: u16) -> 
         );
         theme::style_edit(hwnd, CURRENT_THEME.get());
         surfaces::install_edit(hwnd);
+        if class == rich_text::CLASS {
+            rich_text::install(hwnd, CURRENT_THEME.get(), CURRENT_PRESET.get());
+        }
     } else if class == "COMBOBOX" {
         surfaces::install_combo(hwnd);
     }

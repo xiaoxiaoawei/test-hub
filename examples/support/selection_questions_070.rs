@@ -27,7 +27,6 @@ pub(super) fn check(inline: HWND, mock: &Mock) -> Result<(), String> {
     if input.is_null() || button.is_null() {
         return Err("The question recovery composer was not created.".into());
     }
-    let previous = format!("静译文\n\n你：{QUESTION_NEW}\n轻译：{ANSWER_NEW}");
     ask(inline, QUESTION_FAIL)?;
     wait_for("a failed answer preserving the submitted question", || {
         Ok(text(inline, 254)?.contains("提问失败")
@@ -37,7 +36,10 @@ pub(super) fn check(inline: HWND, mock: &Mock) -> Result<(), String> {
     })
     .map_err(|error| question_failure(error, mock, inline))?;
     ask(inline, QUESTION_FAIL)?;
-    let retried = format!("{previous}\n\n你：{QUESTION_FAIL}\n轻译：{ANSWER_RETRY}");
+    let retried = displayed_conversation(
+        "静译文",
+        &[(QUESTION_NEW, ANSWER_NEW), (QUESTION_FAIL, ANSWER_RETRY)],
+    );
     wait_for(
         "a successful retry without a failed history exchange",
         || Ok(text(inline, 251)? == retried && text(inline, 254)?.contains("回答完成")),
@@ -76,7 +78,14 @@ pub(super) fn check(inline: HWND, mock: &Mock) -> Result<(), String> {
     // Keep the old server blocked. A new question must finish before that gate
     // is released, proving cancellation does not merely hide an old request.
     ask(inline, QUESTION_AFTER_STOP)?;
-    let continued = format!("{retried}\n\n你：{QUESTION_AFTER_STOP}\n轻译：{ANSWER_AFTER_STOP}");
+    let continued = displayed_conversation(
+        "静译文",
+        &[
+            (QUESTION_NEW, ANSWER_NEW),
+            (QUESTION_FAIL, ANSWER_RETRY),
+            (QUESTION_AFTER_STOP, ANSWER_AFTER_STOP),
+        ],
+    );
     wait_for(
         "a fresh answer while the canceled response remains blocked",
         || {

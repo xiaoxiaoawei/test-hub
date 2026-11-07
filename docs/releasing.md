@@ -7,7 +7,7 @@
 ## 准备版本
 
 1. 在 `lingoleaf` 完成修改，同步 `Cargo.toml`、锁文件和 `assets/lingoleaf.rc`。资源数字字段为 `X,Y,Z,0`，`FileVersion` 为 `X.Y.Z.0`，`ProductVersion` 为 `X.Y.Z`。
-2. 更新 README、更新记录和 `docs/build-validation.md`，区分逻辑测试、Wine、原生 Windows CI、真实 Windows 桌面与公开更新源。未执行项目保持未执行。
+2. 更新 README、更新记录和 `docs/build-validation.md`，区分逻辑测试、Wine、原生 Windows CI、真实 Windows 桌面与公开更新源。未执行项目保持未执行；设计与界面变化同步 [0.9.0 设计说明](design-0.9.0.md)，新截图注明版本、环境、DPI 和是否使用模拟服务。
 3. 使用 Python 3.12 或以上版本与稳定 Rust 完成检查、构建和打包：
 
 ```powershell
@@ -32,7 +32,7 @@ Windows CI 使用 MSVC / Windows SDK 与静态 CRT，并从实际 EXE 核对 Fil
 ```text
 lingoleaf.exe
 lingoleaf-windows-x64.zip
-lingoleaf-0.8.0-windows-x64.exe  # 仅供旧更新器兼容，字节与主 EXE 完全相同
+lingoleaf-0.9.0-windows-x64.exe  # 仅供旧更新器兼容，字节与主 EXE 完全相同
 update.json
 SHA256SUMS
 ```
@@ -48,7 +48,7 @@ ZIP 采用固定条目顺序、时间戳和权限，仅包含 `lingoleaf.exe`、
 ```powershell
 Get-FileHash dist/lingoleaf.exe -Algorithm SHA256
 Get-FileHash dist/lingoleaf-windows-x64.zip -Algorithm SHA256
-Get-FileHash dist/lingoleaf-0.8.0-windows-x64.exe -Algorithm SHA256
+Get-FileHash dist/lingoleaf-0.9.0-windows-x64.exe -Algorithm SHA256
 Get-FileHash dist/update.json -Algorithm SHA256
 ```
 
@@ -60,16 +60,16 @@ Get-FileHash dist/update.json -Algorithm SHA256
 https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/update.json
 ```
 
-清单仍为 schema 1、六字段，兼容旧客户端；以 0.8.0 为例：
+清单仍为 schema 1、六字段，兼容旧客户端；以 0.9.0 为例：
 
 ```json
 {
   "schema_version": 1,
-  "version": "0.8.0",
-  "download_url": "https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.8.0/lingoleaf-0.8.0-windows-x64.exe",
+  "version": "0.9.0",
+  "download_url": "https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.9.0/lingoleaf-0.9.0-windows-x64.exe",
   "sha256": "<打包生成的64位小写十六进制SHA-256>",
   "size": 0,
-  "notes_url": "https://github.com/xiaoxiaoawei/test-hub/releases/tag/v0.8.0"
+  "notes_url": "https://github.com/xiaoxiaoawei/test-hub/releases/tag/v0.9.0"
 }
 ```
 
@@ -86,9 +86,9 @@ https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/update.json
 ```powershell
 git switch lingoleaf
 git status --short
-python tools/release.py --check --tag v0.8.0
-git tag -a v0.8.0 -m "LingoLeaf 0.8.0"
-git push --atomic origin lingoleaf v0.8.0
+python tools/release.py --check --tag v0.9.0
+git tag -a v0.9.0 -m "LingoLeaf 0.9.0"
+git push --atomic origin lingoleaf v0.9.0
 ```
 
 发行任务依赖 Windows 与可移植检查，下载同次 Windows 构建的产物、核对 SHA 和两个 EXE 的字节，再公开五项发行资产。仅该任务具有 `contents: write`，其他任务只读。
@@ -112,8 +112,10 @@ git push --atomic origin lingoleaf v0.8.0
 
 配置仍在 `%LOCALAPPDATA%\LingoLeaf`，升级保留服务、模型、DPAPI 密钥、语言、主题、模式、兼容取词和图标。缺少语言字段时为英语 → 简体中文，兼容取词缺省关闭，明暗缺省暗夜；缺少模板字段时为暖砂金，并保留原有明暗，原关闭总开关保持关闭。暂停划词、保持显示和密钥显隐属于临时交互，不新增持久配置。
 
-0.8.0 发布前重点验证四套模板的八种明暗组合、旧配置默认暖砂金、模板即时持久化与草稿保护，以及圆角输入 / 下拉的真实鼠标和键盘操作。逐项检查卡片分组、翻译浮框、边缘裁切、不同 DPI、控件焦点、颜色对比和长时间切换后的 GDI 句柄。
+0.9.0 发布前重点验证侧栏设置、四套模板的八种明暗组合、100% / 150% / 200% 与混合 DPI 的文字和图标。服务草稿、旧配置迁移、原生输入 / 下拉、键盘焦点、边缘裁切和长时间切换后的 GDI 句柄都应分别检查。
 
-继续回归既有停止 / 重译、问答、流式选区和滚动位置、保持显示、临时暂停、语言交换、密钥显隐、真实右键复制、剪贴板与更新回滚。不同模板只改变外观，不应使缓存失效、发起翻译或重置自定义图标。Windows 11 系统圆角与 Windows 10 / Wine 降级分别记录，不能由兼容层截图声称实机效果已通过。
+Markdown 检查标题、列表、表格、代码、中英混排、流式未闭合标记、超长内容降级，以及可读纯文本 / Markdown 原文的复制。HTML 不执行、外图不加载、网址不自动打开。朗读应在真实 Windows 有声设备上验证匹配语音、停止与换选区取消；Wine 界面或模拟引擎不代表已听到发声。润色应通过请求记录确认一次显式点击只发一个问答请求，使用当前上下文、保留原译文与输入草稿；真实质量和费用另记。
+
+继续回归既有停止 / 重译、问答、流式选区和滚动位置、保持显示、临时暂停、语言交换、密钥显隐、四项右键复制、剪贴板与更新回滚。不同模板只改变外观，不应使缓存失效、发起翻译或重置自定义图标。Windows 11 系统圆角与 Windows 10 / Wine 降级分别记录，不能由兼容层截图声称实机效果已通过。旧版行为与证据可查相应版本标签，不把历史通过数用于本版。
 
 手动回退也应先退出当前程序，再运行保留的旧 EXE。旧版保存可能丢失新字段；配置备份仍受 Windows 用户范围的 DPAPI 约束。启动失败恢复不代表对断电、用户删除或所有系统错误均可无条件回滚。

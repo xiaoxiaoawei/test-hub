@@ -4,6 +4,8 @@
 use super::*;
 use translation::{ConversationContext, ConversationTurn};
 
+pub(super) const POLISH_PROMPT: &str = "请结合当前原文和译文，对译文做一次完整检查与润色。检查准确性、遗漏、术语、语法和表达，保留原意、事实和数字，不添加未经原文支持的信息。使用当前目标语言，以 Markdown 给出两个简洁部分：检查要点、润色后的完整译文；无问题时如实说明。";
+
 struct Job {
     generation: u64,
     anchor: u64,
@@ -202,6 +204,7 @@ impl Drop for State {
 }
 
 pub(super) unsafe fn reset(app: &mut App) {
+    super::stop_speech(app);
     let state = &mut app.conversation;
     state.advance();
     state.history.clear();
@@ -239,6 +242,10 @@ pub(super) unsafe fn refresh(app: &mut App) {
             || (app.conversation.anchor == app.generation
                 && app.conversation.epoch == app.active_epoch));
     let visual_busy = busy && current;
+    for window in [app.inline_window, app.result_window] {
+        let polish = GetDlgItem(window, ID_POLISH as i32);
+        EnableWindow(polish, ready(app) as i32);
+    }
     let changed = CONVERSATION_BUSY.replace(visual_busy) != visual_busy;
     for button in [app.inline_ui.send, app.result_ui.send] {
         if changed {
@@ -268,6 +275,9 @@ unsafe fn restore_question(app: &App) {
     let Some(question) = &app.conversation.pending else {
         return;
     };
+    if question == POLISH_PROMPT {
+        return;
+    }
     for input in [app.inline_ui.question, app.result_ui.question] {
         // An asynchronous error or a stop must not erase the next draft.
         if text(input).is_empty() {
@@ -321,6 +331,16 @@ pub(super) unsafe fn submit(app: &mut App, owner: HWND) {
         focus_if_foreground(input);
         return;
     }
+    submit_question(app, question, Some(input));
+}
+
+pub(super) unsafe fn polish(app: &mut App) {
+    if ready(app) {
+        submit_question(app, POLISH_PROMPT.to_owned(), None);
+    }
+}
+
+unsafe fn submit_question(app: &mut App, question: String, input: Option<HWND>) {
     if let Err(error) = app.settings.validate() {
         translation_status(app, &error);
         return;
@@ -349,11 +369,19 @@ pub(super) unsafe fn submit(app: &mut App, owner: HWND) {
         state.error = Some("提问线程不可用，请重新打开轻译。".into());
         translation_status(app, "提问未启动");
     } else {
-        set_text(input, "");
-        // A real mouse submission permits the next draft, while a background
-        // command must not activate an otherwise inactive translation window.
-        focus_if_foreground(input);
-        translation_status(app, "正在思考…");
+        if let Some(input) = input {
+            set_text(input, "");
+            // Mouse submissions permit a next draft; polishing never overwrites it.
+            focus_if_foreground(input);
+        }
+        translation_status(
+            app,
+            if app.conversation.pending.as_deref() == Some(POLISH_PROMPT) {
+                "正在检查与润色…"
+            } else {
+                "正在思考…"
+            },
+        );
     }
     let original = app.translated.clone();
     super::render_translation(app, &original);
@@ -418,9 +446,20 @@ pub(super) fn has_content(state: &State) -> bool {
 }
 
 fn append_exchange(output: &mut String, question: &str, answer: &str) {
-    output.push_str("\n\n你：");
-    output.push_str(question);
-    output.push_str("\n轻译：");
+    output.push_str("\n\n**你：** ");
+    let question = if question == POLISH_PROMPT {
+        "检查并润色"
+    } else {
+        question
+    };
+    // User questions are literal content, including backticks/links/HTML.
+    for character in question.chars() {
+        if "\\`*_{}[]<>()#+-.!|~>".contains(character) {
+            output.push('\\');
+        }
+        output.push(character);
+    }
+    output.push_str("\n\n**轻译：**\n\n");
     output.push_str(answer);
 }
 

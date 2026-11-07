@@ -144,9 +144,9 @@ pub(crate) unsafe fn layout_control(window: HWND) {
             window,
             CB_SETITEMHEIGHT,
             usize::MAX,
-            scaled(window, 30) as isize,
+            scaled(window, 34) as isize,
         );
-        SendMessageW(window, CB_SETITEMHEIGHT, 0, scaled(window, 30) as isize);
+        SendMessageW(window, CB_SETITEMHEIGHT, 0, scaled(window, 32) as isize);
         let mut info: COMBOBOXINFO = zeroed();
         info.cbSize = size_of::<COMBOBOXINFO>() as u32;
         if GetComboBoxInfo(window, &mut info) != 0 && !info.hwndList.is_null() {

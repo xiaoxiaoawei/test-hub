@@ -113,7 +113,8 @@ impl Theme {
             return;
         }
         SelectObject(dc, self.card);
-        SelectObject(dc, self.border_pen);
+        // Surface contrast groups content without drawing a second frame around it.
+        SelectObject(dc, GetStockObject(NULL_PEN));
         RoundRect(
             dc,
             rect.left,
@@ -122,6 +123,99 @@ impl Theme {
             rect.bottom,
             radius * 2,
             radius * 2,
+        );
+        RestoreDC(dc, saved);
+    }
+
+    /// Paint a native sidebar button while retaining its label and accessibility.
+    ///
+    /// # Safety
+    /// `info` and `font` must be valid for the current UI thread's WM_DRAWITEM.
+    pub(crate) unsafe fn draw_navigation(
+        &self,
+        info: &DRAWITEMSTRUCT,
+        font: HFONT,
+        selected: bool,
+    ) {
+        let dc = info.hDC;
+        let saved = SaveDC(dc);
+        if saved == 0 {
+            return;
+        }
+        let disabled = info.itemState & ODS_DISABLED != 0;
+        let pressed = info.itemState & ODS_SELECTED != 0;
+        let hot = info.itemState & ODS_HOTLIGHT != 0;
+        let focused = info.itemState & ODS_FOCUS != 0;
+        let bounds = info.rcItem;
+        FillRect(dc, &bounds, self.card);
+        let diameter = scale(info.hwndItem, 8);
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        if !disabled && (selected || pressed || hot) {
+            SelectObject(dc, if pressed { self.surface } else { self.raised });
+            RoundRect(
+                dc,
+                bounds.left,
+                bounds.top,
+                bounds.right,
+                bounds.bottom,
+                diameter,
+                diameter,
+            );
+        }
+        if selected {
+            let indicator_height = scale(info.hwndItem, 16);
+            let top = bounds.top + (bounds.bottom - bounds.top - indicator_height) / 2;
+            SelectObject(dc, if disabled { self.surface } else { self.accent });
+            let left = bounds.left + scale(info.hwndItem, 2);
+            RoundRect(
+                dc,
+                left,
+                top,
+                left + scale(info.hwndItem, 3),
+                top + indicator_height,
+                scale(info.hwndItem, 3),
+                scale(info.hwndItem, 3),
+            );
+        }
+        if focused && !disabled {
+            let inset = scale(info.hwndItem, 2);
+            SelectObject(dc, self.accent_pen);
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            RoundRect(
+                dc,
+                bounds.left + inset,
+                bounds.top + inset,
+                bounds.right - inset,
+                bounds.bottom - inset,
+                diameter,
+                diameter,
+            );
+        }
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(
+            dc,
+            if disabled {
+                self.muted_color
+            } else {
+                self.text_color
+            },
+        );
+        SelectObject(dc, font);
+        let mut text_rect = RECT {
+            left: bounds.left + scale(info.hwndItem, 20),
+            right: bounds.right - scale(info.hwndItem, 10),
+            ..bounds
+        };
+        if pressed && !disabled {
+            text_rect.top += scale(info.hwndItem, 1);
+        }
+        let text = label(info.hwndItem);
+        DrawTextW(
+            dc,
+            text.as_ptr(),
+            -1,
+            &mut text_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
         RestoreDC(dc, saved);
     }
@@ -135,35 +229,38 @@ impl Theme {
         selected: bool,
     ) {
         let dc = info.hDC;
-        let saved = SaveDC(dc);
-        if saved == 0 {
-            return;
-        }
         let colors = Palette::for_theme(self.mode, preset);
-        let bounds = info.rcItem;
-        FillRect(dc, &bounds, self.background);
-        let card = CreateSolidBrush(color(colors.card));
-        let outline = CreatePen(
+        let disabled = info.itemState & ODS_DISABLED != 0;
+        let pressed = info.itemState & ODS_SELECTED != 0;
+        let hot = info.itemState & ODS_HOTLIGHT != 0;
+        let focused = info.itemState & ODS_FOCUS != 0;
+        let card = GdiObject(CreateSolidBrush(color(if (hot || pressed) && !disabled {
+            colors.raised
+        } else {
+            colors.card
+        })));
+        let outline = GdiObject(CreatePen(
             PS_SOLID,
-            if selected { scale(info.hwndItem, 2) } else { 1 },
-            color(if selected {
+            scale(info.hwndItem, 1),
+            color(if selected && !disabled {
                 colors.accent
             } else {
                 colors.border
             }),
-        );
-        if card.is_null() || outline.is_null() {
-            RestoreDC(dc, saved);
-            if !card.is_null() {
-                DeleteObject(card);
-            }
-            if !outline.is_null() {
-                DeleteObject(outline);
-            }
+        ));
+        let title_font = sized_font(font, info.hwndItem, 16, FW_SEMIBOLD as i32);
+        let detail_font = sized_font(font, info.hwndItem, 13, FW_NORMAL as i32);
+        if card.0.is_null() || outline.0.is_null() {
             return;
         }
-        SelectObject(dc, card);
-        SelectObject(dc, outline);
+        let saved = SaveDC(dc);
+        if saved == 0 {
+            return;
+        }
+        let bounds = info.rcItem;
+        FillRect(dc, &bounds, self.background);
+        SelectObject(dc, card.0);
+        SelectObject(dc, outline.0);
         let gap = scale(info.hwndItem, 2);
         let rect = RECT {
             left: bounds.left + gap,
@@ -171,7 +268,7 @@ impl Theme {
             right: bounds.right - gap,
             bottom: bounds.bottom - gap,
         };
-        let diameter = scale(info.hwndItem, 28);
+        let diameter = scale(info.hwndItem, 24);
         RoundRect(
             dc,
             rect.left,
@@ -186,20 +283,27 @@ impl Theme {
             .into_iter()
             .enumerate()
         {
-            let brush = CreateSolidBrush(color(swatch));
-            if !brush.is_null() {
-                let previous = SelectObject(dc, brush);
+            let brush = GdiObject(CreateSolidBrush(color(swatch)));
+            if !brush.0.is_null() {
+                let previous = SelectObject(dc, brush.0);
                 let x = rect.left + scale(info.hwndItem, 16 + index as i32 * 16);
                 let y = rect.top + scale(info.hwndItem, 15);
-                let side = scale(info.hwndItem, 10);
-                Ellipse(dc, x, y, x + side, y + side);
+                let side = scale(info.hwndItem, 12);
+                let corner = scale(info.hwndItem, 8);
+                RoundRect(dc, x, y, x + side, y + side, corner, corner);
                 SelectObject(dc, previous);
-                DeleteObject(brush);
             }
         }
         SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, color(colors.text));
-        SelectObject(dc, font);
+        SetTextColor(dc, color(if disabled { colors.muted } else { colors.text }));
+        SelectObject(
+            dc,
+            if title_font.0.is_null() {
+                font
+            } else {
+                title_font.0
+            },
+        );
         let mut title = RECT {
             left: rect.left + scale(info.hwndItem, 16),
             top: rect.top + scale(info.hwndItem, 34),
@@ -213,22 +317,22 @@ impl Theme {
             &mut title,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
-        let mut detail_face: LOGFONTW = std::mem::zeroed();
-        let mut detail_font = std::ptr::null_mut();
-        if GetObjectW(
-            font,
-            size_of::<LOGFONTW>() as i32,
-            (&mut detail_face as *mut LOGFONTW).cast(),
-        ) != 0
-        {
-            detail_face.lfHeight = -scale(info.hwndItem, 12);
-            detail_face.lfWeight = FW_NORMAL as i32;
-            detail_font = CreateFontIndirectW(&detail_face);
-            if !detail_font.is_null() {
-                SelectObject(dc, detail_font);
-            }
-        }
-        SetTextColor(dc, color(colors.muted));
+        SelectObject(
+            dc,
+            if detail_font.0.is_null() {
+                font
+            } else {
+                detail_font.0
+            },
+        );
+        SetTextColor(
+            dc,
+            color(if !disabled && (hot || pressed) {
+                colors.text
+            } else {
+                colors.muted
+            }),
+        );
         let mut detail = RECT {
             top: rect.top + scale(info.hwndItem, 64),
             bottom: rect.bottom - scale(info.hwndItem, 8),
@@ -242,29 +346,29 @@ impl Theme {
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
         if selected {
-            SelectObject(dc, outline);
+            SelectObject(dc, outline.0);
             let x = rect.right - scale(info.hwndItem, 24);
-            let y = rect.top + scale(info.hwndItem, 20);
+            let y = rect.top + scale(info.hwndItem, 21);
             let points = [
                 POINT {
-                    x: x - scale(info.hwndItem, 5),
+                    x: x - scale(info.hwndItem, 4),
                     y,
                 },
                 POINT {
                     x: x - scale(info.hwndItem, 1),
-                    y: y + scale(info.hwndItem, 4),
+                    y: y + scale(info.hwndItem, 3),
                 },
                 POINT {
-                    x: x + scale(info.hwndItem, 7),
-                    y: y - scale(info.hwndItem, 5),
+                    x: x + scale(info.hwndItem, 5),
+                    y: y - scale(info.hwndItem, 4),
                 },
             ];
-            Polyline(dc, points.as_ptr(), 3);
+            Polyline(dc, points.as_ptr(), points.len() as i32);
         }
-        if info.itemState & ODS_FOCUS != 0 {
-            SelectObject(dc, outline);
+        if focused && !disabled {
+            SelectObject(dc, self.accent_pen);
             SelectObject(dc, GetStockObject(NULL_BRUSH));
-            let inset = scale(info.hwndItem, 6);
+            let inset = scale(info.hwndItem, 4);
             RoundRect(
                 dc,
                 rect.left + inset,
@@ -275,12 +379,8 @@ impl Theme {
                 diameter - inset,
             );
         }
+        // Restore selected objects before RAII releases the temporary GDI handles.
         RestoreDC(dc, saved);
-        if !detail_font.is_null() {
-            DeleteObject(detail_font);
-        }
-        DeleteObject(outline);
-        DeleteObject(card);
     }
 
     /// Paint a BS_OWNERDRAW push button using the caller's current DPI font.
@@ -322,7 +422,7 @@ impl Theme {
         FillRect(dc, &rect, self.control_backdrop(info.hwndItem));
         SelectObject(dc, brush);
         SelectObject(dc, pen);
-        let radius = scale(info.hwndItem, 26);
+        let radius = scale(info.hwndItem, 16);
         RoundRect(
             dc,
             rect.left,
@@ -572,6 +672,34 @@ impl Drop for Theme {
             }
         }
     }
+}
+
+/// Temporary preview resources are always released, including allocation failure.
+struct GdiObject(HGDIOBJ);
+
+impl Drop for GdiObject {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                DeleteObject(self.0);
+            }
+        }
+    }
+}
+
+unsafe fn sized_font(font: HFONT, hwnd: HWND, height: i32, weight: i32) -> GdiObject {
+    let mut face: LOGFONTW = std::mem::zeroed();
+    if GetObjectW(
+        font,
+        size_of::<LOGFONTW>() as i32,
+        (&mut face as *mut LOGFONTW).cast(),
+    ) == 0
+    {
+        return GdiObject(std::ptr::null_mut());
+    }
+    face.lfHeight = -scale(hwnd, height);
+    face.lfWeight = weight;
+    GdiObject(CreateFontIndirectW(&face))
 }
 
 fn checked(object: HGDIOBJ) -> Result<HGDIOBJ, String> {

@@ -1,6 +1,6 @@
 [package]
 name = "lingoleaf"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.85"
 description = "A lightweight native Windows selection translator"
@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [build-dependencies]
 embed-resource = "3"
@@ -16,6 +17,8 @@ embed-resource = "3"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
+    "Win32_Media_Speech",
+    "Win32_System_Threading",
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_Variant",

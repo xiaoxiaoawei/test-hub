@@ -4,7 +4,7 @@
 use super::*;
 use translation::{ConversationContext, ConversationTurn};
 
-pub(super) const POLISH_PROMPT: &str = "请结合当前原文和译文，对译文做一次完整检查与润色。检查准确性、遗漏、术语、语法和表达，保留原意、事实和数字，不添加未经原文支持的信息。使用当前目标语言，以 Markdown 给出两个简洁部分：检查要点、润色后的完整译文；无问题时如实说明。";
+pub(super) const POLISH_PROMPT: &str = "结合原文检查并润色当前译文，保留原意、事实与数字。只输出目标语言的完整润色译文，不列检查要点，不加开场白、解释、总结或重复版本；无需修改则直接输出原译文。";
 
 struct Job {
     generation: u64,

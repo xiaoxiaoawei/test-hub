@@ -17,7 +17,7 @@ pub(super) unsafe fn handle_notice(main: HWND) {
         Some(Notice::Saved) => {
             MessageBoxW(
                 owner,
-                wide("设置保存成功，已立即生效。").as_ptr(),
+                wide("保存成功。").as_ptr(),
                 wide("轻译 · 保存成功").as_ptr(),
                 MB_OK | MB_ICONINFORMATION,
             );
@@ -98,7 +98,11 @@ pub(super) unsafe fn check_updates(app: &mut App, manual: bool) {
     app.update_busy = true;
     set_text(
         app.settings_ui.update_status,
-        &format!("v{} · 正在检查更新…", env!("CARGO_PKG_VERSION")),
+        &format!(
+            "v{}
+检查中…",
+            env!("CARGO_PKG_VERSION")
+        ),
     );
     set_text(GetDlgItem(app.settings_window, ID_UPDATE as i32), "检查中…");
     EnableWindow(GetDlgItem(app.settings_window, ID_UPDATE as i32), 0);
@@ -114,7 +118,7 @@ pub(super) unsafe fn check_updates(app: &mut App, manual: bool) {
     if started.is_err() {
         app.update_busy = false;
         refresh_update_button(app);
-        set_text(app.settings_ui.update_status, "更新检查未启动，请稍后重试");
+        set_text(app.settings_ui.update_status, "检查未启动");
     }
 }
 
@@ -134,7 +138,11 @@ pub(super) unsafe fn checked(
             if ready {
                 set_text(
                     app.settings_ui.update_status,
-                    &format!("v{} 已下载并校验 · 等待重启", release.version),
+                    &format!(
+                        "v{}
+等待重启",
+                        release.version
+                    ),
                 );
                 app.available_update = Some(release);
                 enqueue_notice(app, Notice::RestartUpdate);
@@ -145,8 +153,8 @@ pub(super) unsafe fn checked(
             set_text(
                 app.settings_ui.update_status,
                 &format!(
-                    "当前 v{} · 可更新至 v{}",
-                    env!("CARGO_PKG_VERSION"),
+                    "可更新至
+v{}",
                     release.version
                 ),
             );
@@ -157,7 +165,11 @@ pub(super) unsafe fn checked(
             app.available_update = None;
             set_text(
                 app.settings_ui.update_status,
-                &format!("v{} · 已是最新版本", env!("CARGO_PKG_VERSION")),
+                &format!(
+                    "v{}
+已是最新",
+                    env!("CARGO_PKG_VERSION")
+                ),
             );
             if manual {
                 enqueue_notice(
@@ -172,7 +184,11 @@ pub(super) unsafe fn checked(
         Ok(update::CheckResult::NotPublished) => {
             set_text(
                 app.settings_ui.update_status,
-                &format!("v{} · 暂无已发布更新", env!("CARGO_PKG_VERSION")),
+                &format!(
+                    "v{}
+暂无更新",
+                    env!("CARGO_PKG_VERSION")
+                ),
             );
             if manual {
                 enqueue_notice(
@@ -185,10 +201,7 @@ pub(super) unsafe fn checked(
             }
         }
         Err(error) => {
-            set_text(
-                app.settings_ui.update_status,
-                "更新检查失败，可稍后手动重试",
-            );
+            set_text(app.settings_ui.update_status, "更新检查失败");
             if manual {
                 enqueue_notice(app, Notice::Error(format!("更新检查失败：{error}")));
             }
@@ -230,7 +243,7 @@ pub(super) unsafe fn download_available_update(app: &mut App) {
     if started.is_err() {
         app.update_busy = false;
         refresh_update_button(app);
-        set_text(app.settings_ui.update_status, "更新下载未启动，请稍后重试");
+        set_text(app.settings_ui.update_status, "下载未启动");
     }
 }
 
@@ -240,13 +253,17 @@ pub(super) unsafe fn downloaded(app: &mut App, result: Result<update::VerifiedDo
         Ok(download) => {
             set_text(
                 app.settings_ui.update_status,
-                &format!("v{} 已下载并校验 · 等待重启", download.version),
+                &format!(
+                    "v{}
+等待重启",
+                    download.version
+                ),
             );
             app.downloaded_update = Some(download);
             enqueue_notice(app, Notice::RestartUpdate);
         }
         Err(error) => {
-            set_text(app.settings_ui.update_status, "更新下载失败，可重试");
+            set_text(app.settings_ui.update_status, "下载失败");
             enqueue_notice(app, Notice::Error(format!("更新下载失败：{error}")));
         }
     }
@@ -261,7 +278,7 @@ unsafe fn launch_downloaded_update(app: &mut App) {
         return;
     };
     app.update_busy = true;
-    set_text(app.settings_ui.update_status, "正在准备重启更新…");
+    set_text(app.settings_ui.update_status, "准备重启…");
     EnableWindow(app.settings_window, 0);
     EnableWindow(GetDlgItem(app.settings_window, ID_UPDATE as i32), 0);
     let sender = app.ui_events.clone();
@@ -288,10 +305,7 @@ pub(super) unsafe fn launched(app: &mut App, result: Result<(), String>) {
             app.update_busy = false;
             EnableWindow(app.settings_window, 1);
             refresh_update_button(app);
-            set_text(
-                app.settings_ui.update_status,
-                "更新未安装 · 当前版本继续运行",
-            );
+            set_text(app.settings_ui.update_status, "更新未安装");
             enqueue_notice(
                 app,
                 Notice::Error(format!(

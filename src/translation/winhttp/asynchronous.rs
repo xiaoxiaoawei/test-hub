@@ -25,7 +25,7 @@ const BUFFER_SIZE: usize = 8192;
 const MAX_LIVE_REQUESTS: usize = 16;
 
 #[derive(Default)]
-pub(super) struct Slots(AtomicUsize);
+pub(crate) struct Slots(AtomicUsize);
 
 #[cfg(test)]
 impl Slots {
@@ -90,13 +90,13 @@ struct Context {
     read_buffer: Mutex<Box<[u8; BUFFER_SIZE]>>,
 }
 
-pub(super) struct Request {
+pub(crate) struct Request {
     handle: Option<HttpHandle>,
     context: Arc<Context>,
 }
 
 impl Request {
-    pub(super) fn new(
+    pub(crate) fn new(
         handle: HttpHandle,
         headers: Vec<u16>,
         body: Vec<u8>,
@@ -159,7 +159,7 @@ impl Request {
         })
     }
 
-    pub(super) fn raw(&self) -> *mut c_void {
+    pub(crate) fn raw(&self) -> *mut c_void {
         self.handle.as_ref().expect("request is open").0
     }
 
@@ -171,7 +171,7 @@ impl Request {
         )
     }
 
-    pub(super) fn send<C: Fn() -> bool>(
+    pub(crate) fn send<C: Fn() -> bool>(
         &self,
         deadline: Instant,
         cancel: &C,
@@ -196,7 +196,7 @@ impl Request {
         }
     }
 
-    pub(super) fn receive<C: Fn() -> bool>(
+    pub(crate) fn receive<C: Fn() -> bool>(
         &self,
         deadline: Instant,
         cancel: &C,
@@ -209,7 +209,7 @@ impl Request {
         }
     }
 
-    pub(super) fn available<C: Fn() -> bool>(
+    pub(crate) fn available<C: Fn() -> bool>(
         &self,
         deadline: Instant,
         cancel: &C,
@@ -224,7 +224,7 @@ impl Request {
         }
     }
 
-    pub(super) fn read<C: Fn() -> bool>(
+    pub(crate) fn read<C: Fn() -> bool>(
         &self,
         available: u32,
         deadline: Instant,

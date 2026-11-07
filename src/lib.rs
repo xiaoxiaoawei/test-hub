@@ -12,3 +12,5 @@ mod mailbox;
 pub mod platform;
 
 pub mod selection_text;
+
+pub mod speech;

@@ -42,6 +42,10 @@ use windows_sys::Win32::{
 mod conversation_ui;
 #[path = "app/layout_ui.rs"]
 mod layout_ui;
+#[path = "app/manual_ui.rs"]
+mod manual_ui;
+#[path = "app/speech_ui.rs"]
+mod speech_ui;
 use layout_ui::*;
 
 #[path = "app/update_ui.rs"]
@@ -56,6 +60,7 @@ const WM_SETTINGS: u32 = WM_APP + 4;
 const WM_ACCESSIBILITY: u32 = WM_APP + 5;
 const WM_NOTICE: u32 = WM_APP + 6;
 const HOTKEY: i32 = 1;
+const HOTKEY_MANUAL: i32 = 2;
 const TIMER_SELECTION: usize = 1;
 const TIMER_CHIP: usize = 2;
 const ID_SETTINGS: u16 = 100;
@@ -103,13 +108,21 @@ const ID_PRESET_AMBER: u16 = 284;
 const ID_SPEAK: u16 = 285;
 const ID_POLISH: u16 = 286;
 const ID_COPY_MARKDOWN: u16 = 287;
+const ID_MANUAL_HOTKEY: u16 = 301;
+const ID_TRANSLATE_INPUT: u16 = 302;
+const ID_SPEECH_SETTINGS: u16 = 303;
+const ID_SPEECH_APPLY: u16 = 308;
+const ID_SPEECH_CLOSE: u16 = 309;
+const ID_MANUAL_WINDOW: u16 = 315;
+const SPEECH_WIDTH: i32 = 480;
+const SPEECH_HEIGHT: i32 = 424;
 const APPEARANCE_WIDTH: i32 = 440;
 const APPEARANCE_HEIGHT: i32 = 380;
 const INLINE_WIDTH: i32 = 460;
 const INLINE_HEIGHT: i32 = 356;
 const SETTINGS_WIDTH: i32 = 760;
 const SETTINGS_HEIGHT: i32 = 680;
-const SETTINGS_CONTENT_HEIGHT: i32 = 636;
+const SETTINGS_CONTENT_HEIGHT: i32 = 600;
 const RESULT_WIDTH: i32 = 600;
 const RESULT_HEIGHT: i32 = 620;
 
@@ -140,7 +153,7 @@ thread_local! {
     static CURRENT_THEME: Cell<config::ThemeMode> = const { Cell::new(config::ThemeMode::Dark) };
     static NOTICES: RefCell<VecDeque<Notice>> = const { RefCell::new(VecDeque::new()) };
     static NOTICE_ACTIVE: Cell<bool> = const { Cell::new(false) };
-    static DRAFT_ICON_COLOR: Cell<u32> = const { Cell::new(0xD6A575) };
+    static DRAFT_ICON_COLOR: Cell<u32> = const { Cell::new(0x19A97C) };
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -264,10 +277,19 @@ struct App {
     inline_window: HWND,
     inline_ui: InlineUi,
     inline_active: bool,
+    inline_positioned: bool,
+    result_positioned: bool,
+    manual_mode: bool,
+    manual_draft: String,
+    manual_hotkey_registered: bool,
     window_pinned: bool,
     selection_paused: bool,
     appearance_window: HWND,
     appearance_ui: AppearanceUi,
+    speech_window: HWND,
+    speech_ui: SpeechSettingsUi,
+    speech_restore_view: Option<bool>,
+    speech_settings_was_visible: bool,
     icons: icons::IconSet,
     preview_icons: Option<icons::IconSet>,
     window_icons: HashMap<isize, (WindowIconKey, icons::IconSet)>,
@@ -407,7 +429,13 @@ unsafe fn run_inner() -> Result<(), String> {
     let settings_window = create_window(
         "轻译 · 设置",
         0,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL,
+        WS_OVERLAPPED
+            | WS_CAPTION
+            | WS_SYSMENU
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX
+            | WS_THICKFRAME
+            | WS_VSCROLL,
         SETTINGS_WIDTH,
         SETTINGS_HEIGHT,
         null_mut(),
@@ -444,11 +472,20 @@ unsafe fn run_inner() -> Result<(), String> {
         APPEARANCE_HEIGHT,
         settings_window,
     );
+    let speech_window = create_window(
+        "轻译 · 朗读接口",
+        WS_EX_TOOLWINDOW,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        SPEECH_WIDTH,
+        SPEECH_HEIGHT,
+        settings_window,
+    );
     if settings_window.is_null()
         || result_window.is_null()
         || chip.is_null()
         || appearance_window.is_null()
         || inline_window.is_null()
+        || speech_window.is_null()
     {
         return Err("无法创建翻译窗口。".into());
     }
@@ -466,11 +503,11 @@ unsafe fn run_inner() -> Result<(), String> {
         set_window_icons(window, &runtime_icons);
     }
     popup::disable_shadow(chip);
-    popup::disable_shadow(inline_window);
     let settings_ui = make_settings(settings_window);
     let result_ui = make_result(result_window);
     let inline_ui = make_inline(inline_window);
     let appearance_ui = make_appearance(appearance_window);
+    let speech_ui = make_speech_settings(speech_window);
     let (events_tx, events) = mpsc::channel();
     let ui_events = events_tx.clone();
     let (capture_tx, capture_rx) = mpsc::channel::<CaptureWork>();
@@ -631,17 +668,18 @@ unsafe fn run_inner() -> Result<(), String> {
         MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
         b'T' as u32,
     ) != 0;
+    let manual_hotkey_ok = manual_ui::register(main, settings.manual_hotkey);
     mouse::set_enabled(settings.selection_button);
     let hook = mouse::install(main as isize, WM_SELECTION);
     let accessibility = selection_events::install(main as isize, WM_ACCESSIBILITY);
     let hook_error = hook.as_ref().err().cloned();
     let conversation = conversation_ui::State::new(main, ui_events.clone())?;
     let speech_sender = ui_events.clone();
-    let speech_window = main as isize;
+    let speech_notify_window = main as isize;
     let speech = speech::Speech::new(move |event| {
         let _ = speech_sender.send(Event::Speech(event));
         unsafe {
-            PostMessageW(speech_window as HWND, WM_WORK, 0, 0);
+            PostMessageW(speech_notify_window as HWND, WM_WORK, 0, 0);
         }
     })?;
     let app = App {
@@ -652,10 +690,19 @@ unsafe fn run_inner() -> Result<(), String> {
         inline_window,
         inline_ui,
         inline_active: false,
+        inline_positioned: false,
+        result_positioned: false,
+        manual_mode: false,
+        manual_draft: String::new(),
+        manual_hotkey_registered: manual_hotkey_ok,
         window_pinned: false,
         selection_paused: false,
         appearance_window,
         appearance_ui,
+        speech_window,
+        speech_ui,
+        speech_restore_view: None,
+        speech_settings_was_visible: false,
         icons: runtime_icons,
         preview_icons: None,
         window_icons: HashMap::new(),
@@ -722,6 +769,8 @@ unsafe fn run_inner() -> Result<(), String> {
         layout_appearance(app);
         layout_inline(app);
         layout_chip(app);
+        layout_speech_settings(app.speech_window);
+        theme::apply_window(app.speech_window, CURRENT_THEME.get(), CURRENT_PRESET.get());
         for window in [
             app.main,
             app.settings_window,
@@ -739,6 +788,9 @@ unsafe fn run_inner() -> Result<(), String> {
         if !hotkey_ok {
             problems.push("Ctrl+Alt+T 已被其他应用占用；划词按钮与翻译剪贴板仍可用。".into());
         }
+        if !manual_hotkey_ok {
+            problems.push("手动翻译快捷键已被占用，可在偏好设置中更改。".into());
+        }
         if let Some(error) = hook_error {
             problems.push(error);
         }
@@ -754,6 +806,25 @@ unsafe fn run_inner() -> Result<(), String> {
         let status = GetMessageW(&mut message, null_mut(), 0, 0);
         if status <= 0 {
             break;
+        }
+        if message.message == WM_KEYDOWN
+            && message.wParam == VK_RETURN as usize
+            && message.hwnd == GetDlgItem(result_window, 222)
+        {
+            let mut manual = false;
+            with_app(|app| {
+                manual = app.manual_mode;
+                if manual && GetKeyState(VK_CONTROL as i32) < 0 {
+                    manual_ui::submit(app, false);
+                }
+            });
+            if manual {
+                if GetKeyState(VK_CONTROL as i32) >= 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                continue;
+            }
         }
         if message.message == WM_KEYDOWN
             && message.wParam == VK_RETURN as usize
@@ -775,11 +846,14 @@ unsafe fn run_inner() -> Result<(), String> {
                 || root == settings_window
                 || root == appearance_window
                 || root == inline_window
+                || root == speech_window
             {
                 if root == inline_window {
                     with_app(|app| close_inline(app));
                 } else if root == result_window {
                     with_app(|app| close_translation(app));
+                } else if root == speech_window {
+                    with_app(|app| speech_ui::close(app));
                 } else if root == appearance_window {
                     with_app(|app| close_appearance(app));
                 } else {
@@ -791,7 +865,8 @@ unsafe fn run_inner() -> Result<(), String> {
                 continue;
             }
         }
-        if IsDialogMessageW(settings_window, &message) == 0
+        if IsDialogMessageW(speech_window, &message) == 0
+            && IsDialogMessageW(settings_window, &message) == 0
             && IsDialogMessageW(result_window, &message) == 0
             && IsDialogMessageW(appearance_window, &message) == 0
             && IsDialogMessageW(inline_window, &message) == 0
@@ -818,6 +893,7 @@ unsafe fn run_inner() -> Result<(), String> {
     drop(accessibility);
     drop(hook);
     UnregisterHotKey(main, HOTKEY);
+    UnregisterHotKey(main, HOTKEY_MANUAL);
     APP.with(|cell| {
         if let Some(app) = cell.borrow_mut().take() {
             Shell_NotifyIconW(NIM_DELETE, &app.tray);
@@ -826,6 +902,7 @@ unsafe fn run_inner() -> Result<(), String> {
             DestroyWindow(app.result_window);
             DestroyWindow(app.settings_window);
             DestroyWindow(app.appearance_window);
+            DestroyWindow(app.speech_window);
             DestroyWindow(app.main);
         }
     });
@@ -879,7 +956,7 @@ unsafe fn paint_message(
             let id = GetDlgCtrlID(control);
             let surface = message == WM_CTLCOLOREDIT
                 || message == WM_CTLCOLORLISTBOX
-                || matches!(id, 210..=213 | 222 | 224 | 237 | 251 | 260 | 272 | 273)
+                || matches!(id, 210..=213 | 222 | 224 | 237 | 251 | 260 | 272 | 273 | 301 | 304..=307)
                 || id == ID_PROVIDER as i32;
             with_theme(|palette| {
                 let dc = wparam as HDC;
@@ -952,9 +1029,11 @@ unsafe fn paint_message(
                     palette.draw_button(
                         item,
                         face,
-                        item.CtlID == ID_SAVE as u32
-                            || (item.CtlID == ID_SERVICE_TAB as u32
-                                && SETTINGS_PAGE.get() == SettingsPage::Service)
+                        matches!(
+                            item.CtlID as u16,
+                            ID_SAVE | ID_SPEECH_APPLY | ID_TRANSLATE_INPUT
+                        ) || (item.CtlID == ID_SERVICE_TAB as u32
+                            && SETTINGS_PAGE.get() == SettingsPage::Service)
                             || (item.CtlID == ID_PREFERENCES_TAB as u32
                                 && SETTINGS_PAGE.get() == SettingsPage::Preferences)
                             || (item.CtlID == ID_APPEARANCE_TAB as u32
@@ -997,10 +1076,11 @@ unsafe fn paint_panels(hwnd: HWND, dc: HDC, palette: &theme::Theme, client: &REC
     let scale = dpi(hwnd);
     let width = client.right * 96 / scale as i32;
     let (panels, scroll) = if hwnd as isize == SETTINGS_WINDOW.get() {
+        let (rail, _, _) = settings_geometry(width);
         let sidebar = RECT {
             left: 0,
             top: 0,
-            right: scaled(156, scale),
+            right: scaled(rail, scale),
             bottom: client.bottom,
         };
         FillRect(dc, &sidebar, palette.card);
@@ -1008,13 +1088,10 @@ unsafe fn paint_panels(hwnd: HWND, dc: HDC, palette: &theme::Theme, client: &REC
         info.cbSize = size_of::<SCROLLINFO>() as u32;
         info.fMask = SIF_POS;
         GetScrollInfo(hwnd, SB_VERT, &mut info);
-        let panels = match SETTINGS_PAGE.get() {
-            SettingsPage::Service => vec![(184, 112, width - 28, 452)],
-            SettingsPage::Preferences => {
-                vec![(184, 112, width - 28, 252), (184, 268, width - 28, 468)]
-            }
-            SettingsPage::Appearance => vec![(184, 392, width - 28, 468)],
-        };
+        let panels = settings_panels(width, SETTINGS_PAGE.get())
+            .into_iter()
+            .map(|rect| (rect.left, rect.top, rect.right, rect.bottom))
+            .collect::<Vec<_>>();
         (panels, info.nPos)
     } else if hwnd as isize == APPEARANCE_WINDOW.get() {
         (vec![(20, 84, width - 20, 244)], 0)
@@ -1111,15 +1188,6 @@ unsafe fn update_language_labels(app: &App) {
         app.settings.source_language.label(),
         app.settings.target_language.label()
     );
-    set_text(GetDlgItem(app.settings_window, 201), &pair);
-    set_text(
-        GetDlgItem(app.settings_window, 293),
-        if app.selection_paused {
-            "已暂停划词"
-        } else {
-            "Ctrl + Alt + T"
-        },
-    );
     set_text(GetDlgItem(app.inline_window, 250), &pair);
     set_text(GetDlgItem(app.result_window, 220), &pair);
 }
@@ -1134,6 +1202,7 @@ unsafe fn update_appearance_summary(app: &App) {
         config::IconShape::Rounded => "圆角",
         config::IconShape::Square => "方形",
         config::IconShape::Circle => "圆形",
+        config::IconShape::Leaf => "叶形",
     };
     set_text(
         GetDlgItem(app.settings_window, 276),
@@ -1172,7 +1241,7 @@ unsafe fn position_over_owner(hwnd: HWND, owner: HWND, width: i32, height: i32) 
 }
 
 fn automatic_enabled(app: &App) -> bool {
-    app.settings.selection_button && !app.selection_paused
+    app.settings.selection_button && !app.selection_paused && !app.manual_mode
 }
 
 unsafe fn update_pause_ui(app: &App) {
@@ -1247,7 +1316,7 @@ unsafe fn swap_languages(app: &App) {
     SendMessageW(app.settings_ui.source, CB_SETCURSEL, new_source, 0);
     SendMessageW(app.settings_ui.target, CB_SETCURSEL, new_target, 0);
     update_swap_button(app);
-    set_text(app.settings_ui.status, "已交换语言 · 保存后生效");
+    set_text(app.settings_ui.status, "");
 }
 
 unsafe fn set_api_key_visibility(app: &App, visible: bool) {
@@ -1347,9 +1416,13 @@ unsafe fn toggle_speech(app: &mut App) {
         stop_speech(app);
         translation_status(app, "已停止朗读");
     } else if app.translation_ready && !app.display_pending && !app.streaming {
+        if app.settings.speech_settings().validate().is_err() {
+            speech_ui::show(app, true);
+            return;
+        }
         let spoken = crate::markdown::plain_text(&app.translated);
         if !spoken.trim().is_empty() {
-            app.speech_token = app.speech.start(spoken, app.settings.target_language);
+            app.speech_token = app.speech.start(spoken, app.settings.speech_settings());
             app.speaking = true;
             refresh_speech_actions(app);
         }
@@ -1529,10 +1602,7 @@ unsafe fn change_provider(app: &mut App) {
     app.latest_test
         .store(app.test_generation, Ordering::Release);
     EnableWindow(GetDlgItem(app.settings_window, ID_TEST as i32), 1);
-    set_text(
-        app.settings_ui.status,
-        "已填入服务地址与模型，请填写对应的 API 密钥。",
-    );
+    set_text(app.settings_ui.status, "");
 }
 
 unsafe extern "system" fn window_proc(
@@ -1581,6 +1651,10 @@ unsafe extern "system" fn window_proc(
                 } else if lparam as u32 == WM_LBUTTONDBLCLK {
                     show_settings(app);
                 }
+                handled = true;
+            }
+            WM_HOTKEY if wparam == HOTKEY_MANUAL as usize => {
+                manual_ui::open(app);
                 handled = true;
             }
             WM_HOTKEY if wparam == HOTKEY as usize => {
@@ -1714,7 +1788,7 @@ unsafe extern "system" fn window_proc(
                 } else if id == ID_SOURCE_LANGUAGE || id == ID_TARGET_LANGUAGE {
                     if (wparam >> 16) as u16 == CBN_SELCHANGE as u16 {
                         update_swap_button(app);
-                        set_text(app.settings_ui.status, "语言偏好将在保存后生效");
+                        set_text(app.settings_ui.status, "");
                     }
                 } else if id == ID_PROVIDER {
                     if (wparam >> 16) as u16 == CBN_SELCHANGE as u16 {
@@ -1746,6 +1820,8 @@ unsafe extern "system" fn window_proc(
                 } else if hwnd == app.settings_window {
                     mask_api_key(app);
                     ShowWindow(hwnd, SW_HIDE);
+                } else if hwnd == app.speech_window {
+                    speech_ui::close(app);
                 } else if hwnd == app.appearance_window {
                     close_appearance(app);
                 } else {
@@ -1754,7 +1830,9 @@ unsafe extern "system" fn window_proc(
                 handled = true;
             }
             WM_SIZE => {
-                if hwnd == app.settings_window {
+                if hwnd == app.speech_window {
+                    layout_speech_settings(hwnd);
+                } else if hwnd == app.settings_window {
                     layout_settings(app);
                 } else if hwnd == app.result_window {
                     layout_result(app);
@@ -1790,11 +1868,18 @@ unsafe extern "system" fn window_proc(
                 layout_settings(app);
                 handled = true;
             }
-            WM_GETMINMAXINFO if hwnd == app.result_window => {
+            WM_GETMINMAXINFO if hwnd == app.result_window || hwnd == app.settings_window => {
                 let info = &mut *(lparam as *mut MINMAXINFO);
                 let dpi = dpi(hwnd);
                 info.ptMinTrackSize = POINT {
-                    x: scaled(400, dpi),
+                    x: scaled(
+                        if hwnd == app.settings_window {
+                            600
+                        } else {
+                            400
+                        },
+                        dpi,
+                    ),
                     y: scaled(480, dpi),
                 };
                 handled = true;
@@ -1822,6 +1907,8 @@ unsafe extern "system" fn window_proc(
                     refresh_icon_preview(app);
                 } else if hwnd == app.inline_window {
                     layout_inline(app);
+                } else if hwnd == app.speech_window {
+                    layout_speech_settings(hwnd);
                 } else {
                     layout_chip(app);
                 }
@@ -1899,6 +1986,8 @@ unsafe fn command(app: &mut App, id: u16) {
         ID_RETRY => {
             if app.streaming {
                 stop_translation(app);
+            } else if app.manual_mode {
+                manual_ui::submit(app, true);
             } else if !app.active_text.is_empty() {
                 let text = app.active_text.clone();
                 let inline = app.inline_active;
@@ -1928,6 +2017,11 @@ unsafe fn command(app: &mut App, id: u16) {
             let visible = !KEY_VISIBLE.get();
             set_api_key_visibility(app, visible);
         }
+        ID_MANUAL_WINDOW => manual_ui::open(app),
+        ID_TRANSLATE_INPUT => manual_ui::submit(app, false),
+        ID_SPEECH_SETTINGS => speech_ui::show(app, false),
+        ID_SPEECH_APPLY => speech_ui::save(app),
+        ID_SPEECH_CLOSE => speech_ui::close(app),
         ID_SPEAK => toggle_speech(app),
         ID_POLISH => conversation_ui::polish(app),
         ID_COPY_MARKDOWN => {
@@ -2015,10 +2109,7 @@ unsafe fn command(app: &mut App, id: u16) {
             }
         }
         ID_SAVE => {
-            match read_settings(app).and_then(|settings| {
-                config::save(&settings)?;
-                Ok(settings)
-            }) {
+            match read_settings(app).and_then(|settings| manual_ui::save_settings(app, settings)) {
                 Ok(settings) => {
                     if settings.base_url != app.settings.base_url
                         || settings.model != app.settings.model
@@ -2033,6 +2124,8 @@ unsafe fn command(app: &mut App, id: u16) {
                         app.latest_translation
                             .store(app.generation, Ordering::Release);
                         app.streaming = false;
+                        app.active_started = None;
+                        translation_status(app, "已停止，请重新翻译");
                     }
                     app.test_generation += 1;
                     app.latest_test
@@ -2063,7 +2156,7 @@ unsafe fn command(app: &mut App, id: u16) {
                     conversation_ui::refresh(app);
                     update_mode_hint(app);
                     refresh_translation_actions(app);
-                    set_text(app.settings_ui.status, "设置已保存 · 已立即生效");
+                    set_text(app.settings_ui.status, "");
                     enqueue_notice(app, Notice::Saved);
                 }
                 Err(error) => set_text(app.settings_ui.status, &error),
@@ -2129,7 +2222,7 @@ unsafe fn reset_automatic(app: &mut App) {
     KillTimer(app.main, TIMER_SELECTION);
     KillTimer(app.main, TIMER_CHIP);
     ShowWindow(app.chip, SW_HIDE);
-    if !app.window_pinned {
+    if !app.window_pinned && !app.manual_mode {
         ShowWindow(app.result_window, SW_HIDE);
     }
     app.chip_deadline = None;
@@ -2149,7 +2242,7 @@ unsafe fn reset_automatic(app: &mut App) {
     app.compatibility_attempted = false;
     // Keep the network model alive for cache/in-flight reuse. Detach its view
     // immediately so an older stream cannot paint over a new selection.
-    app.display_pending = !app.window_pinned;
+    app.display_pending = !app.window_pinned && !app.manual_mode;
     conversation_ui::refresh(app);
 }
 
@@ -2255,13 +2348,37 @@ unsafe fn present_translation(app: &mut App, inline: bool, point: POINT) {
     app.inline_active = inline;
     if inline {
         ShowWindow(app.result_window, SW_HIDE);
-        position_near(app.inline_window, point, INLINE_WIDTH, INLINE_HEIGHT);
+        if !app.inline_positioned {
+            position_near(app.inline_window, point, INLINE_WIDTH, INLINE_HEIGHT);
+            app.inline_positioned = true;
+        }
+        SetWindowPos(
+            app.inline_window,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
         layout_inline(app);
         ShowWindow(app.inline_window, SW_SHOWNOACTIVATE);
         SetTimer(app.main, TIMER_CHIP, 200, None);
     } else {
         ShowWindow(app.inline_window, SW_HIDE);
-        position_near(app.result_window, point, RESULT_WIDTH, RESULT_HEIGHT);
+        if !app.result_positioned {
+            position_near(app.result_window, point, RESULT_WIDTH, RESULT_HEIGHT);
+            app.result_positioned = true;
+        }
+        SetWindowPos(
+            app.result_window,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
         layout_result(app);
         ShowWindow(app.result_window, SW_SHOWNOACTIVATE);
     }
@@ -2272,6 +2389,10 @@ unsafe fn close_inline(app: &mut App) {
 }
 
 unsafe fn close_translation(app: &mut App) {
+    ShowWindow(app.result_window, SW_HIDE);
+    manual_ui::leave(app);
+    app.inline_positioned = false;
+    app.result_positioned = false;
     app.window_pinned = false;
     conversation_ui::reset(app);
     ShowWindow(app.inline_window, SW_HIDE);
@@ -2322,20 +2443,7 @@ unsafe fn selected_mode(app: &App) -> config::SelectionMode {
 unsafe fn update_mode_hint(app: &App) {
     EnableWindow(app.settings_ui.mode, AUTO_CHECKED.get() as i32);
     EnableWindow(app.settings_ui.compatibility, AUTO_CHECKED.get() as i32);
-    let hint = if !AUTO_CHECKED.get() {
-        "自动划词已关闭 · Ctrl+Alt+T 仍可用"
-    } else if COMPATIBILITY_CHECKED.get() {
-        if selected_mode(app) == config::SelectionMode::Direct {
-            "选区自动发送 · 临时复制后尝试恢复剪贴板"
-        } else {
-            "临时复制后尝试恢复 · 点击图标才发送"
-        }
-    } else if selected_mode(app) == config::SelectionMode::Direct {
-        "选区将自动发送至翻译服务"
-    } else {
-        "点击图标后才发送选区"
-    };
-    set_text(app.settings_ui.status, hint);
+    set_text(app.settings_ui.status, "");
 }
 
 unsafe fn request_capture(app: &mut App, kind: CaptureKind, point: POINT) {
@@ -2542,7 +2650,7 @@ unsafe fn drain_events(app: &mut App) {
                         DRAFT_ICON_COLOR.set(color);
                         refresh_icon_preview(app);
                     }
-                    Ok(None) => set_text(app.appearance_ui.status, "已取消取色，颜色保持不变。"),
+                    Ok(None) => set_text(app.appearance_ui.status, ""),
                     Err(error) => set_text(app.appearance_ui.status, &error),
                 }
             }
@@ -2551,7 +2659,7 @@ unsafe fn drain_events(app: &mut App) {
                 let percent = received.saturating_mul(100).checked_div(total).unwrap_or(0);
                 set_text(
                     app.settings_ui.update_status,
-                    &format!("正在下载更新 · {}%", percent.min(100)),
+                    &format!("下载 {}%", percent.min(100)),
                 );
             }
             Event::UpdateDownloaded(result) => update_ui::downloaded(app, result),
@@ -2561,6 +2669,7 @@ unsafe fn drain_events(app: &mut App) {
 }
 
 unsafe fn start_translation(app: &mut App, text: String, source: &str, point: POINT) {
+    manual_ui::leave(app);
     start_translation_in(app, text, source, point, false);
 }
 
@@ -2661,6 +2770,12 @@ unsafe fn start_translation_request(
 }
 
 unsafe fn show_error(app: &mut App, error: &str, point: POINT) {
+    if app.manual_mode {
+        translation_status(app, error);
+        ShowWindow(app.result_window, SW_RESTORE);
+        SetForegroundWindow(app.result_window);
+        return;
+    }
     app.active_text.clear();
     conversation_ui::reset(app);
     app.display_pending = false;
@@ -2677,7 +2792,10 @@ unsafe fn show_error(app: &mut App, error: &str, point: POINT) {
         app.result_ui.status,
         "也可手动复制文字，再右击托盘选择“翻译剪贴板”",
     );
-    position_near(app.result_window, point, RESULT_WIDTH, RESULT_HEIGHT);
+    if !app.result_positioned {
+        position_near(app.result_window, point, RESULT_WIDTH, RESULT_HEIGHT);
+        app.result_positioned = true;
+    }
     layout_result(app);
     ShowWindow(app.result_window, SW_SHOWNOACTIVATE);
 }
@@ -2713,6 +2831,19 @@ unsafe fn translation_copy_enabled(app: &mut App, enabled: bool) {
 
 unsafe fn show_settings(app: &mut App) {
     cancel_automatic(app);
+    if IsWindowVisible(app.speech_window) != 0 {
+        SetForegroundWindow(app.speech_window);
+        return;
+    }
+    SetWindowPos(
+        app.result_window,
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
     if IsWindowVisible(app.appearance_window) != 0 {
         SetForegroundWindow(app.appearance_window);
         return;
@@ -2722,7 +2853,14 @@ unsafe fn show_settings(app: &mut App) {
         app.settings_scroll = 0;
         fill_settings(app);
     }
-    position_centered(app.settings_window, SETTINGS_WIDTH, SETTINGS_HEIGHT);
+    let mut settings_rect: RECT = zeroed();
+    GetWindowRect(app.settings_window, &mut settings_rect);
+    let scale = dpi(app.settings_window) as i32;
+    position_centered(
+        app.settings_window,
+        ((settings_rect.right - settings_rect.left) * 96 / scale).max(600),
+        ((settings_rect.bottom - settings_rect.top) * 96 / scale).max(480),
+    );
     layout_settings(app);
     ShowWindow(app.settings_window, SW_RESTORE);
     SetForegroundWindow(app.settings_window);
@@ -2783,6 +2921,7 @@ unsafe fn apply_visual_theme(app: &mut App, mode: config::ThemeMode, preset: con
         app.result_window,
         app.inline_window,
         app.appearance_window,
+        app.speech_window,
     ] {
         theme::apply_window(window, mode, preset);
         EnumChildWindows(window, Some(retheme_child), 0);
@@ -2797,18 +2936,7 @@ unsafe fn apply_visual_theme(app: &mut App, mode: config::ThemeMode, preset: con
             "切换到暗夜模式"
         },
     );
-    set_text(
-        app.settings_ui.status,
-        &format!(
-            "已应用{} · {} · 已保存",
-            preset.label(),
-            if mode == config::ThemeMode::Dark {
-                "暗夜"
-            } else {
-                "白天"
-            }
-        ),
-    );
+    set_text(app.settings_ui.status, "");
 }
 
 unsafe extern "system" fn retheme_child(window: HWND, _data: LPARAM) -> BOOL {
@@ -2875,6 +3003,7 @@ fn shape_index(shape: config::IconShape) -> usize {
         config::IconShape::Rounded => 0,
         config::IconShape::Square => 1,
         config::IconShape::Circle => 2,
+        config::IconShape::Leaf => 3,
     }
 }
 
@@ -2882,6 +3011,7 @@ unsafe fn selected_icon_shape(app: &App) -> config::IconShape {
     match SendMessageW(app.appearance_ui.shape, CB_GETCURSEL, 0, 0) {
         1 => config::IconShape::Square,
         2 => config::IconShape::Circle,
+        3 => config::IconShape::Leaf,
         _ => config::IconShape::Rounded,
     }
 }
@@ -2898,6 +3028,10 @@ unsafe fn selected_icon_size(app: &App) -> Result<u32, String> {
 }
 
 unsafe fn show_appearance(app: &mut App) {
+    if IsWindowVisible(app.speech_window) != 0 {
+        SetForegroundWindow(app.speech_window);
+        return;
+    }
     cancel_automatic(app);
     SendMessageW(
         app.appearance_ui.shape,
@@ -2956,7 +3090,7 @@ unsafe fn refresh_icon_preview(app: &mut App) {
                 app.appearance_ui.color,
                 &format!("#{:06X}", DRAFT_ICON_COLOR.get()),
             );
-            set_text(app.appearance_ui.status, "预览已更新，点击应用保存。");
+            set_text(app.appearance_ui.status, "");
         }
         Err(error) => set_text(app.appearance_ui.status, &error),
     }
@@ -3011,7 +3145,7 @@ unsafe fn apply_appearance(app: &mut App) {
     set_text(
         app.appearance_ui.status,
         if notified {
-            "已应用并保存，重启后继续使用。"
+            ""
         } else {
             "已保存，托盘将在资源管理器刷新后更新。"
         },
@@ -3034,6 +3168,10 @@ unsafe fn pick_icon_color(owner: HWND, rgb: u32) -> Option<u32> {
 }
 
 unsafe fn fill_settings(app: &App) {
+    set_text(
+        GetDlgItem(app.settings_window, ID_MANUAL_HOTKEY as i32),
+        &app.settings.manual_hotkey.label(),
+    );
     update_preset_controls(app);
     mask_api_key(app);
     update_pause_ui(app);
@@ -3094,6 +3232,10 @@ unsafe fn fill_settings(app: &App) {
 
 unsafe fn read_settings(app: &App) -> Result<config::Settings, String> {
     let settings = config::Settings {
+        manual_hotkey: config::Hotkey::parse(&text(GetDlgItem(
+            app.settings_window,
+            ID_MANUAL_HOTKEY as i32,
+        )))?,
         base_url: text(app.settings_ui.base).trim().into(),
         api_key: text(app.settings_ui.key).trim().into(),
         model: text(app.settings_ui.model).trim().into(),
@@ -3122,6 +3264,12 @@ unsafe fn tray_menu(app: &App) -> u16 {
         MF_STRING,
         ID_CLIPBOARD as usize,
         wide("翻译剪贴板").as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_MANUAL_WINDOW as usize,
+        wide("手动翻译").as_ptr(),
     );
     AppendMenuW(
         menu,

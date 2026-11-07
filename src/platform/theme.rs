@@ -150,7 +150,7 @@ impl Theme {
         FillRect(dc, &bounds, self.card);
         let diameter = scale(info.hwndItem, 8);
         SelectObject(dc, GetStockObject(NULL_PEN));
-        if !disabled && (selected || pressed || hot) {
+        if !disabled && (selected || pressed || hot || focused) {
             SelectObject(dc, if pressed { self.surface } else { self.raised });
             RoundRect(
                 dc,
@@ -178,18 +178,16 @@ impl Theme {
             );
         }
         if focused && !disabled {
-            let inset = scale(info.hwndItem, 2);
-            SelectObject(dc, self.accent_pen);
-            SelectObject(dc, GetStockObject(NULL_BRUSH));
-            RoundRect(
-                dc,
-                bounds.left + inset,
-                bounds.top + inset,
-                bounds.right - inset,
-                bounds.bottom - inset,
-                diameter,
-                diameter,
-            );
+            // A short cue keeps keyboard focus visible without framing the row.
+            let left = bounds.left + scale(info.hwndItem, 20);
+            let bottom = bounds.bottom - scale(info.hwndItem, 6);
+            let cue = RECT {
+                left,
+                top: bottom - scale(info.hwndItem, 2),
+                right: left + scale(info.hwndItem, 18),
+                bottom,
+            };
+            FillRect(dc, &cue, self.accent);
         }
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(
@@ -234,11 +232,13 @@ impl Theme {
         let pressed = info.itemState & ODS_SELECTED != 0;
         let hot = info.itemState & ODS_HOTLIGHT != 0;
         let focused = info.itemState & ODS_FOCUS != 0;
-        let card = GdiObject(CreateSolidBrush(color(if (hot || pressed) && !disabled {
-            colors.raised
-        } else {
-            colors.card
-        })));
+        let card = GdiObject(CreateSolidBrush(color(
+            if (hot || pressed || focused) && !disabled {
+                colors.raised
+            } else {
+                colors.card
+            },
+        )));
         let outline = GdiObject(CreatePen(
             PS_SOLID,
             scale(info.hwndItem, 1),
@@ -249,7 +249,6 @@ impl Theme {
             }),
         ));
         let title_font = sized_font(font, info.hwndItem, 16, FW_SEMIBOLD as i32);
-        let detail_font = sized_font(font, info.hwndItem, 13, FW_NORMAL as i32);
         if card.0.is_null() || outline.0.is_null() {
             return;
         }
@@ -260,7 +259,14 @@ impl Theme {
         let bounds = info.rcItem;
         FillRect(dc, &bounds, self.background);
         SelectObject(dc, card.0);
-        SelectObject(dc, outline.0);
+        SelectObject(
+            dc,
+            if selected && !disabled {
+                outline.0
+            } else {
+                GetStockObject(NULL_PEN)
+            },
+        );
         let gap = scale(info.hwndItem, 2);
         let rect = RECT {
             left: bounds.left + gap,
@@ -306,9 +312,9 @@ impl Theme {
         );
         let mut title = RECT {
             left: rect.left + scale(info.hwndItem, 16),
-            top: rect.top + scale(info.hwndItem, 34),
+            top: rect.top + scale(info.hwndItem, 38),
             right: rect.right - scale(info.hwndItem, 12),
-            bottom: rect.top + scale(info.hwndItem, 60),
+            bottom: rect.bottom - scale(info.hwndItem, 12),
         };
         DrawTextW(
             dc,
@@ -316,34 +322,6 @@ impl Theme {
             -1,
             &mut title,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-        SelectObject(
-            dc,
-            if detail_font.0.is_null() {
-                font
-            } else {
-                detail_font.0
-            },
-        );
-        SetTextColor(
-            dc,
-            color(if !disabled && (hot || pressed) {
-                colors.text
-            } else {
-                colors.muted
-            }),
-        );
-        let mut detail = RECT {
-            top: rect.top + scale(info.hwndItem, 64),
-            bottom: rect.bottom - scale(info.hwndItem, 8),
-            ..title
-        };
-        DrawTextW(
-            dc,
-            wide(preset.subtitle()).as_ptr(),
-            -1,
-            &mut detail,
-            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
         if selected {
             SelectObject(dc, outline.0);
@@ -365,19 +343,17 @@ impl Theme {
             ];
             Polyline(dc, points.as_ptr(), points.len() as i32);
         }
-        if focused && !disabled {
-            SelectObject(dc, self.accent_pen);
-            SelectObject(dc, GetStockObject(NULL_BRUSH));
-            let inset = scale(info.hwndItem, 4);
-            RoundRect(
-                dc,
-                rect.left + inset,
-                rect.top + inset,
-                rect.right - inset,
-                rect.bottom - inset,
-                diameter - inset,
-                diameter - inset,
-            );
+        if focused && !disabled && !selected {
+            // The one selected outline is never duplicated by a focus rectangle.
+            let left = rect.left + scale(info.hwndItem, 16);
+            let bottom = rect.bottom - scale(info.hwndItem, 8);
+            let cue = RECT {
+                left,
+                top: bottom - scale(info.hwndItem, 2),
+                right: left + scale(info.hwndItem, 18),
+                bottom,
+            };
+            FillRect(dc, &cue, self.accent);
         }
         // Restore selected objects before RAII releases the temporary GDI handles.
         RestoreDC(dc, saved);
@@ -412,11 +388,15 @@ impl Theme {
             self.surface
         };
         let pen = if focused && !disabled {
-            self.accent_pen
+            if primary {
+                self.check_pen
+            } else {
+                self.accent_pen
+            }
         } else if primary && !disabled {
             self.primary_pen
         } else {
-            self.border_pen
+            GetStockObject(NULL_PEN)
         };
         let mut rect = info.rcItem;
         FillRect(dc, &rect, self.control_backdrop(info.hwndItem));
@@ -432,33 +412,6 @@ impl Theme {
             radius,
             radius,
         );
-        if focused && !disabled {
-            let inset = scale(info.hwndItem, 3);
-            let focus_rect = RECT {
-                left: rect.left + inset,
-                top: rect.top + inset,
-                right: rect.right - inset,
-                bottom: rect.bottom - inset,
-            };
-            SelectObject(dc, GetStockObject(NULL_BRUSH));
-            SelectObject(
-                dc,
-                if primary {
-                    self.check_pen
-                } else {
-                    self.accent_pen
-                },
-            );
-            RoundRect(
-                dc,
-                focus_rect.left,
-                focus_rect.top,
-                focus_rect.right - 1,
-                focus_rect.bottom - 1,
-                radius,
-                radius,
-            );
-        }
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(
             dc,

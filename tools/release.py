@@ -24,11 +24,11 @@ REQUIRED_DOCUMENTS = (
     "docs/windows-validation.md",
 )
 OPTIONAL_DOCUMENTS = (
-    "docs/images/settings-dark-0.9.0.png",
-    "docs/images/markdown-0.9.0.png",
-    "docs/images/appearance-0.9.0.png",
-    "docs/images/settings-200pct-0.9.0.png",
-    "docs/design-0.9.0.md",
+    "docs/images/settings-dark-0.10.0.png",
+    "docs/images/markdown-0.10.0.png",
+    "docs/images/appearance-0.10.0.png",
+    "docs/images/settings-200pct-0.10.0.png",
+    "docs/design-0.10.0.md",
 )
 
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)

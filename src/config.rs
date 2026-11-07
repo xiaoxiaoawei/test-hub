@@ -8,14 +8,14 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 const SETTINGS_VERSION: u32 = 1;
-const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_CONFIG_BYTES: u64 = 128 * 1024;
 
 /// Runtime icon appearance. The executable's embedded file icon is unchanged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IconStyle {
-    Leaf,
     #[default]
+    Leaf,
     Translate,
     Letter,
 }
@@ -24,10 +24,11 @@ pub enum IconStyle {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IconShape {
-    #[default]
     Rounded,
     Square,
     Circle,
+    #[default]
+    Leaf,
 }
 
 /// Action taken after selecting text while automatic selection is enabled.
@@ -173,12 +174,204 @@ pub const TARGET_LANGUAGES: &[Language] = &[
     Language::Italian,
 ];
 
+/// A manual-translation shortcut, stored independently of the fixed selection
+/// shortcut Ctrl+Alt+T. Modifiers use Win32's portable ALT/CONTROL/SHIFT/WIN bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hotkey {
+    pub modifiers: u32,
+    pub virtual_key: u32,
+}
+
+impl Default for Hotkey {
+    fn default() -> Self {
+        Self {
+            modifiers: 0x0001 | 0x0002,
+            virtual_key: 0x20,
+        }
+    }
+}
+
+impl Hotkey {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let mut modifiers = 0;
+        let mut virtual_key = None;
+        for part in value.split('+').map(str::trim) {
+            if part.is_empty() {
+                return Err("快捷键格式无效，例如 Ctrl+Alt+Space。".into());
+            }
+            let upper = part.to_ascii_uppercase();
+            let modifier = match upper.as_str() {
+                "CTRL" | "CONTROL" => Some(0x0002),
+                "ALT" => Some(0x0001),
+                "SHIFT" => Some(0x0004),
+                "WIN" | "WINDOWS" | "META" => Some(0x0008),
+                _ => None,
+            };
+            if let Some(modifier) = modifier {
+                if modifiers & modifier != 0 {
+                    return Err("快捷键不能重复修饰键。".into());
+                }
+                modifiers |= modifier;
+                continue;
+            }
+            if virtual_key.is_some() {
+                return Err("快捷键只能包含一个主键。".into());
+            }
+            let key = if matches!(upper.as_str(), "SPACE" | "SPACEBAR" | "空格") {
+                0x20
+            } else if upper.len() == 1 && upper.as_bytes()[0].is_ascii_alphanumeric() {
+                u32::from(upper.as_bytes()[0])
+            } else if let Some(function) = upper.strip_prefix('F') {
+                let number = function
+                    .parse::<u32>()
+                    .map_err(|_| "快捷键主键无效。".to_owned())?;
+                if !(1..=12).contains(&number) {
+                    return Err("功能键仅支持 F1–F12。".into());
+                }
+                0x70 + number - 1
+            } else {
+                return Err("主键支持字母、数字、Space 或 F1–F12。".into());
+            };
+            virtual_key = Some(key);
+        }
+        let hotkey = Self {
+            modifiers,
+            virtual_key: virtual_key.ok_or_else(|| "请填写快捷键主键。".to_owned())?,
+        };
+        hotkey.validate()?;
+        Ok(hotkey)
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.modifiers & !0x000f != 0 || self.modifiers & (0x0001 | 0x0002 | 0x0008) == 0 {
+            return Err("快捷键至少需要 Ctrl、Alt 或 Win 修饰键。".into());
+        }
+        if !(self.virtual_key == 0x20
+            || (u32::from(b'A')..=u32::from(b'Z')).contains(&self.virtual_key)
+            || (u32::from(b'0')..=u32::from(b'9')).contains(&self.virtual_key)
+            || (0x70..=0x7b).contains(&self.virtual_key))
+        {
+            return Err("主键支持字母、数字、Space 或 F1–F12。".into());
+        }
+        if self.modifiers == 0x0003 && self.virtual_key == u32::from(b'T') {
+            return Err("Ctrl+Alt+T 已用于翻译选区，请选择其他快捷键。".into());
+        }
+        if (self.modifiers & 0x0008 != 0 && self.virtual_key == u32::from(b'L'))
+            || (self.modifiers == 0x0001 && self.virtual_key == 0x73)
+        {
+            return Err("此快捷键由 Windows 保留，请选择其他组合。".into());
+        }
+        Ok(())
+    }
+
+    pub fn label(self) -> String {
+        let mut parts = Vec::new();
+        for (flag, name) in [
+            (0x0002, "Ctrl"),
+            (0x0001, "Alt"),
+            (0x0004, "Shift"),
+            (0x0008, "Win"),
+        ] {
+            if self.modifiers & flag != 0 {
+                parts.push(name.to_owned());
+            }
+        }
+        parts.push(match self.virtual_key {
+            0x20 => "Space".into(),
+            0x70..=0x7b => format!("F{}", self.virtual_key - 0x70 + 1),
+            key => char::from_u32(key).map_or_else(|| "?".to_owned(), |key| key.to_string()),
+        });
+        parts.join(" + ")
+    }
+}
+
+/// A separate online speech service. Translation credentials are deliberately
+/// absent from this value unless the user independently enters the same key.
+#[derive(Clone)]
+pub struct SpeechSettings {
+    pub base_url: String,
+    pub model: String,
+    pub voice: String,
+    pub api_key: String,
+    pub timeout_seconds: u32,
+}
+
+impl Default for SpeechSettings {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: default_speech_model(),
+            voice: default_speech_voice(),
+            api_key: String::new(),
+            timeout_seconds: default_timeout(),
+        }
+    }
+}
+
+impl fmt::Debug for SpeechSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpeechSettings")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("voice", &self.voice)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "(empty)"
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
+impl SpeechSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.base_url.trim().is_empty() {
+            return Err("请先配置朗读接口。".into());
+        }
+        parse_speech_endpoint(&self.base_url)?;
+        validate_speech_identifier(&self.model, "朗读模型", true)?;
+        validate_speech_identifier(&self.voice, "朗读音色", true)?;
+        validate_speech_key(&self.api_key)?;
+        if !(1..=120).contains(&self.timeout_seconds) {
+            return Err("朗读超时必须为 1–120 秒。".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_speech_identifier(value: &str, name: &str, required: bool) -> Result<(), String> {
+    if value.chars().count() > 256
+        || value.chars().any(char::is_control)
+        || (required && value.trim().is_empty())
+    {
+        return Err(format!("请填写有效的{name}（最多 256 个字符）。"));
+    }
+    Ok(())
+}
+
+fn validate_speech_key(value: &str) -> Result<(), String> {
+    if value.len() > 8192 || value.chars().any(char::is_control) {
+        return Err("朗读 API Key 格式无效。".into());
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub base_url: String,
     pub model: String,
     pub timeout_seconds: u32,
     pub api_key: String,
+    pub speech_base_url: String,
+    pub speech_model: String,
+    pub speech_voice: String,
+    pub speech_api_key: String,
+    pub manual_hotkey: Hotkey,
     /// Overall switch for automatic text-selection translation.
     pub selection_button: bool,
     pub selection_mode: SelectionMode,
@@ -203,6 +396,11 @@ impl Default for Settings {
             model: "gpt-4o-mini".into(),
             timeout_seconds: 20,
             api_key: String::new(),
+            speech_base_url: String::new(),
+            speech_model: default_speech_model(),
+            speech_voice: default_speech_voice(),
+            speech_api_key: String::new(),
+            manual_hotkey: Hotkey::default(),
             selection_button: true,
             selection_mode: SelectionMode::default(),
             compatibility_capture: false,
@@ -234,6 +432,18 @@ impl fmt::Debug for Settings {
                     "[REDACTED]"
                 },
             )
+            .field("speech_base_url", &self.speech_base_url)
+            .field("speech_model", &self.speech_model)
+            .field("speech_voice", &self.speech_voice)
+            .field(
+                "speech_api_key",
+                &if self.speech_api_key.is_empty() {
+                    "(empty)"
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("manual_hotkey", &self.manual_hotkey)
             .field("selection_button", &self.selection_button)
             .field("selection_mode", &self.selection_mode)
             .field("compatibility_capture", &self.compatibility_capture)
@@ -250,6 +460,16 @@ impl fmt::Debug for Settings {
 }
 
 impl Settings {
+    pub fn speech_settings(&self) -> SpeechSettings {
+        SpeechSettings {
+            base_url: self.speech_base_url.clone(),
+            model: self.speech_model.clone(),
+            voice: self.speech_voice.clone(),
+            api_key: self.speech_api_key.clone(),
+            timeout_seconds: self.timeout_seconds,
+        }
+    }
+
     /// A key-free preset for the official DeepSeek OpenAI-compatible API.
     /// Selecting a preset must not carry a credential over from another service.
     pub fn deepseek() -> Self {
@@ -263,6 +483,13 @@ impl Settings {
 
     pub fn validate(&self) -> Result<(), String> {
         parse_endpoint(&self.base_url)?;
+        self.manual_hotkey.validate()?;
+        if !self.speech_base_url.trim().is_empty() {
+            parse_speech_endpoint(&self.speech_base_url)?;
+        }
+        validate_speech_identifier(&self.speech_model, "朗读模型", false)?;
+        validate_speech_identifier(&self.speech_voice, "朗读音色", false)?;
+        validate_speech_key(&self.speech_api_key)?;
         if self.target_language == Language::Auto {
             return Err("目标语言不能选择自动检测。".into());
         }
@@ -310,7 +537,13 @@ fn default_target_language() -> Language {
     Language::SimplifiedChinese
 }
 fn default_icon_color() -> u32 {
-    0xD6_A5_75
+    0x19_A9_7C
+}
+fn default_speech_model() -> String {
+    "tts-1".into()
+}
+fn default_speech_voice() -> String {
+    "alloy".into()
 }
 fn default_icon_size() -> u32 {
     32
@@ -349,11 +582,27 @@ struct StoredSettings {
     #[serde(default = "default_icon_color")]
     icon_color: u32,
     #[serde(default)]
+    icon_defaults_version: u32,
+    #[serde(default)]
     api_key_encrypted: Vec<u8>,
+    #[serde(default)]
+    speech_base_url: String,
+    #[serde(default = "default_speech_model")]
+    speech_model: String,
+    #[serde(default = "default_speech_voice")]
+    speech_voice: String,
+    #[serde(default)]
+    speech_api_key_encrypted: Vec<u8>,
+    #[serde(default)]
+    manual_hotkey: Hotkey,
 }
 
 impl StoredSettings {
-    fn from_settings(settings: &Settings, encrypted_key: Vec<u8>) -> Self {
+    fn from_settings(
+        settings: &Settings,
+        encrypted_key: Vec<u8>,
+        encrypted_speech_key: Vec<u8>,
+    ) -> Self {
         Self {
             version: SETTINGS_VERSION,
             base_url: settings.base_url.trim().trim_end_matches('/').to_owned(),
@@ -370,14 +619,32 @@ impl StoredSettings {
             icon_shape: settings.icon_shape,
             icon_size: settings.icon_size,
             icon_color: settings.icon_color,
+            icon_defaults_version: 1,
             api_key_encrypted: encrypted_key,
+            speech_base_url: settings
+                .speech_base_url
+                .trim()
+                .trim_end_matches('/')
+                .to_owned(),
+            speech_model: settings.speech_model.trim().to_owned(),
+            speech_voice: settings.speech_voice.trim().to_owned(),
+            speech_api_key_encrypted: encrypted_speech_key,
+            manual_hotkey: settings.manual_hotkey,
         }
     }
 
-    fn into_settings(self, api_key: String) -> Result<Settings, String> {
+    fn into_settings(self, api_key: String, speech_api_key: String) -> Result<Settings, String> {
         if self.version != SETTINGS_VERSION {
             return Err("设置文件版本不受支持，请使用匹配的应用版本。".into());
         }
+        // Earlier clients had no marker distinguishing their factory icon.
+        // Only the complete old tuple is migrated; every customized tuple and
+        // every value explicitly saved by this version remains untouched.
+        let migrate_factory_icon = self.icon_defaults_version == 0
+            && self.icon_style == IconStyle::Translate
+            && self.icon_shape == IconShape::Rounded
+            && self.icon_color == 0xD6_A5_75
+            && self.icon_size == 32;
         let settings = Settings {
             base_url: self.base_url,
             model: self.model,
@@ -389,11 +656,28 @@ impl StoredSettings {
             theme_preset: self.theme_preset,
             source_language: self.source_language,
             target_language: self.target_language,
-            icon_style: self.icon_style,
-            icon_shape: self.icon_shape,
+            icon_style: if migrate_factory_icon {
+                IconStyle::Leaf
+            } else {
+                self.icon_style
+            },
+            icon_shape: if migrate_factory_icon {
+                IconShape::Leaf
+            } else {
+                self.icon_shape
+            },
             icon_size: self.icon_size,
-            icon_color: self.icon_color,
+            icon_color: if migrate_factory_icon {
+                default_icon_color()
+            } else {
+                self.icon_color
+            },
             api_key,
+            speech_base_url: self.speech_base_url,
+            speech_model: self.speech_model,
+            speech_voice: self.speech_voice,
+            speech_api_key,
+            manual_hotkey: self.manual_hotkey,
         };
         settings.validate()?;
         Ok(settings)
@@ -428,7 +712,13 @@ pub fn load() -> Result<Settings, String> {
     } else {
         unprotect_key(&stored.api_key_encrypted)?
     };
-    stored.into_settings(api_key)
+    let speech_api_key = if stored.speech_api_key_encrypted.is_empty() {
+        String::new()
+    } else {
+        unprotect_key(&stored.speech_api_key_encrypted)
+            .map_err(|_| "无法解密朗读 API Key，请重新填写。".to_owned())?
+    };
+    stored.into_settings(api_key, speech_api_key)
 }
 
 pub fn save(settings: &Settings) -> Result<(), String> {
@@ -438,7 +728,13 @@ pub fn save(settings: &Settings) -> Result<(), String> {
     } else {
         protect_key(settings.api_key.as_bytes())?
     };
-    let stored = StoredSettings::from_settings(settings, encrypted_key);
+    let encrypted_speech_key = if settings.speech_api_key.is_empty() {
+        Vec::new()
+    } else {
+        protect_key(settings.speech_api_key.as_bytes())
+            .map_err(|_| "无法加密朗读 API Key，设置未保存。".to_owned())?
+    };
+    let stored = StoredSettings::from_settings(settings, encrypted_key, encrypted_speech_key);
     let bytes = serde_json::to_vec_pretty(&stored).map_err(|_| "无法生成设置文件。".to_owned())?;
     let path = settings_path()?;
     write_atomically(&path, &bytes)
@@ -615,6 +911,21 @@ pub(crate) struct Endpoint {
 }
 
 pub(crate) fn parse_endpoint(base_url: &str) -> Result<Endpoint, String> {
+    parse_service_endpoint(base_url, "/chat/completions")
+}
+
+pub(crate) fn parse_speech_endpoint(base_url: &str) -> Result<Endpoint, String> {
+    if base_url
+        .trim()
+        .trim_end_matches('/')
+        .ends_with("/chat/completions")
+    {
+        return Err("朗读接口不能使用聊天地址，请填写语音服务 Base URL。".into());
+    }
+    parse_service_endpoint(base_url, "/audio/speech")
+}
+
+fn parse_service_endpoint(base_url: &str, route: &str) -> Result<Endpoint, String> {
     let url = base_url.trim();
     if url.is_empty()
         || url.len() > 2048
@@ -673,13 +984,13 @@ pub(crate) fn parse_endpoint(base_url: &str) -> Result<Endpoint, String> {
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback());
     if !secure && !is_loopback {
-        return Err("远程翻译服务必须使用 HTTPS。HTTP 仅允许 localhost 或回环 IP。".into());
+        return Err("远程服务必须使用 HTTPS。HTTP 仅允许 localhost 或回环 IP。".into());
     }
     let base_path = base_path.trim_end_matches('/');
-    let path = if base_path.ends_with("/chat/completions") {
+    let path = if base_path.ends_with(route) {
         base_path.to_owned()
     } else {
-        format!("{base_path}/chat/completions")
+        format!("{base_path}{route}")
     };
     Ok(Endpoint {
         host,
@@ -715,6 +1026,196 @@ fn valid_hostname(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_shortcuts_roundtrip_and_reject_typing_or_reserved_combinations() {
+        let default = Hotkey::default();
+        assert_eq!(default.label(), "Ctrl + Alt + Space");
+        assert_eq!(Hotkey::parse("ctrl + alt + 空格").unwrap(), default);
+        for (text, modifiers, key) in [
+            ("Ctrl+Shift+J", 0x0006, u32::from(b'J')),
+            ("Alt+9", 0x0001, u32::from(b'9')),
+            ("Win+Shift+F8", 0x000c, 0x77),
+            ("Ctrl+Alt+F12", 0x0003, 0x7b),
+        ] {
+            let hotkey = Hotkey::parse(text).unwrap();
+            assert_eq!(hotkey.modifiers, modifiers);
+            assert_eq!(hotkey.virtual_key, key);
+            assert_eq!(Hotkey::parse(&hotkey.label()).unwrap(), hotkey);
+            assert_eq!(
+                serde_json::from_value::<Hotkey>(serde_json::to_value(hotkey).unwrap()).unwrap(),
+                hotkey
+            );
+        }
+        for text in [
+            "",
+            "Space",
+            "Shift+A",
+            "Ctrl+",
+            "Ctrl+Ctrl+Q",
+            "Ctrl+A+B",
+            "Ctrl+Alt+T",
+            "Win+L",
+            "Alt+F4",
+            "Ctrl+F13",
+            "Ctrl+Tab",
+        ] {
+            assert!(Hotkey::parse(text).is_err(), "accepted shortcut: {text}");
+        }
+        assert!(Hotkey {
+            modifiers: 0x4003,
+            virtual_key: 0x20
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn speech_configuration_is_opt_in_with_an_independent_key_and_audio_route() {
+        let old: StoredSettings = serde_json::from_str(
+            r#"{"version":1,"base_url":"https://api.deepseek.com/v1","model":"deepseek-chat"}"#,
+        )
+        .unwrap();
+        let mut settings = old
+            .into_settings("translation-test-key".into(), String::new())
+            .unwrap();
+        assert!(settings.speech_base_url.is_empty());
+        assert!(settings.speech_api_key.is_empty());
+        assert_eq!(settings.manual_hotkey, Hotkey::default());
+        assert!(settings.validate().is_ok());
+        assert!(settings.speech_settings().validate().is_err());
+        settings.speech_base_url = "https://speech.example/v1/audio/speech/".into();
+        settings.speech_model = "kokoro".into();
+        settings.speech_voice = "zf_xiaobei".into();
+        settings.speech_api_key = "speech-test-only-key".into();
+        let speech = settings.speech_settings();
+        speech.validate().unwrap();
+        assert_eq!(speech.api_key, "speech-test-only-key");
+        assert_eq!(settings.api_key, "translation-test-key");
+        assert_eq!(
+            parse_speech_endpoint(&speech.base_url).unwrap().path,
+            "/v1/audio/speech"
+        );
+        assert_eq!(
+            parse_speech_endpoint("http://127.0.0.1:8880/v1")
+                .unwrap()
+                .path,
+            "/v1/audio/speech"
+        );
+        assert_eq!(
+            parse_endpoint(&settings.base_url).unwrap().path,
+            "/v1/chat/completions"
+        );
+        for invalid in [
+            "http://speech.example/v1",
+            "https://speech.example/v1?key=secret",
+            "https://user:secret@speech.example/v1",
+            "https://speech.example/v1/chat/completions",
+            "https://speech.example/v1#secret",
+        ] {
+            assert!(
+                parse_speech_endpoint(invalid).is_err(),
+                "accepted speech address: {invalid}"
+            );
+        }
+        for change in [0, 1, 2] {
+            let mut invalid = speech.clone();
+            match change {
+                0 => invalid.api_key = "key\r\nHeader:bad".into(),
+                1 => invalid.model.clear(),
+                _ => invalid.voice = "voice\0bad".into(),
+            }
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn translation_and_speech_secrets_remain_separate_and_redacted_in_storage() {
+        let settings = Settings {
+            api_key: "translation-only-test-secret".into(),
+            speech_base_url: "https://speech.example/v1".into(),
+            speech_api_key: "speech-only-test-secret".into(),
+            manual_hotkey: Hotkey::parse("Ctrl+Shift+F7").unwrap(),
+            ..Settings::default()
+        };
+        let stored = StoredSettings::from_settings(&settings, vec![18, 42, 71], vec![9, 8, 7]);
+        let json = serde_json::to_string(&stored).unwrap();
+        let debug = format!("{settings:?} {:?}", settings.speech_settings());
+        for secret in [&settings.api_key, &settings.speech_api_key] {
+            assert!(!json.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+        let stored: StoredSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
+        assert_eq!(stored.speech_api_key_encrypted, [9, 8, 7]);
+        let restored = stored
+            .into_settings(settings.api_key.clone(), settings.speech_api_key.clone())
+            .unwrap();
+        assert_eq!(restored.api_key, settings.api_key);
+        assert_eq!(restored.speech_api_key, settings.speech_api_key);
+        assert_eq!(restored.manual_hotkey, settings.manual_hotkey);
+        assert_eq!(restored.speech_base_url, settings.speech_base_url);
+    }
+
+    #[test]
+    fn legacy_factory_icon_migrates_once_without_replacing_custom_appearance() {
+        let factory = serde_json::json!({"version":1,"base_url":"https://api.deepseek.com/v1","model":"deepseek-chat","icon_style":"translate","icon_shape":"rounded","icon_size":32,"icon_color":0xD6_A5_75});
+        let stored: StoredSettings = serde_json::from_value(factory.clone()).unwrap();
+        assert_eq!(stored.icon_defaults_version, 0);
+        let migrated = stored.into_settings(String::new(), String::new()).unwrap();
+        assert_eq!(migrated.icon_style, IconStyle::Leaf);
+        assert_eq!(migrated.icon_shape, IconShape::Leaf);
+        assert_eq!(migrated.icon_color, 0x19_A9_7C);
+        let stamped = StoredSettings::from_settings(&migrated, vec![], vec![]);
+        assert_eq!(stamped.icon_defaults_version, 1);
+        // A user explicitly choosing the old combination must retain it later.
+        let mut explicit = factory.clone();
+        explicit["icon_defaults_version"] = 1.into();
+        let saved: StoredSettings = serde_json::from_value(explicit).unwrap();
+        let preserved = saved.into_settings(String::new(), String::new()).unwrap();
+        assert_eq!(preserved.icon_style, IconStyle::Translate);
+        assert_eq!(preserved.icon_shape, IconShape::Rounded);
+        assert_eq!(preserved.icon_color, 0xD6_A5_75);
+        for (field, value) in [
+            ("icon_style", serde_json::json!("letter")),
+            ("icon_shape", serde_json::json!("circle")),
+            ("icon_size", serde_json::json!(48)),
+            ("icon_color", serde_json::json!(0x40_48_80)),
+        ] {
+            let mut custom = factory.clone();
+            custom[field] = value.clone();
+            let stored: StoredSettings = serde_json::from_value(custom.clone()).unwrap();
+            let restored = stored.into_settings(String::new(), String::new()).unwrap();
+            let saved =
+                serde_json::to_value(StoredSettings::from_settings(&restored, vec![], vec![]))
+                    .unwrap();
+            assert_eq!(saved[field], value, "custom {field} changed");
+            for original in ["icon_style", "icon_shape", "icon_size", "icon_color"] {
+                assert_eq!(saved[original], custom[original]);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn independent_dpapi_speech_and_translation_keys_roundtrip() {
+        let settings = Settings {
+            api_key: "translation-secret-仅供测试".into(),
+            speech_api_key: "speech-secret-仅供测试".into(),
+            speech_base_url: "https://speech.example/v1".into(),
+            ..Settings::default()
+        };
+        let a = protect_key(settings.api_key.as_bytes()).unwrap();
+        let b = protect_key(settings.speech_api_key.as_bytes()).unwrap();
+        assert_ne!(a, b);
+        let raw = serde_json::to_vec(&StoredSettings::from_settings(&settings, a, b)).unwrap();
+        let stored: StoredSettings = serde_json::from_slice(&raw).unwrap();
+        let a = unprotect_key(&stored.api_key_encrypted).unwrap();
+        let b = unprotect_key(&stored.speech_api_key_encrypted).unwrap();
+        let restored = stored.into_settings(a, b).unwrap();
+        assert_eq!(restored.api_key, settings.api_key);
+        assert_eq!(restored.speech_api_key, settings.speech_api_key);
+    }
 
     #[test]
     fn defaults_are_valid_and_select_to_translate_is_enabled() {
@@ -814,7 +1315,7 @@ mod tests {
             ..Settings::default()
         };
         assert!(!format!("{settings:?}").contains(&settings.api_key));
-        let stored = StoredSettings::from_settings(&settings, vec![18, 42, 71]);
+        let stored = StoredSettings::from_settings(&settings, vec![18, 42, 71], Vec::new());
         let json = serde_json::to_string(&stored).unwrap();
         assert!(!json.contains(&settings.api_key));
         assert!(!json.contains("\"api_key\":"));
@@ -826,7 +1327,7 @@ mod tests {
         let legacy: StoredSettings =
             serde_json::from_str(r#"{"base_url":"https://example.com/v1","model":"test"}"#)
                 .unwrap();
-        let decoded = legacy.into_settings(String::new()).unwrap();
+        let decoded = legacy.into_settings(String::new(), String::new()).unwrap();
         assert!(decoded.selection_button);
         assert_eq!(decoded.timeout_seconds, 20);
         assert_eq!(decoded.selection_mode, SelectionMode::Click);
@@ -834,19 +1335,23 @@ mod tests {
         assert_eq!(decoded.theme_mode, ThemeMode::Dark);
         assert_eq!(decoded.source_language, Language::English);
         assert_eq!(decoded.target_language, Language::SimplifiedChinese);
-        assert_eq!(decoded.icon_style, IconStyle::Translate);
-        assert_eq!(decoded.icon_shape, IconShape::Rounded);
+        assert_eq!(decoded.icon_style, IconStyle::Leaf);
+        assert_eq!(decoded.icon_shape, IconShape::Leaf);
         assert_eq!(decoded.icon_size, 32);
-        assert_eq!(decoded.icon_color, 0xD6_A5_75);
+        assert_eq!(decoded.icon_color, 0x19_A9_7C);
         let settings = Settings {
             selection_button: false,
             timeout_seconds: 60,
             ..Settings::default()
         };
-        let encoded =
-            serde_json::to_vec(&StoredSettings::from_settings(&settings, vec![])).unwrap();
+        let encoded = serde_json::to_vec(&StoredSettings::from_settings(
+            &settings,
+            vec![],
+            Vec::new(),
+        ))
+        .unwrap();
         let stored: StoredSettings = serde_json::from_slice(&encoded).unwrap();
-        let result = stored.into_settings(String::new()).unwrap();
+        let result = stored.into_settings(String::new(), String::new()).unwrap();
         assert!(!result.selection_button);
         assert_eq!(result.timeout_seconds, 60);
     }
@@ -858,17 +1363,17 @@ mod tests {
             r#"{"version":1,"base_url":"https://api.deepseek.com/v1","model":"deepseek-chat","timeout_seconds":30,"selection_button":false,"api_key_encrypted":[]}"#,
         )
         .unwrap();
-        let settings = stored.into_settings(String::new()).unwrap();
+        let settings = stored.into_settings(String::new(), String::new()).unwrap();
         assert_eq!(settings.base_url, "https://api.deepseek.com/v1");
         assert_eq!(settings.model, "deepseek-chat");
         assert_eq!(settings.timeout_seconds, 30);
         assert!(!settings.selection_button);
         assert_eq!(settings.selection_mode, SelectionMode::Click);
         assert!(!settings.compatibility_capture);
-        assert_eq!(settings.icon_style, IconStyle::Translate);
-        assert_eq!(settings.icon_shape, IconShape::Rounded);
+        assert_eq!(settings.icon_style, IconStyle::Leaf);
+        assert_eq!(settings.icon_shape, IconShape::Leaf);
         assert_eq!(settings.icon_size, 32);
-        assert_eq!(settings.icon_color, 0xD6_A5_75);
+        assert_eq!(settings.icon_color, 0x19_A9_7C);
     }
 
     #[test]
@@ -887,7 +1392,9 @@ mod tests {
             });
             let stored: StoredSettings = serde_json::from_value(document).unwrap();
             assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
-            let settings = stored.into_settings("test-only-key".into()).unwrap();
+            let settings = stored
+                .into_settings("test-only-key".into(), String::new())
+                .unwrap();
             assert_eq!(settings.base_url, "https://example.com/v1");
             assert_eq!(settings.model, "custom-model");
             assert_eq!(settings.timeout_seconds, 60);
@@ -896,7 +1403,7 @@ mod tests {
             assert!(!settings.compatibility_capture);
             assert_eq!(settings.icon_style, IconStyle::Leaf);
             assert_eq!(settings.icon_color, 0x12_34_56);
-            assert_eq!(settings.icon_shape, IconShape::Rounded);
+            assert_eq!(settings.icon_shape, IconShape::Leaf);
             assert_eq!(settings.icon_size, 32);
             assert_eq!(settings.api_key, "test-only-key");
         }
@@ -910,7 +1417,9 @@ mod tests {
         )
         .unwrap();
         let encrypted_key = stored.api_key_encrypted.clone();
-        let settings = stored.into_settings("test-only-key".into()).unwrap();
+        let settings = stored
+            .into_settings("test-only-key".into(), String::new())
+            .unwrap();
         assert!(settings.selection_button);
         assert_eq!(settings.selection_mode, SelectionMode::Direct);
         assert!(!settings.compatibility_capture);
@@ -918,7 +1427,7 @@ mod tests {
         assert_eq!(settings.icon_shape, IconShape::Circle);
         assert_eq!(settings.icon_size, 48);
         assert_eq!(settings.icon_color, 0x12_34_56);
-        let saved = StoredSettings::from_settings(&settings, encrypted_key);
+        let saved = StoredSettings::from_settings(&settings, encrypted_key, Vec::new());
         assert!(!saved.compatibility_capture);
         assert_eq!(saved.api_key_encrypted, [18, 42, 71]);
     }
@@ -935,11 +1444,12 @@ mod tests {
             };
             settings.validate().unwrap();
             let encoded =
-                serde_json::to_value(StoredSettings::from_settings(&settings, vec![])).unwrap();
+                serde_json::to_value(StoredSettings::from_settings(&settings, vec![], Vec::new()))
+                    .unwrap();
             assert_eq!(encoded["compatibility_capture"], true);
             assert_eq!(encoded["version"], 1);
             let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
-            let restored = stored.into_settings(String::new()).unwrap();
+            let restored = stored.into_settings(String::new(), String::new()).unwrap();
             assert!(restored.compatibility_capture);
             assert_eq!(restored.selection_mode, mode);
         }
@@ -962,7 +1472,9 @@ mod tests {
         });
         let stored: StoredSettings = serde_json::from_value(legacy).unwrap();
         assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
-        let restored = stored.into_settings("test-only-key".into()).unwrap();
+        let restored = stored
+            .into_settings("test-only-key".into(), String::new())
+            .unwrap();
         assert_eq!(restored.theme_mode, ThemeMode::Dark);
         assert_eq!(restored.base_url, "https://example.com/v1");
         assert_eq!(restored.model, "custom-model");
@@ -994,7 +1506,9 @@ mod tests {
             });
             let stored: StoredSettings = serde_json::from_value(document).unwrap();
             let encrypted = stored.api_key_encrypted.clone();
-            let restored = stored.into_settings("test-only-key".into()).unwrap();
+            let restored = stored
+                .into_settings("test-only-key".into(), String::new())
+                .unwrap();
             assert_eq!(restored.theme_preset, ThemePreset::Amber);
             assert_eq!(restored.theme_mode, expected_mode);
             assert_eq!(restored.base_url, "https://api.deepseek.com/v1");
@@ -1009,7 +1523,7 @@ mod tests {
             assert_eq!(restored.icon_size, 48);
             assert_eq!(restored.icon_color, 0x40_48_80);
             assert_eq!(restored.api_key, "test-only-key");
-            let saved = StoredSettings::from_settings(&restored, encrypted);
+            let saved = StoredSettings::from_settings(&restored, encrypted, Vec::new());
             assert_eq!(saved.version, 1);
             assert_eq!(saved.api_key_encrypted, [18, 42, 71]);
         }
@@ -1048,6 +1562,7 @@ mod tests {
                 let encoded = serde_json::to_value(StoredSettings::from_settings(
                     &original,
                     vec![18, 42, 71],
+                    Vec::new(),
                 ))
                 .unwrap();
                 assert_eq!(encoded["theme_preset"], encoded_name);
@@ -1055,7 +1570,9 @@ mod tests {
                 assert!(encoded.get("api_key").is_none());
                 let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
                 assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
-                let restored = stored.into_settings(original.api_key.clone()).unwrap();
+                let restored = stored
+                    .into_settings(original.api_key.clone(), original.speech_api_key.clone())
+                    .unwrap();
                 assert_eq!(restored.theme_preset, preset);
                 assert_eq!(restored.theme_mode, mode);
                 assert_eq!(restored.base_url, original.base_url);
@@ -1114,14 +1631,19 @@ mod tests {
                 icon_size: 48,
                 ..Settings::default()
             };
-            let encoded =
-                serde_json::to_value(StoredSettings::from_settings(&settings, vec![18, 42, 71]))
-                    .unwrap();
+            let encoded = serde_json::to_value(StoredSettings::from_settings(
+                &settings,
+                vec![18, 42, 71],
+                Vec::new(),
+            ))
+            .unwrap();
             assert_eq!(encoded["theme_mode"], encoded_mode);
             assert_eq!(encoded["version"], SETTINGS_VERSION);
             let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
             assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
-            let restored = stored.into_settings("test-only-key".into()).unwrap();
+            let restored = stored
+                .into_settings("test-only-key".into(), String::new())
+                .unwrap();
             assert_eq!(restored.theme_mode, mode);
             assert_eq!(restored.model, settings.model);
             assert_eq!(restored.selection_mode, settings.selection_mode);
@@ -1152,7 +1674,9 @@ mod tests {
         });
         let stored: StoredSettings = serde_json::from_value(document).unwrap();
         let encrypted = stored.api_key_encrypted.clone();
-        let restored = stored.into_settings("test-only-key".into()).unwrap();
+        let restored = stored
+            .into_settings("test-only-key".into(), String::new())
+            .unwrap();
         assert_eq!(restored.source_language, Language::English);
         assert_eq!(restored.target_language, Language::SimplifiedChinese);
         assert_eq!(restored.base_url, "https://api.deepseek.com/v1");
@@ -1165,7 +1689,7 @@ mod tests {
         assert_eq!(restored.icon_shape, IconShape::Circle);
         assert_eq!(restored.icon_size, 48);
         assert_eq!(restored.icon_color, 0x40_48_80);
-        let saved = StoredSettings::from_settings(&restored, encrypted);
+        let saved = StoredSettings::from_settings(&restored, encrypted, Vec::new());
         assert_eq!(saved.api_key_encrypted, [18, 42, 71]);
         assert_eq!(saved.version, 1);
     }
@@ -1193,6 +1717,7 @@ mod tests {
                 let encoded = serde_json::to_value(StoredSettings::from_settings(
                     &settings,
                     vec![18, 42, 71],
+                    Vec::new(),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -1205,7 +1730,9 @@ mod tests {
                 );
                 let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
                 assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
-                let restored = stored.into_settings("test-only-key".into()).unwrap();
+                let restored = stored
+                    .into_settings("test-only-key".into(), String::new())
+                    .unwrap();
                 assert_eq!(restored.source_language, source);
                 assert_eq!(restored.target_language, target);
                 assert_eq!(restored.theme_mode, ThemeMode::Light);
@@ -1242,8 +1769,8 @@ mod tests {
             ..Settings::default()
         };
         assert!(invalid_target.validate().is_err());
-        let stored = StoredSettings::from_settings(&invalid_target, vec![]);
-        assert!(stored.into_settings(String::new()).is_err());
+        let stored = StoredSettings::from_settings(&invalid_target, vec![], Vec::new());
+        assert!(stored.into_settings(String::new(), String::new()).is_err());
         assert!(serde_json::from_str::<StoredSettings>(
             r#"{"source_language":"unknown-language"}"#
         )
@@ -1265,6 +1792,7 @@ mod tests {
                 (IconShape::Rounded, "rounded"),
                 (IconShape::Square, "square"),
                 (IconShape::Circle, "circle"),
+                (IconShape::Leaf, "leaf"),
             ] {
                 for (mode, mode_name) in [
                     (SelectionMode::Click, "click"),
@@ -1280,9 +1808,12 @@ mod tests {
                             icon_color: color,
                             ..Settings::default()
                         };
-                        let encoded =
-                            serde_json::to_value(StoredSettings::from_settings(&settings, vec![]))
-                                .unwrap();
+                        let encoded = serde_json::to_value(StoredSettings::from_settings(
+                            &settings,
+                            vec![],
+                            Vec::new(),
+                        ))
+                        .unwrap();
                         assert_eq!(encoded["version"], 1);
                         assert_eq!(encoded["icon_style"], name);
                         assert_eq!(encoded["icon_shape"], shape_name);
@@ -1290,7 +1821,7 @@ mod tests {
                         assert_eq!(encoded["icon_color"], color);
                         assert_eq!(encoded["selection_mode"], mode_name);
                         let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
-                        let restored = stored.into_settings(String::new()).unwrap();
+                        let restored = stored.into_settings(String::new(), String::new()).unwrap();
                         assert_eq!(restored.selection_button, selection_button);
                         assert_eq!(restored.selection_mode, mode);
                         assert_eq!(restored.icon_style, style);
@@ -1311,8 +1842,8 @@ mod tests {
                 ..Settings::default()
             };
             assert!(settings.validate().is_err(), "accepted icon size {size}");
-            let stored = StoredSettings::from_settings(&settings, vec![]);
-            assert!(stored.into_settings(String::new()).is_err());
+            let stored = StoredSettings::from_settings(&settings, vec![], Vec::new());
+            assert!(stored.into_settings(String::new(), String::new()).is_err());
         }
         for size in [16, 32, 64] {
             let settings = Settings {
@@ -1320,10 +1851,20 @@ mod tests {
                 ..Settings::default()
             };
             settings.validate().unwrap();
-            let encoded =
-                serde_json::to_vec(&StoredSettings::from_settings(&settings, vec![])).unwrap();
+            let encoded = serde_json::to_vec(&StoredSettings::from_settings(
+                &settings,
+                vec![],
+                Vec::new(),
+            ))
+            .unwrap();
             let stored: StoredSettings = serde_json::from_slice(&encoded).unwrap();
-            assert_eq!(stored.into_settings(String::new()).unwrap().icon_size, size);
+            assert_eq!(
+                stored
+                    .into_settings(String::new(), String::new())
+                    .unwrap()
+                    .icon_size,
+                size
+            );
         }
     }
 
@@ -1335,8 +1876,8 @@ mod tests {
                 ..Settings::default()
             };
             assert!(settings.validate().is_err());
-            let stored = StoredSettings::from_settings(&settings, vec![]);
-            assert!(stored.into_settings(String::new()).is_err());
+            let stored = StoredSettings::from_settings(&settings, vec![], Vec::new());
+            assert!(stored.into_settings(String::new(), String::new()).is_err());
         }
         for color in [0x00_00_00, 0xFF_FF_FF] {
             assert!(Settings {
@@ -1371,7 +1912,7 @@ mod tests {
         .validate()
         .is_err());
         let stored: StoredSettings = serde_json::from_str(r#"{"version":999}"#).unwrap();
-        assert!(stored.into_settings(String::new()).is_err());
+        assert!(stored.into_settings(String::new(), String::new()).is_err());
     }
 
     #[test]

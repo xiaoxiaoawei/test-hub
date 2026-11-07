@@ -8,13 +8,13 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Networking::WinHttp::*;
 
 #[path = "winhttp/asynchronous.rs"]
-mod asynchronous;
+pub(crate) mod asynchronous;
 use asynchronous::Request;
 
-struct HttpHandle(*mut c_void);
+pub(crate) struct HttpHandle(pub(crate) *mut c_void);
 
 impl HttpHandle {
-    fn from_raw(handle: *mut c_void) -> Result<Self, String> {
+    pub(crate) fn from_raw(handle: *mut c_void) -> Result<Self, String> {
         if handle.is_null() {
             Err(network_error())
         } else {

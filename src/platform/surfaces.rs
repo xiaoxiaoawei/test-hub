@@ -40,11 +40,12 @@ struct Colors {
 
 type Geometry = (i32, i32, i32, u32);
 type Layout = (i32, i32, u32, usize);
+type WindowGeometry = (i32, i32, u32, bool, isize, isize);
 
 thread_local! {
     static REGIONS: RefCell<HashMap<usize, Geometry>> = RefCell::new(HashMap::new());
     static LAYOUTS: RefCell<HashMap<usize, Layout>> = RefCell::new(HashMap::new());
-    static WINDOWS: RefCell<HashMap<usize, (i32, i32, u32, bool)>> = RefCell::new(HashMap::new());
+    static WINDOWS: RefCell<HashMap<usize, WindowGeometry>> = RefCell::new(HashMap::new());
     static COLORS: Cell<Colors> = const { Cell::new(Colors { surface: 0x252930, border: 0x3e4959, accent: 0x75a5d6, text: 0xd8e5f1, raised: 0x2c3440 }) };
 }
 
@@ -188,28 +189,31 @@ pub(crate) unsafe fn round_window(window: HWND) {
         return;
     }
     let zoomed = IsZoomed(window) != 0;
+    let style = GetWindowLongPtrW(window, GWL_STYLE);
+    let extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
     let key = (
         bounds.right - bounds.left,
         bounds.bottom - bounds.top,
         GetDpiForWindow(window),
         zoomed,
+        style & (WS_CAPTION | WS_THICKFRAME | WS_POPUP) as isize,
+        extended & WS_EX_LAYERED as isize,
     );
     let unchanged =
         WINDOWS.with(|cache| cache.borrow().get(&(window as usize)).copied() == Some(key));
     if unchanged {
         return;
     }
+    // Commit before SetWindowRgn can synchronously reenter the owner's layout.
     WINDOWS.with(|cache| {
         cache.borrow_mut().insert(window as usize, key);
     });
-    if zoomed {
-        REGIONS.with(|cache| {
-            cache.borrow_mut().remove(&(window as usize));
-        });
-        SetWindowRgn(window, null_mut(), 0);
+    if zoomed || extended & WS_EX_LAYERED as isize != 0 {
+        // Per-pixel icons already own their silhouette. A window region must
+        // never cut a second, rounded-rectangle mask out of that alpha surface.
+        clear_owned_region(window);
         return;
     }
-    let popup = GetWindowLongPtrW(window, GWL_STYLE) & WS_POPUP as isize != 0;
     let preference = windows_sys::Win32::Graphics::Dwm::DWMWCP_ROUND;
     let result = windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
         window,
@@ -224,46 +228,81 @@ pub(crate) unsafe fn round_window(window: HWND) {
         (&mut actual as *mut i32).cast(),
         size_of::<i32>() as u32,
     );
-    // Do not mistake a successful but unimplemented compatibility-layer hint
-    // for a real rounded frame. Native Windows 11 reports the applied preference.
-    if popup
-        || result < 0
-        || readable < 0
-        || actual != preference
-        || !GetPropW(window, ROUND.as_ptr()).is_null()
-    {
-        rounded_region(window, scaled(window, if popup { 18 } else { 14 }));
+    let mut non_client_enabled = 0i32;
+    let non_client_readable = windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+        window,
+        windows_sys::Win32::Graphics::Dwm::DWMWA_NCRENDERING_ENABLED as u32,
+        (&mut non_client_enabled as *mut i32).cast(),
+        size_of::<i32>() as u32,
+    );
+    // A ROUND preference alone is not proof that a borderless popup can use
+    // DWM corners. These require a real composited frame; all other windows
+    // get one software silhouette instead of two competing corner clips.
+    let native = has_native_frame(style)
+        && result >= 0
+        && readable >= 0
+        && actual == preference
+        && non_client_readable >= 0
+        && non_client_enabled != 0;
+    if native {
+        clear_owned_region(window);
+    } else if rounded_region(window, scaled(window, 12)) {
         SetPropW(window, ROUND.as_ptr(), std::ptr::without_provenance_mut(1));
+    } else {
+        WINDOWS.with(|cache| {
+            cache.borrow_mut().remove(&(window as usize));
+        });
     }
 }
 
-unsafe fn rounded_region(window: HWND, radius: i32) {
+fn has_native_frame(style: isize) -> bool {
+    style & WS_CAPTION as isize == WS_CAPTION as isize || style & WS_THICKFRAME as isize != 0
+}
+
+unsafe fn clear_owned_region(window: HWND) {
+    if GetPropW(window, ROUND.as_ptr()).is_null() {
+        return;
+    }
+    REGIONS.with(|cache| {
+        cache.borrow_mut().remove(&(window as usize));
+    });
+    RemovePropW(window, ROUND.as_ptr());
+    SetWindowRgn(window, null_mut(), 0);
+}
+
+unsafe fn rounded_region(window: HWND, radius: i32) -> bool {
     let mut rect: RECT = zeroed();
     if GetWindowRect(window, &mut rect) == 0 {
-        return;
+        return false;
     }
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     if width <= 1 || height <= 1 {
-        return;
+        return false;
     }
     let key = (width, height, radius, GetDpiForWindow(window));
     let unchanged =
         REGIONS.with(|cache| cache.borrow().get(&(window as usize)).copied() == Some(key));
     if unchanged {
-        return;
+        return true;
+    }
+    let diameter = (radius * 2).min(width).min(height);
+    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+    if region.is_null() {
+        return false;
     }
     REGIONS.with(|cache| {
         cache.borrow_mut().insert(window as usize, key);
     });
-    let diameter = (radius * 2).min(width).min(height);
-    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
-    if !region.is_null() && SetWindowRgn(window, region, 0) == 0 {
+    if SetWindowRgn(window, region, 0) == 0 {
         // A successful SetWindowRgn transfers ownership to USER32.
         DeleteObject(region);
         REGIONS.with(|cache| {
             cache.borrow_mut().remove(&(window as usize));
         });
+        false
+    } else {
+        true
     }
 }
 
@@ -515,4 +554,21 @@ fn blend(first: COLORREF, second: COLORREF) -> COLORREF {
 
 unsafe fn scaled(window: HWND, value: i32) -> i32 {
     ((i64::from(value) * i64::from(GetDpiForWindow(window).max(96)) + 48) / 96) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_real_non_client_frames_use_native_dwm_rounding() {
+        assert!(has_native_frame(WS_OVERLAPPEDWINDOW as isize));
+        assert!(has_native_frame(
+            (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU) as isize
+        ));
+        assert!(has_native_frame((WS_POPUP | WS_THICKFRAME) as isize));
+        assert!(!has_native_frame(WS_POPUP as isize));
+        assert!(!has_native_frame((WS_POPUP | WS_BORDER) as isize));
+        assert!(!has_native_frame((WS_POPUP | WS_DLGFRAME) as isize));
+    }
 }

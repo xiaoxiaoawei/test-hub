@@ -147,37 +147,11 @@ unsafe fn question_input(parent: HWND) -> HWND {
 pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
     child(parent, "STATIC", "轻译", SS_LEFT, 200);
     icon_button(parent, "切换主题", ID_THEME, "切换白天 / 暗夜");
-    child(
-        parent,
-        "STATIC",
-        "英文 → 简体中文  ·  Ctrl + Alt + T",
-        SS_LEFT,
-        201,
-    );
-    child(parent, "STATIC", "设置", SS_LEFT, 292);
-    child(parent, "STATIC", "Ctrl + Alt + T", SS_LEFT, 293);
     child(parent, "STATIC", "翻译服务", SS_LEFT, 294);
-    child(
-        parent,
-        "STATIC",
-        "连接你常用的模型，开始自然流畅地阅读。",
-        SS_LEFT,
-        295,
-    );
-    child(parent, "STATIC", "其他更改请点击保存", SS_LEFT, 296);
-    child(parent, "STATIC", "日夜模式", SS_LEFT, 297);
-    child(parent, "STATIC", "翻译语言", SS_LEFT, 298);
-    child(parent, "STATIC", "划词行为", SS_LEFT, 299);
     child(parent, "BUTTON", "翻译服务", WS_TABSTOP, ID_SERVICE_TAB);
-    child(parent, "BUTTON", "翻译偏好", WS_TABSTOP, ID_PREFERENCES_TAB);
-    child(
-        parent,
-        "BUTTON",
-        "外观与阅读",
-        WS_TABSTOP,
-        ID_APPEARANCE_TAB,
-    );
-    child(parent, "STATIC", "服务提供商", SS_LEFT, 202);
+    child(parent, "BUTTON", "偏好设置", WS_TABSTOP, ID_PREFERENCES_TAB);
+    child(parent, "BUTTON", "外观", WS_TABSTOP, ID_APPEARANCE_TAB);
+    child(parent, "STATIC", "服务", SS_LEFT, 202);
     let provider = combo(
         parent,
         ID_PROVIDER,
@@ -210,7 +184,8 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         (ES_NUMBER | ES_AUTOHSCROLL) as u32 | WS_TABSTOP,
         213,
     );
-    child(parent, "STATIC", "原始语言", SS_LEFT, 274);
+    child(parent, "BUTTON", "朗读接口", WS_TABSTOP, 303);
+    child(parent, "STATIC", "源语言", SS_LEFT, 274);
     let source = combo(
         parent,
         ID_SOURCE_LANGUAGE,
@@ -230,69 +205,45 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         parent,
         "交换语言",
         ID_SWAP_LANGUAGES,
-        "交换原始语言与目标语言；自动检测时不可交换",
+        "交换源语言与目标语言",
     );
+    child(parent, "STATIC", "手动翻译快捷键", SS_LEFT, 300);
+    let hotkey = child(parent, "EDIT", "", ES_AUTOHSCROLL as u32 | WS_TABSTOP, 301);
+    tooltip(parent, hotkey, "打开手动翻译框，例如 Ctrl+Alt+Space");
     let auto = child(parent, "BUTTON", "自动划词", WS_TABSTOP, ID_AUTO);
     let mode = combo(
         parent,
         ID_SELECTION_MODE,
         ["点击图标后翻译", "直接显示译文"],
     );
-    let compatibility = child(
+    let compatibility = child(parent, "BUTTON", "兼容取词", WS_TABSTOP, ID_COMPATIBILITY);
+    tooltip(
         parent,
-        "BUTTON",
-        "兼容取词 · 网页 / PDF",
-        WS_TABSTOP,
-        ID_COMPATIBILITY,
+        compatibility,
+        "网页 / PDF 取词失败时临时复制并恢复剪贴板",
     );
     let pause = child(parent, "BUTTON", "暂停划词", WS_TABSTOP, ID_PAUSE);
-    tooltip(parent, pause, "仅本次运行暂停自动划词，快捷键仍可用");
-    child(
-        parent,
-        "STATIC",
-        "临时复制选区，并尝试恢复剪贴板。",
-        SS_LEFT,
-        218,
-    );
-    child(parent, "STATIC", "配色模板", SS_LEFT, 290);
-    child(parent, "STATIC", "选择即应用 · 自动保存", SS_LEFT, 291);
-    for (id, name, description) in [
-        (ID_PRESET_OCEAN, "深海蓝", "沉静蓝调 · 清晰专注"),
-        (ID_PRESET_AURORA, "极光青", "冷冽青绿 · 轻盈明亮"),
-        (ID_PRESET_NEBULA, "星云紫", "柔和紫调 · 灵感空间"),
-        (ID_PRESET_AMBER, "暖砂金", "温润琥珀 · 舒适阅读"),
+    tooltip(parent, pause, "仅本次运行暂停自动划词");
+    for (id, preset) in [
+        (ID_PRESET_OCEAN, config::ThemePreset::Ocean),
+        (ID_PRESET_AURORA, config::ThemePreset::Aurora),
+        (ID_PRESET_NEBULA, config::ThemePreset::Nebula),
+        (ID_PRESET_AMBER, config::ThemePreset::Amber),
     ] {
-        let control = child(
-            parent,
-            "BUTTON",
-            &format!("{name} · {description}"),
-            WS_TABSTOP,
-            id,
-        );
-        tooltip(
-            parent,
-            control,
-            &format!("{name} · 点击应用并保存，支持白天与暗夜模式"),
-        );
+        let control = child(parent, "BUTTON", preset.label(), WS_TABSTOP, id);
+        tooltip(parent, control, &format!("{} · 点击应用", preset.label()));
     }
     child(parent, "BUTTON", "划词图标", WS_TABSTOP, ID_APPEARANCE);
-    child(parent, "STATIC", "", SS_LEFT, 276);
     child(parent, "BUTTON", "检查更新", WS_TABSTOP, ID_UPDATE);
     let update_status = child(
         parent,
         "STATIC",
-        &format!("v{} · 启动时自动检查", env!("CARGO_PKG_VERSION")),
+        &format!("v{}", env!("CARGO_PKG_VERSION")),
         SS_LEFT,
         219,
     );
-    let status = child(
-        parent,
-        "STATIC",
-        "选择服务，填写密钥后测试连接。",
-        SS_LEFT,
-        215,
-    );
-    child(parent, "BUTTON", "保存设置", WS_TABSTOP, ID_SAVE);
+    let status = child(parent, "STATIC", "", SS_LEFT, 215);
+    child(parent, "BUTTON", "保存", WS_TABSTOP, ID_SAVE);
     SettingsUi {
         source,
         target,
@@ -307,6 +258,88 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         status,
         update_status,
     }
+}
+
+pub(super) struct SpeechSettingsUi {
+    pub(super) base: HWND,
+    pub(super) key: HWND,
+    pub(super) model: HWND,
+    pub(super) voice: HWND,
+    pub(super) status: HWND,
+}
+
+pub(super) unsafe fn make_speech_settings(parent: HWND) -> SpeechSettingsUi {
+    child(parent, "STATIC", "服务地址", SS_LEFT, 311);
+    let base = child(parent, "EDIT", "", ES_AUTOHSCROLL as u32 | WS_TABSTOP, 304);
+    child(parent, "STATIC", "API 密钥", SS_LEFT, 314);
+    let key = child(
+        parent,
+        "EDIT",
+        "",
+        (ES_AUTOHSCROLL | ES_PASSWORD) as u32 | WS_TABSTOP,
+        307,
+    );
+    child(parent, "STATIC", "模型", SS_LEFT, 312);
+    let model = child(parent, "EDIT", "", ES_AUTOHSCROLL as u32 | WS_TABSTOP, 305);
+    child(parent, "STATIC", "声音", SS_LEFT, 313);
+    let voice = child(parent, "EDIT", "", ES_AUTOHSCROLL as u32 | WS_TABSTOP, 306);
+    tooltip(parent, base, "OpenAI 兼容语音服务，也可接入远端 Kokoro");
+    let status = child(parent, "STATIC", "", SS_LEFT, 310);
+    child(parent, "BUTTON", "保存", WS_TABSTOP, 308);
+    child(parent, "BUTTON", "取消", WS_TABSTOP, 309);
+    SpeechSettingsUi {
+        base,
+        key,
+        model,
+        voice,
+        status,
+    }
+}
+
+unsafe fn input_margins(control: HWND, scale: u32) {
+    let inset = scaled(10, scale) as isize;
+    SendMessageW(
+        control,
+        EM_SETMARGINS,
+        (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
+        inset | (inset << 16),
+    );
+}
+
+pub(super) unsafe fn layout_speech_settings(hwnd: HWND) {
+    let scale = dpi(hwnd);
+    let mut bounds: RECT = zeroed();
+    GetClientRect(hwnd, &mut bounds);
+    let width = bounds.right * 96 / scale as i32;
+    let height = bounds.bottom * 96 / scale as i32;
+    let inner = (width - 48).max(260);
+    let half = (inner - 16) / 2;
+    let positions = [
+        (311, 24, 20, inner, 20),
+        (304, 24, 46, inner, 40),
+        (314, 24, 104, inner, 20),
+        (307, 24, 130, inner, 40),
+        (312, 24, 188, half, 20),
+        (313, 40 + half, 188, half, 20),
+        (305, 24, 214, half, 40),
+        (306, 40 + half, 214, half, 40),
+        (310, 24, 274, inner, 36),
+        (309, width - 264, height - 60, 112, 36),
+        (308, width - 136, height - 60, 112, 36),
+    ];
+    for (id, x, y, w, h) in positions {
+        let face = font(
+            scale,
+            if matches!(id, 310..=314) { 13 } else { 16 },
+            FW_NORMAL as i32,
+        );
+        let control = GetDlgItem(hwnd, id);
+        place(control, x, y, w, h, scale, face);
+        if matches!(id, 304..=307) {
+            input_margins(control, scale);
+        }
+    }
+    redraw_layout(hwnd);
 }
 
 unsafe fn page_visible(parent: HWND, ids: &[u16], visible: bool) {
@@ -324,6 +357,32 @@ unsafe fn mark_cards(parent: HWND, ids: &[u16]) {
     while !control.is_null() {
         surfaces::set_card_control(control, ids.contains(&(GetDlgCtrlID(control) as u16)));
         control = GetWindow(control, GW_HWNDNEXT);
+    }
+}
+
+/// Logical geometry shared by layout and the parent background painter.
+pub(super) fn settings_geometry(width: i32) -> (i32, i32, i32) {
+    let rail = if width < 680 { 132 } else { 156 };
+    let left = rail + 24;
+    (rail, left, (width - left - 24).max(280))
+}
+
+pub(super) fn settings_panels(width: i32, page: SettingsPage) -> Vec<RECT> {
+    let (_, left, main_width) = settings_geometry(width);
+    let content = main_width - 40;
+    let rect = |top, bottom| RECT {
+        left,
+        top,
+        right: left + main_width,
+        bottom,
+    };
+    match page {
+        SettingsPage::Service => vec![rect(88, 420)],
+        SettingsPage::Preferences => vec![
+            rect(88, 280),
+            rect(296, if content < 360 { 466 } else { 420 }),
+        ],
+        SettingsPage::Appearance => Vec::new(),
     }
 }
 
@@ -350,14 +409,13 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
     SetScrollInfo(hwnd, SB_VERT, &scroll, 0);
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
-    let main_width = (width - 212).max(340);
-    let content = main_width - 48;
+    let (rail, left, main_width) = settings_geometry(width);
+    let content = main_width - 40;
+    let x = left + 20;
+    let right = left + main_width;
+    let language_width = (content - 52) / 2;
     let template_width = (main_width - 16) / 2;
-    let language_width = (content - 60) / 2;
     let page = SETTINGS_PAGE.get();
-    let service = page == SettingsPage::Service;
-    let preferences = page == SettingsPage::Preferences;
-    let appearance = page == SettingsPage::Appearance;
     page_visible(
         hwnd,
         &[
@@ -373,72 +431,58 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_TEST,
             206,
             213,
+            303,
         ],
-        service,
+        page == SettingsPage::Service,
     );
     page_visible(
         hwnd,
         &[
-            298,
-            299,
             274,
             ID_SOURCE_LANGUAGE,
             275,
             ID_TARGET_LANGUAGE,
             ID_SWAP_LANGUAGES,
+            300,
+            301,
             ID_AUTO,
             ID_SELECTION_MODE,
             ID_COMPATIBILITY,
             ID_PAUSE,
-            218,
         ],
-        preferences,
+        page == SettingsPage::Preferences,
     );
     page_visible(
         hwnd,
         &[
-            290,
-            291,
             ID_PRESET_OCEAN,
             ID_PRESET_AURORA,
             ID_PRESET_NEBULA,
             ID_PRESET_AMBER,
             ID_APPEARANCE,
-            276,
         ],
-        appearance,
+        page == SettingsPage::Appearance,
     );
-    // Navigation, version and update actions belong to the persistent sidebar.
     page_visible(
         hwnd,
         &[
             200,
-            201,
-            292,
-            293,
-            297,
             ID_THEME,
             ID_SERVICE_TAB,
             ID_PREFERENCES_TAB,
             ID_APPEARANCE_TAB,
             ID_UPDATE,
-            219,
             294,
-            295,
-            296,
             215,
             ID_SAVE,
         ],
         true,
     );
+    page_visible(hwnd, &[219], height >= 400);
     mark_cards(
         hwnd,
         &[
             200,
-            201,
-            292,
-            293,
-            297,
             ID_THEME,
             ID_SERVICE_TAB,
             ID_PREFERENCES_TAB,
@@ -457,161 +501,161 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_TEST,
             206,
             213,
-            298,
-            299,
             274,
             ID_SOURCE_LANGUAGE,
             275,
             ID_TARGET_LANGUAGE,
             ID_SWAP_LANGUAGES,
+            300,
+            301,
             ID_AUTO,
             ID_SELECTION_MODE,
             ID_COMPATIBILITY,
             ID_PAUSE,
-            218,
-            ID_APPEARANCE,
-            276,
         ],
     );
-    let (title, subtitle) = match page {
-        SettingsPage::Service => ("翻译服务", "连接你常用的模型，开始自然流畅地阅读。"),
-        SettingsPage::Preferences => ("翻译偏好", "选择语言与触发方式，让翻译融入你的习惯。"),
-        SettingsPage::Appearance => ("外观与阅读", "用喜欢的色彩，构建舒适清晰的阅读空间。"),
-    };
-    set_text(GetDlgItem(hwnd, 294), title);
-    set_text(GetDlgItem(hwnd, 295), subtitle);
     set_text(
-        GetDlgItem(hwnd, 296),
-        if appearance {
-            "模板选择即保存；其他更改请保存"
-        } else {
-            "更改会在保存后立即生效"
+        GetDlgItem(hwnd, 294),
+        match page {
+            SettingsPage::Service => "翻译服务",
+            SettingsPage::Preferences => "偏好设置",
+            SettingsPage::Appearance => "外观",
         },
     );
-    let footer = (height - 172).max(292);
+    let compact = height < 400;
+    let nav_start = if compact { 76 } else { 84 };
+    let nav_step = if compact { 40 } else { 48 };
+    let nav_height = if compact { 36 } else { 40 };
+    let theme_y = if compact {
+        (height - 100).max(204)
+    } else {
+        (height - 156).max(244)
+    };
+    let update_y = if compact {
+        height - 48
+    } else {
+        (height - 104).max(296)
+    };
+    let logical_height = height.max(SETTINGS_CONTENT_HEIGHT);
+    let narrow = content < 360;
+    let mode_x = if narrow { x } else { x + 164 };
+    let mode_y = if narrow { 350 } else { 312 };
+    let mode_width = if narrow { content } else { content - 164 };
+    let compatibility_y = if narrow { 414 } else { 370 };
     let positions = [
-        (200, 20, 26, 116, 30),
-        (201, 20, 64, 116, 38),
-        (292, 20, 108, 116, 18),
-        (ID_SERVICE_TAB, 16, 128, 124, 40),
-        (ID_PREFERENCES_TAB, 16, 176, 124, 40),
-        (ID_APPEARANCE_TAB, 16, 224, 124, 40),
-        (293, 20, footer - 34, 116, 22),
-        (ID_THEME, 16, footer, 36, 36),
-        (297, 60, footer + 7, 80, 22),
-        (ID_UPDATE, 16, footer + 52, 124, 36),
-        (219, 20, footer + 100, 116, 56),
-        (294, 184, 24, main_width, 38),
-        (295, 184, 70, main_width, 24),
-        (202, 208, 134, content, 20),
-        (ID_PROVIDER, 208, 160, content, 220),
-        (204, 208, 208, content, 20),
-        (211, 208, 234, content - 48, 40),
-        (ID_KEY_VISIBILITY, width - 88, 236, 36, 36),
-        (203, 208, 282, content, 20),
-        (210, 208, 308, content, 40),
-        (205, 208, 356, content - 148, 20),
-        (206, width - 136, 356, 84, 20),
-        (212, 208, 382, content - 148, 40),
-        (ID_TEST, width - 188, 382, 40, 40),
-        (213, width - 136, 382, 84, 40),
-        (298, 208, 132, content, 24),
-        (274, 208, 164, language_width, 20),
-        (275, 268 + language_width, 164, language_width, 20),
-        (ID_SOURCE_LANGUAGE, 208, 190, language_width, 220),
-        (ID_SWAP_LANGUAGES, 220 + language_width, 192, 36, 36),
+        (200, 20, 24, rail - 40, 30),
+        (ID_SERVICE_TAB, 16, nav_start, rail - 32, nav_height),
+        (
+            ID_PREFERENCES_TAB,
+            16,
+            nav_start + nav_step,
+            rail - 32,
+            nav_height,
+        ),
+        (
+            ID_APPEARANCE_TAB,
+            16,
+            nav_start + nav_step * 2,
+            rail - 32,
+            nav_height,
+        ),
+        (ID_THEME, 16, theme_y, 36, 36),
+        (ID_UPDATE, 16, update_y, rail - 32, 36),
+        (219, 20, height - 56, rail - 40, 40),
+        (294, left, 24, main_width, 38),
+        (202, x, 106, content, 20),
+        (ID_PROVIDER, x, 132, content, 220),
+        (204, x, 184, content, 20),
+        (211, x, 208, content - 48, 40),
+        (ID_KEY_VISIBILITY, right - 56, 210, 36, 36),
+        (203, x, 260, content, 20),
+        (210, x, 284, content, 40),
+        (205, x, 336, content - 148, 20),
+        (206, right - 104, 336, 84, 20),
+        (212, x, 360, content - 148, 40),
+        (ID_TEST, right - 156, 360, 40, 40),
+        (213, right - 104, 360, 84, 40),
+        (303, left, 436, 120, 36),
+        (274, x, 108, language_width, 20),
+        (275, x + language_width + 52, 108, language_width, 20),
+        (ID_SOURCE_LANGUAGE, x, 134, language_width, 220),
+        (ID_SWAP_LANGUAGES, x + language_width + 8, 136, 36, 36),
         (
             ID_TARGET_LANGUAGE,
-            268 + language_width,
-            190,
+            x + language_width + 52,
+            134,
             language_width,
             220,
         ),
-        (299, 208, 288, content, 24),
-        (ID_AUTO, 208, 328, 176, 30),
-        (ID_SELECTION_MODE, 400, 324, content - 192, 190),
-        (ID_COMPATIBILITY, 208, 378, content - 132, 30),
-        (ID_PAUSE, width - 164, 374, 112, 36),
-        (218, 236, 424, content - 28, 32),
-        (290, 184, 112, 160, 22),
-        (291, width - 240, 114, 212, 22),
-        (ID_PRESET_OCEAN, 184, 144, template_width, 104),
+        (300, x, 190, content, 20),
+        (301, x, 216, content, 40),
+        (ID_AUTO, x, 316, 148, 28),
+        (ID_SELECTION_MODE, mode_x, mode_y, mode_width, 190),
+        (ID_COMPATIBILITY, x, compatibility_y, content - 128, 30),
+        (ID_PAUSE, right - 132, compatibility_y - 4, 112, 36),
+        (ID_PRESET_OCEAN, left, 88, template_width, 90),
         (
             ID_PRESET_AURORA,
-            200 + template_width,
-            144,
+            left + template_width + 16,
+            88,
             template_width,
-            104,
+            90,
         ),
-        (ID_PRESET_NEBULA, 184, 260, template_width, 104),
+        (ID_PRESET_NEBULA, left, 192, template_width, 90),
         (
             ID_PRESET_AMBER,
-            200 + template_width,
-            260,
+            left + template_width + 16,
+            192,
             template_width,
-            104,
+            90,
         ),
-        (ID_APPEARANCE, 208, 412, 124, 36),
-        (276, 348, 418, content - 140, 24),
-        (215, 184, 496, main_width, 40),
-        (296, 184, 566, main_width - 148, 40),
-        (ID_SAVE, width - 148, 556, 120, 40),
+        (ID_APPEARANCE, left, 304, main_width, 44),
+        (215, left, logical_height - 112, main_width, 32),
+        (ID_SAVE, right - 112, logical_height - 64, 112, 40),
     ];
     for (id, x, y, w, h) in positions {
         let control_font = match id {
             200 => font(scale, 20, FW_SEMIBOLD as i32),
             294 => font(scale, 26, FW_SEMIBOLD as i32),
-            298 | 299 => font(scale, 15, FW_SEMIBOLD as i32),
             ID_SERVICE_TAB | ID_PREFERENCES_TAB | ID_APPEARANCE_TAB => {
                 font(scale, 15, FW_NORMAL as i32)
             }
-            ID_PRESET_OCEAN | ID_PRESET_AURORA | ID_PRESET_NEBULA | ID_PRESET_AMBER => {
-                font(scale, 16, FW_SEMIBOLD as i32)
-            }
-            201
-            | 202..=206
-            | 215
-            | 218
-            | 219
-            | 274
-            | 275
-            | 276
-            | 290
-            | 291
-            | 292
-            | 293
-            | 295
-            | 296
-            | 297 => font(scale, 13, FW_NORMAL as i32),
+            202..=206 | 215 | 219 | 274 | 275 | 300 => font(scale, 13, FW_NORMAL as i32),
             _ => face,
         };
         let sidebar = matches!(
             id,
-            200 | 201
-                | 292
-                | 293
-                | 297
-                | ID_THEME
+            200 | ID_THEME
                 | ID_SERVICE_TAB
                 | ID_PREFERENCES_TAB
                 | ID_APPEARANCE_TAB
                 | ID_UPDATE
                 | 219
         );
-        let y = if sidebar { y } else { y - app.settings_scroll };
-        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
+        let control = GetDlgItem(hwnd, id as i32);
+        place(
+            control,
+            x,
+            if sidebar { y } else { y - app.settings_scroll },
+            w,
+            h,
+            scale,
+            control_font,
+        );
+        if id == 301 {
+            input_margins(control, scale);
+        }
     }
     redraw_layout(hwnd);
 }
 
 pub(super) unsafe fn make_appearance(parent: HWND) -> AppearanceUi {
     child(parent, "STATIC", "图标外观", SS_LEFT, 240);
-    child(parent, "STATIC", "划词图标 · 无阴影", SS_LEFT, 241);
     child(parent, "STATIC", "样式", SS_LEFT, 242);
     let style = combo(parent, ID_ICON_STYLE, ["叶片", "译字", "字母 A"]);
     child(parent, "STATIC", "形状", SS_LEFT, 245);
-    let shape = combo(parent, ID_ICON_SHAPE, ["圆角", "方形", "圆形"]);
-    child(parent, "STATIC", "尺寸 · 16–64 px", SS_LEFT, 246);
+    let shape = combo(parent, ID_ICON_SHAPE, ["圆角", "方形", "圆形", "叶形"]);
+    child(parent, "STATIC", "尺寸", SS_LEFT, 246);
     let size = child(
         parent,
         "EDIT",
@@ -629,7 +673,7 @@ pub(super) unsafe fn make_appearance(parent: HWND) -> AppearanceUi {
     child(parent, "STATIC", "颜色", SS_LEFT, 243);
     let color = child(parent, "BUTTON", "选择颜色…", WS_TABSTOP, ID_ICON_COLOR);
     child(parent, "BUTTON", "屏幕取色", WS_TABSTOP, ID_SCREEN_PICK);
-    let status = child(parent, "STATIC", "预览后点击应用。", SS_LEFT, 235);
+    let status = child(parent, "STATIC", "", SS_LEFT, 235);
     child(parent, "BUTTON", "恢复默认", WS_TABSTOP, ID_ICON_RESET);
     child(parent, "BUTTON", "应用", WS_TABSTOP, ID_ICON_APPLY);
     AppearanceUi {
@@ -646,7 +690,7 @@ pub(super) unsafe fn layout_appearance(app: &mut App) {
     let hwnd = app.appearance_window;
     refresh_window_icons(app, hwnd);
     let scale = dpi(hwnd);
-    let face = font(scale, 14, FW_NORMAL as i32);
+    let face = font(scale, 16, FW_NORMAL as i32);
     let mut rect: RECT = zeroed();
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
@@ -674,7 +718,6 @@ pub(super) unsafe fn layout_appearance(app: &mut App) {
     );
     let positions = [
         (240, 24, 16, width - 120, 30),
-        (241, 24, 50, width - 120, 20),
         (
             234,
             width - 84 + (64 - preview_size) / 2,
@@ -698,7 +741,7 @@ pub(super) unsafe fn layout_appearance(app: &mut App) {
     for (id, x, y, w, h) in positions {
         let control_font = match id {
             240 => font(scale, 22, FW_SEMIBOLD as i32),
-            241 | 235 | 242 | 245 | 246 | 243 => font(scale, 13, FW_NORMAL as i32),
+            235 | 242 | 245 | 246 | 243 => font(scale, 13, FW_NORMAL as i32),
             _ => face,
         };
         place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
@@ -803,6 +846,8 @@ pub(super) unsafe fn make_result(parent: HWND) -> ResultUi {
         (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_VSCROLL | WS_TABSTOP,
         222,
     );
+    let manual_translate = child(parent, "BUTTON", "翻译", WS_TABSTOP, 302);
+    ShowWindow(manual_translate, SW_HIDE);
     child(parent, "STATIC", "译文", SS_LEFT, 223);
     let translated = child(
         parent,
@@ -871,10 +916,11 @@ pub(super) unsafe fn layout_result(app: &mut App) {
         (ID_COPY, 104, 64, 32, 32),
         (ID_SPEAK, 144, 64, 32, 32),
         (ID_POLISH, 184, 64, 32, 32),
-        (221, 24, 112, inner, 20),
-        (222, 24, 138, inner, 80),
-        (223, 24, 236, inner, 20),
-        (224, 24, 262, inner, (height - 354).max(64)),
+        (221, 24, 112, inner - 116, 24),
+        (302, width - 124, 106, 100, 36),
+        (222, 24, 150, inner, 80),
+        (223, 24, 246, inner, 20),
+        (224, 24, 272, inner, (height - 364).max(64)),
         (225, 24, height - 78, inner, 20),
         (ID_QUESTION, 24, height - 48, inner - 44, 36),
         (ID_SEND, width - 56, height - 48, 32, 36),
@@ -885,7 +931,11 @@ pub(super) unsafe fn layout_result(app: &mut App) {
             221 | 223 | 225 => font(scale, 13, FW_NORMAL as i32),
             _ => face,
         };
-        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
+        let control = GetDlgItem(hwnd, id as i32);
+        place(control, x, y, w, h, scale, control_font);
+        if id == 222 {
+            input_margins(control, scale);
+        }
     }
     redraw_layout(hwnd);
 }

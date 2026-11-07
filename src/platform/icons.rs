@@ -213,9 +213,18 @@ pub(crate) fn render_pixels(
     let size = scale(logical_size, dpi.clamp(96, 384));
     let side = size * SUPERSAMPLE;
     let glyph = match style {
+        IconStyle::Leaf if shape == IconShape::Leaf => leaf_vein_mask(side),
         IconStyle::Leaf => leaf_mask(side),
-        IconStyle::Translate => text_mask("译", side)?,
-        IconStyle::Letter => text_mask("A", side)?,
+        IconStyle::Translate => text_mask(
+            "译",
+            side,
+            if shape == IconShape::Leaf { 0.50 } else { 0.72 },
+        )?,
+        IconStyle::Letter => text_mask(
+            "A",
+            side,
+            if shape == IconShape::Leaf { 0.56 } else { 0.72 },
+        )?,
     };
     let background = [
         (color & 0xff) as f64,
@@ -225,7 +234,12 @@ pub(crate) fn render_pixels(
     let dark_ink = [27.0, 29.0, 33.0];
     let light_ink = [232.0, 242.0, 249.0];
     let luminance = relative_luminance(background);
-    let foreground = if contrast(luminance, relative_luminance(dark_ink))
+    let foreground = if shape == IconShape::Leaf
+        && style == IconStyle::Leaf
+        && contrast(luminance, relative_luminance(light_ink)) >= 1.8
+    {
+        light_ink
+    } else if contrast(luminance, relative_luminance(dark_ink))
         >= contrast(luminance, relative_luminance(light_ink))
     {
         dark_ink
@@ -296,6 +310,7 @@ fn shape_covers(shape: IconShape, x: usize, y: usize, side: usize) -> bool {
     let y = (y as f64 + 0.5) / side as f64;
     match shape {
         IconShape::Square => true,
+        IconShape::Leaf => leaf_covers(x, y),
         IconShape::Circle => (x - 0.5).powi(2) + (y - 0.5).powi(2) <= 0.25,
         IconShape::Rounded => {
             let radius = 0.22;
@@ -304,6 +319,70 @@ fn shape_covers(shape: IconShape, x: usize, y: usize, side: usize) -> bool {
             (x - nearest_x).powi(2) + (y - nearest_y).powi(2) <= radius * radius
         }
     }
+}
+
+// A curved, pointed silhouette: its tip and short stem remain inside the icon's
+// physical bounds, with genuinely transparent surroundings rather than a plate.
+fn leaf_coordinates(x: f64, y: f64) -> (f64, f64) {
+    let dx = x - 0.5;
+    let dy = y - 0.5;
+    (
+        (dx - dy) * std::f64::consts::FRAC_1_SQRT_2,
+        (dx + dy) * std::f64::consts::FRAC_1_SQRT_2,
+    )
+}
+
+fn leaf_profile(u: f64) -> (f64, f64) {
+    let t = ((u + 0.57) / 1.16).clamp(0.0, 1.0);
+    let fullness = 4.0 * t * (1.0 - t);
+    let center = 0.055 * (t - 0.5) * fullness;
+    (center, 0.34 * fullness)
+}
+
+fn leaf_covers(x: f64, y: f64) -> bool {
+    let (u, v) = leaf_coordinates(x, y);
+    if (-0.57..=0.59).contains(&u) {
+        let (center, width) = leaf_profile(u);
+        let asymmetry = if v < center { 0.90 } else { 1.0 };
+        if (v - center).abs() <= width * asymmetry {
+            return true;
+        }
+    }
+    // The stem joins the body continuously, with no offset/shadow pixels.
+    (-0.625..=-0.43).contains(&u) && (v + 0.005).abs() < 0.018
+}
+
+fn segment_distance(u: f64, v: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
+    let du = b.0 - a.0;
+    let dv = b.1 - a.1;
+    let fraction = (((u - a.0) * du + (v - a.1) * dv) / (du * du + dv * dv)).clamp(0.0, 1.0);
+    ((u - a.0 - fraction * du).powi(2) + (v - a.1 - fraction * dv).powi(2)).sqrt()
+}
+
+fn leaf_vein_mask(side: usize) -> Vec<u8> {
+    let mut mask = vec![0; side * side];
+    for y in 0..side {
+        for x in 0..side {
+            let (u, v) = leaf_coordinates(
+                (x as f64 + 0.5) / side as f64,
+                (y as f64 + 0.5) / side as f64,
+            );
+            let (center, _) = leaf_profile(u);
+            let main = (-0.52..=0.45).contains(&u) && (v - center).abs() <= 0.014;
+            let branch = [-0.29, -0.06, 0.16].into_iter().any(|start| {
+                let a = (start, leaf_profile(start).0);
+                let end = start + 0.16;
+                let (axis, width) = leaf_profile(end);
+                [1.0, -1.0].into_iter().any(|direction| {
+                    segment_distance(u, v, a, (end, axis + width * 0.62 * direction)) < 0.009
+                })
+            });
+            if main || branch {
+                mask[y * side + x] = 255;
+            }
+        }
+    }
+    mask
 }
 
 fn leaf_mask(side: usize) -> Vec<u8> {
@@ -326,13 +405,13 @@ fn leaf_mask(side: usize) -> Vec<u8> {
     mask
 }
 
-fn text_mask(text: &str, side: usize) -> Result<Vec<u8>, String> {
+fn text_mask(text: &str, side: usize, relative_size: f64) -> Result<Vec<u8>, String> {
     let bitmap = Bitmap::new(side)?;
     let dc = MemoryDc::selecting(&bitmap)?;
     let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
     let font = unsafe {
         CreateFontW(
-            -((side as f64 * 0.72).round() as i32),
+            -((side as f64 * relative_size).round() as i32),
             0,
             0,
             0,
@@ -504,6 +583,54 @@ mod tests {
                 assert!(queried > 0);
                 assert_eq!((bitmap.bmWidth, bitmap.bmHeight), (expected, expected));
             }
+        }
+    }
+
+    #[test]
+    fn leaf_shape_is_a_transparent_green_silhouette_with_fine_veins() {
+        for dpi in [96, 120, 144, 192, 288, 384] {
+            let leaf =
+                render_pixels(IconStyle::Leaf, 0x19_A9_7C, IconShape::Leaf, 32, dpi).unwrap();
+            let side = leaf.width as usize;
+            for (x, y) in [(0, 0), (side - 1, 0), (0, side - 1), (side - 1, side - 1)] {
+                assert_eq!(alpha(&leaf, x, y), 0);
+            }
+            assert_eq!(alpha(&leaf, side / 2, side / 2), 255);
+            let occupied = leaf
+                .pixels
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] > 0)
+                .count();
+            assert!(occupied > side * side / 3 && occupied < side * side * 2 / 3);
+            assert!(leaf.pixels.chunks_exact(4).any(|pixel| pixel[3] == 255
+                && u16::from(pixel[1]) > u16::from(pixel[2]) * 2
+                && pixel[1] > pixel[0]));
+            assert!(leaf
+                .pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] == 255 && pixel[..3].iter().all(|channel| *channel > 200)));
+            assert!(leaf
+                .pixels
+                .chunks_exact(4)
+                .any(|pixel| (1..255).contains(&pixel[3])));
+            assert!(leaf
+                .pixels
+                .chunks_exact(4)
+                .all(|pixel| pixel[..3].iter().all(|channel| *channel <= pixel[3])));
+        }
+    }
+
+    #[test]
+    fn leaf_shape_keeps_user_colors_and_alternate_glyphs_without_a_plate() {
+        let leaf = render_pixels(IconStyle::Leaf, 0x19_A9_7C, IconShape::Leaf, 32, 144).unwrap();
+        for style in [IconStyle::Leaf, IconStyle::Translate, IconStyle::Letter] {
+            let alternate = render_pixels(style, 0x40_48_80, IconShape::Leaf, 32, 144).unwrap();
+            assert_ne!(leaf.pixels, alternate.pixels);
+            assert!(leaf
+                .pixels
+                .chunks_exact(4)
+                .zip(alternate.pixels.chunks_exact(4))
+                .all(|(a, b)| a[3] == b[3]));
         }
     }
 

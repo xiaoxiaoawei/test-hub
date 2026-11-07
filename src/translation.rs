@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 #[cfg(any(windows, test))]
 mod stream;
 #[cfg(windows)]
-mod winhttp;
+pub(crate) mod winhttp;
 
 pub const MAX_TEXT_CHARS: usize = 5_000;
 pub const MAX_QUESTION_CHARS: usize = 1_000;
@@ -132,7 +132,7 @@ pub fn is_cancelled_error(error: &str) -> bool {
     error == CANCELLED
 }
 
-fn check_cancel<C: Fn() -> bool>(should_cancel: &C) -> Result<(), String> {
+pub(crate) fn check_cancel<C: Fn() -> bool>(should_cancel: &C) -> Result<(), String> {
     if should_cancel() {
         Err(CANCELLED.into())
     } else {

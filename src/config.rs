@@ -48,6 +48,45 @@ pub enum ThemeMode {
     Light,
 }
 
+/// Color family, independent of day/night mode and the selection icon color.
+/// Missing fields in older configurations retain their warm palette.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreset {
+    Ocean,
+    Aurora,
+    Nebula,
+    #[default]
+    Amber,
+}
+
+pub const THEME_PRESETS: &[ThemePreset] = &[
+    ThemePreset::Ocean,
+    ThemePreset::Aurora,
+    ThemePreset::Nebula,
+    ThemePreset::Amber,
+];
+
+impl ThemePreset {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ocean => "深海蓝",
+            Self::Aurora => "极光青",
+            Self::Nebula => "星云紫",
+            Self::Amber => "暖砂金",
+        }
+    }
+
+    pub const fn subtitle(self) -> &'static str {
+        match self {
+            Self::Ocean => "清晰 · 沉静",
+            Self::Aurora => "轻盈 · 清新",
+            Self::Nebula => "灵感 · 探索",
+            Self::Amber => "温暖 · 专注",
+        }
+    }
+}
+
 /// Supported translation preferences. Automatic detection is source-only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +185,7 @@ pub struct Settings {
     /// Explicit opt-in to temporarily copy a selection when UIA cannot read it.
     pub compatibility_capture: bool,
     pub theme_mode: ThemeMode,
+    pub theme_preset: ThemePreset,
     pub source_language: Language,
     pub target_language: Language,
     pub icon_style: IconStyle,
@@ -167,6 +207,7 @@ impl Default for Settings {
             selection_mode: SelectionMode::default(),
             compatibility_capture: false,
             theme_mode: ThemeMode::default(),
+            theme_preset: ThemePreset::default(),
             source_language: default_source_language(),
             target_language: default_target_language(),
             icon_style: IconStyle::default(),
@@ -197,6 +238,7 @@ impl fmt::Debug for Settings {
             .field("selection_mode", &self.selection_mode)
             .field("compatibility_capture", &self.compatibility_capture)
             .field("theme_mode", &self.theme_mode)
+            .field("theme_preset", &self.theme_preset)
             .field("source_language", &self.source_language)
             .field("target_language", &self.target_language)
             .field("icon_style", &self.icon_style)
@@ -292,6 +334,8 @@ struct StoredSettings {
     compatibility_capture: bool,
     #[serde(default)]
     theme_mode: ThemeMode,
+    #[serde(default)]
+    theme_preset: ThemePreset,
     #[serde(default = "default_source_language")]
     source_language: Language,
     #[serde(default = "default_target_language")]
@@ -319,6 +363,7 @@ impl StoredSettings {
             selection_mode: settings.selection_mode,
             compatibility_capture: settings.compatibility_capture,
             theme_mode: settings.theme_mode,
+            theme_preset: settings.theme_preset,
             source_language: settings.source_language,
             target_language: settings.target_language,
             icon_style: settings.icon_style,
@@ -341,6 +386,7 @@ impl StoredSettings {
             selection_mode: self.selection_mode,
             compatibility_capture: self.compatibility_capture,
             theme_mode: self.theme_mode,
+            theme_preset: self.theme_preset,
             source_language: self.source_language,
             target_language: self.target_language,
             icon_style: self.icon_style,
@@ -925,6 +971,135 @@ mod tests {
         assert_eq!(restored.icon_shape, IconShape::Circle);
         assert_eq!(restored.icon_color, 0x12_34_56);
         assert_eq!(restored.api_key, "test-only-key");
+    }
+
+    #[test]
+    fn legacy_palette_migration_preserves_dark_and_beige_user_preferences() {
+        for (mode, expected_mode) in [("dark", ThemeMode::Dark), ("light", ThemeMode::Light)] {
+            let document = serde_json::json!({
+                "version": 1,
+                "base_url": "https://api.deepseek.com/v1",
+                "model": "custom-model",
+                "timeout_seconds": 37,
+                "theme_mode": mode,
+                "source_language": "auto",
+                "target_language": "japanese",
+                "selection_mode": "direct",
+                "compatibility_capture": true,
+                "icon_style": "letter",
+                "icon_shape": "circle",
+                "icon_size": 48,
+                "icon_color": 0x40_48_80,
+                "api_key_encrypted": [18, 42, 71]
+            });
+            let stored: StoredSettings = serde_json::from_value(document).unwrap();
+            let encrypted = stored.api_key_encrypted.clone();
+            let restored = stored.into_settings("test-only-key".into()).unwrap();
+            assert_eq!(restored.theme_preset, ThemePreset::Amber);
+            assert_eq!(restored.theme_mode, expected_mode);
+            assert_eq!(restored.base_url, "https://api.deepseek.com/v1");
+            assert_eq!(restored.model, "custom-model");
+            assert_eq!(restored.timeout_seconds, 37);
+            assert_eq!(restored.source_language, Language::Auto);
+            assert_eq!(restored.target_language, Language::Japanese);
+            assert_eq!(restored.selection_mode, SelectionMode::Direct);
+            assert!(restored.compatibility_capture);
+            assert_eq!(restored.icon_style, IconStyle::Letter);
+            assert_eq!(restored.icon_shape, IconShape::Circle);
+            assert_eq!(restored.icon_size, 48);
+            assert_eq!(restored.icon_color, 0x40_48_80);
+            assert_eq!(restored.api_key, "test-only-key");
+            let saved = StoredSettings::from_settings(&restored, encrypted);
+            assert_eq!(saved.version, 1);
+            assert_eq!(saved.api_key_encrypted, [18, 42, 71]);
+        }
+        assert_eq!(ThemePreset::default(), ThemePreset::Amber);
+        assert_eq!(Settings::default().theme_preset, ThemePreset::Amber);
+        assert_eq!(
+            crate::visual::Palette::for_theme(ThemeMode::Light, ThemePreset::Amber).background,
+            0xF4EAD8
+        );
+    }
+
+    #[test]
+    fn color_families_roundtrip_independently_from_theme_mode_and_api_settings() {
+        for (&preset, encoded_name) in THEME_PRESETS
+            .iter()
+            .zip(["ocean", "aurora", "nebula", "amber"])
+        {
+            for mode in [ThemeMode::Dark, ThemeMode::Light] {
+                let original = Settings {
+                    theme_mode: mode,
+                    theme_preset: preset,
+                    base_url: "https://example.com/custom/v1".into(),
+                    model: "custom-model".into(),
+                    timeout_seconds: 37,
+                    api_key: "test-only-key".into(),
+                    source_language: Language::Auto,
+                    target_language: Language::Japanese,
+                    selection_mode: SelectionMode::Direct,
+                    compatibility_capture: true,
+                    icon_style: IconStyle::Leaf,
+                    icon_shape: IconShape::Circle,
+                    icon_size: 48,
+                    icon_color: 0x40_48_80,
+                    ..Settings::default()
+                };
+                let encoded = serde_json::to_value(StoredSettings::from_settings(
+                    &original,
+                    vec![18, 42, 71],
+                ))
+                .unwrap();
+                assert_eq!(encoded["theme_preset"], encoded_name);
+                assert_eq!(encoded["version"], 1);
+                assert!(encoded.get("api_key").is_none());
+                let stored: StoredSettings = serde_json::from_value(encoded).unwrap();
+                assert_eq!(stored.api_key_encrypted, [18, 42, 71]);
+                let restored = stored.into_settings(original.api_key.clone()).unwrap();
+                assert_eq!(restored.theme_preset, preset);
+                assert_eq!(restored.theme_mode, mode);
+                assert_eq!(restored.base_url, original.base_url);
+                assert_eq!(restored.model, original.model);
+                assert_eq!(restored.timeout_seconds, original.timeout_seconds);
+                assert_eq!(restored.api_key, original.api_key);
+                assert_eq!(restored.source_language, original.source_language);
+                assert_eq!(restored.target_language, original.target_language);
+                assert_eq!(restored.selection_button, original.selection_button);
+                assert_eq!(restored.selection_mode, original.selection_mode);
+                assert_eq!(
+                    restored.compatibility_capture,
+                    original.compatibility_capture
+                );
+                assert_eq!(restored.icon_style, original.icon_style);
+                assert_eq!(restored.icon_shape, original.icon_shape);
+                assert_eq!(restored.icon_size, original.icon_size);
+                assert_eq!(restored.icon_color, original.icon_color);
+            }
+        }
+        assert!(
+            serde_json::from_str::<StoredSettings>(r#"{"theme_preset":"unknown-family"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn changing_visual_templates_never_invalidates_translation_cache() {
+        let original = Settings::default();
+        let mut cache = crate::cache::TranslationCache::new();
+        cache.insert(&original, "A quiet workspace.", "安静的工作区。");
+        for &preset in THEME_PRESETS {
+            for mode in [ThemeMode::Dark, ThemeMode::Light] {
+                let changed = Settings {
+                    theme_mode: mode,
+                    theme_preset: preset,
+                    ..original.clone()
+                };
+                assert_eq!(
+                    cache.get(&changed, "A quiet workspace."),
+                    Some("安静的工作区。".into()),
+                    "visual-only change discarded the cache: {preset:?} / {mode:?}"
+                );
+            }
+        }
     }
 
     #[test]

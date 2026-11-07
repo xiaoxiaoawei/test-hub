@@ -1,4 +1,5 @@
 //! Compact native layouts. State and commands stay in the parent module.
+use super::super::surfaces;
 use super::*;
 
 const COMBO_STYLE: u32 =
@@ -144,7 +145,7 @@ unsafe fn question_input(parent: HWND) -> HWND {
 }
 
 pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
-    child(parent, "STATIC", "轻译", SS_LEFT, 200);
+    child(parent, "STATIC", "轻译  LingoLeaf", SS_LEFT, 200);
     icon_button(parent, "切换主题", ID_THEME, "切换白天 / 暗夜");
     child(
         parent,
@@ -155,6 +156,7 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
     );
     child(parent, "BUTTON", "服务", WS_TABSTOP, ID_SERVICE_TAB);
     child(parent, "BUTTON", "偏好", WS_TABSTOP, ID_PREFERENCES_TAB);
+    child(parent, "BUTTON", "外观", WS_TABSTOP, ID_APPEARANCE_TAB);
     child(parent, "STATIC", "翻译服务", SS_LEFT, 202);
     let provider = combo(
         parent,
@@ -232,7 +234,28 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         SS_LEFT,
         218,
     );
-    child(parent, "BUTTON", "图标外观", WS_TABSTOP, ID_APPEARANCE);
+    child(parent, "STATIC", "配色模板", SS_LEFT, 290);
+    child(parent, "STATIC", "选择即应用 · 自动保存", SS_LEFT, 291);
+    for (id, name, description) in [
+        (ID_PRESET_OCEAN, "深海蓝", "沉静蓝调 · 清晰专注"),
+        (ID_PRESET_AURORA, "极光青", "冷冽青绿 · 轻盈明亮"),
+        (ID_PRESET_NEBULA, "星云紫", "柔和紫调 · 灵感空间"),
+        (ID_PRESET_AMBER, "暖砂金", "温润琥珀 · 舒适阅读"),
+    ] {
+        let control = child(
+            parent,
+            "BUTTON",
+            &format!("{name} · {description}"),
+            WS_TABSTOP,
+            id,
+        );
+        tooltip(
+            parent,
+            control,
+            &format!("{name} · 点击应用并保存，支持白天与暗夜模式"),
+        );
+    }
+    child(parent, "BUTTON", "划词图标", WS_TABSTOP, ID_APPEARANCE);
     child(parent, "STATIC", "", SS_LEFT, 276);
     child(parent, "BUTTON", "检查更新", WS_TABSTOP, ID_UPDATE);
     let update_status = child(
@@ -276,6 +299,14 @@ unsafe fn page_visible(parent: HWND, ids: &[u16], visible: bool) {
     }
 }
 
+unsafe fn mark_cards(parent: HWND, ids: &[u16]) {
+    let mut control = GetWindow(parent, GW_CHILD);
+    while !control.is_null() {
+        surfaces::set_card_control(control, ids.contains(&(GetDlgCtrlID(control) as u16)));
+        control = GetWindow(control, GW_HWNDNEXT);
+    }
+}
+
 pub(super) unsafe fn layout_settings(app: &mut App) {
     let hwnd = app.settings_window;
     let scale = dpi(hwnd);
@@ -298,11 +329,14 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
     SetScrollInfo(hwnd, SB_VERT, &scroll, 0);
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
-    let margin = 24;
-    let inner = (width - margin * 2).max(260);
-    let half = (inner - 16) / 2;
-    let language_width = (inner - 56) / 2;
+    let inner = (width - 48).max(280);
+    let content = inner - 40;
+    let tab_width = (inner - 16) / 3;
+    let template_width = (inner - 16) / 2;
+    let language_width = (content - 60) / 2;
     let service = SETTINGS_PAGE.get() == SettingsPage::Service;
+    let preferences = SETTINGS_PAGE.get() == SettingsPage::Preferences;
+    let appearance = SETTINGS_PAGE.get() == SettingsPage::Appearance;
     page_visible(
         hwnd,
         &[
@@ -334,65 +368,129 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_COMPATIBILITY,
             ID_PAUSE,
             218,
-            ID_APPEARANCE,
-            276,
             ID_UPDATE,
             219,
         ],
-        !service,
+        preferences,
+    );
+    page_visible(
+        hwnd,
+        &[
+            290,
+            291,
+            ID_PRESET_OCEAN,
+            ID_PRESET_AURORA,
+            ID_PRESET_NEBULA,
+            ID_PRESET_AMBER,
+            ID_APPEARANCE,
+            276,
+        ],
+        appearance,
+    );
+    mark_cards(
+        hwnd,
+        &[
+            202,
+            ID_PROVIDER,
+            204,
+            211,
+            ID_KEY_VISIBILITY,
+            203,
+            210,
+            205,
+            212,
+            ID_TEST,
+            206,
+            213,
+            274,
+            ID_SOURCE_LANGUAGE,
+            275,
+            ID_TARGET_LANGUAGE,
+            ID_SWAP_LANGUAGES,
+            ID_AUTO,
+            ID_SELECTION_MODE,
+            ID_COMPATIBILITY,
+            ID_PAUSE,
+            218,
+            ID_UPDATE,
+            219,
+            ID_APPEARANCE,
+            276,
+        ],
     );
     let positions = [
-        (200, margin, 16, inner - 48, 32),
-        (ID_THEME, width - margin - 32, 18, 32, 32),
-        (201, margin, 55, inner, 22),
-        (ID_SERVICE_TAB, margin, 88, half, 32),
-        (ID_PREFERENCES_TAB, margin + half + 16, 88, half, 32),
-        (202, margin, 140, inner, 22),
-        (ID_PROVIDER, margin, 164, inner, 180),
-        (204, margin, 208, inner, 22),
-        (211, margin, 232, inner - 40, 32),
-        (ID_KEY_VISIBILITY, width - margin - 32, 232, 32, 32),
-        (203, margin, 276, inner, 22),
-        (210, margin, 300, inner, 32),
-        (205, margin, 344, inner - 112, 22),
-        (206, width - margin - 88, 344, 88, 22),
-        (212, margin, 368, inner - 128, 32),
-        (ID_TEST, width - margin - 120, 368, 32, 32),
-        (213, width - margin - 80, 368, 80, 32),
-        (274, margin, 140, language_width, 22),
-        (275, margin + language_width + 56, 140, language_width, 22),
-        (ID_SOURCE_LANGUAGE, margin, 164, language_width, 200),
-        (ID_SWAP_LANGUAGES, margin + language_width + 12, 164, 28, 30),
+        (200, 24, 18, inner - 48, 34),
+        (ID_THEME, width - 60, 20, 36, 36),
+        (201, 24, 60, inner, 20),
+        (ID_SERVICE_TAB, 24, 96, tab_width, 36),
+        (ID_PREFERENCES_TAB, 24 + tab_width + 8, 96, tab_width, 36),
+        (
+            ID_APPEARANCE_TAB,
+            24 + (tab_width + 8) * 2,
+            96,
+            inner - (tab_width + 8) * 2,
+            36,
+        ),
+        (202, 44, 164, content, 18),
+        (ID_PROVIDER, 44, 186, content, 200),
+        (204, 44, 230, content, 18),
+        (211, 44, 252, content - 44, 36),
+        (ID_KEY_VISIBILITY, width - 80, 252, 36, 36),
+        (203, 44, 296, content, 18),
+        (210, 44, 318, content, 36),
+        (205, 44, 362, content - 128, 18),
+        (206, width - 120, 362, 76, 18),
+        (212, 44, 384, content - 128, 36),
+        (ID_TEST, width - 164, 384, 36, 36),
+        (213, width - 120, 384, 76, 36),
+        (274, 44, 164, language_width, 18),
+        (275, 104 + language_width, 164, language_width, 18),
+        (ID_SOURCE_LANGUAGE, 44, 188, language_width, 210),
+        (ID_SWAP_LANGUAGES, 56 + language_width, 188, 36, 36),
         (
             ID_TARGET_LANGUAGE,
-            margin + language_width + 56,
-            164,
+            104 + language_width,
+            188,
             language_width,
-            200,
+            210,
         ),
-        (ID_AUTO, margin, 218, 166, 28),
-        (ID_SELECTION_MODE, margin + 182, 214, inner - 182, 156),
-        (ID_COMPATIBILITY, margin, 258, inner - 100, 28),
-        (ID_PAUSE, width - margin - 88, 256, 88, 30),
-        (218, margin + 28, 294, inner - 28, 36),
-        (ID_APPEARANCE, margin, 342, 104, 32),
-        (276, margin + 120, 348, inner - 120, 24),
-        (ID_UPDATE, margin, 390, 104, 32),
-        (219, margin + 120, 388, inner - 120, 44),
+        (ID_AUTO, 44, 252, 164, 28),
+        (ID_SELECTION_MODE, 224, 248, content - 180, 170),
+        (ID_COMPATIBILITY, 44, 302, content - 116, 28),
+        (ID_PAUSE, width - 148, 296, 104, 36),
+        (218, 72, 340, content - 28, 32),
+        (ID_UPDATE, 44, 392, 112, 36),
+        (219, 172, 392, content - 128, 42),
+        (290, 24, 152, 144, 22),
+        (291, 176, 154, inner - 152, 20),
+        (ID_PRESET_OCEAN, 24, 184, template_width, 104),
         (
-            215,
-            margin,
-            if service { 416 } else { 436 },
-            inner,
-            if service { 36 } else { 20 },
+            ID_PRESET_AURORA,
+            40 + template_width,
+            184,
+            template_width,
+            104,
         ),
-        (ID_SAVE, width - margin - 104, 462, 104, 34),
+        (ID_PRESET_NEBULA, 24, 300, template_width, 104),
+        (
+            ID_PRESET_AMBER,
+            40 + template_width,
+            300,
+            template_width,
+            104,
+        ),
+        (ID_APPEARANCE, 44, 426, 112, 32),
+        (276, 172, 432, content - 128, 24),
+        (215, 24, 484, inner, 36),
+        (ID_SAVE, width - 136, 540, 112, 36),
     ];
     for (id, x, y, w, h) in positions {
-        let face = if id == 200 {
-            font(scale, 24, FW_SEMIBOLD as i32)
-        } else {
-            face
+        let control_font = match id {
+            200 => font(scale, 26, FW_SEMIBOLD as i32),
+            201 | 215 | 218 | 219 | 276 | 291 => font(scale, 12, FW_NORMAL as i32),
+            202..=206 | 274 | 275 => font(scale, 12, FW_NORMAL as i32),
+            290 => font(scale, 15, FW_SEMIBOLD as i32),
+            _ => face,
         };
         place(
             GetDlgItem(hwnd, id as i32),
@@ -401,7 +499,7 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             w,
             h,
             scale,
-            face,
+            control_font,
         );
     }
     redraw_layout(hwnd);
@@ -453,43 +551,57 @@ pub(super) unsafe fn layout_appearance(app: &mut App) {
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
     let height = rect.bottom * 96 / scale as i32;
-    let half = (width - 60) / 2;
+    let half = (width - 88) / 2;
     let preview_size = app
         .preview_icons
         .as_ref()
         .map(|icon| icon.chip_size() * 96 / scale as i32)
         .unwrap_or(32)
         .clamp(16, 64);
+    mark_cards(
+        hwnd,
+        &[
+            242,
+            ID_ICON_STYLE,
+            245,
+            ID_ICON_SHAPE,
+            246,
+            ID_ICON_SIZE,
+            243,
+            ID_ICON_COLOR,
+            ID_SCREEN_PICK,
+        ],
+    );
     let positions = [
-        (240, 22, 14, width - 44, 30),
-        (241, 22, 48, width - 44, 22),
-        (242, 22, 82, half, 22),
-        (ID_ICON_STYLE, 22, 106, half, 150),
-        (245, 38 + half, 82, half, 22),
-        (ID_ICON_SHAPE, 38 + half, 106, half, 150),
-        (246, 22, 151, width - 142, 22),
-        (ID_ICON_SIZE, 22, 177, 96, 30),
+        (240, 24, 16, width - 120, 30),
+        (241, 24, 50, width - 120, 20),
         (
             234,
-            width - 94 + (64 - preview_size) / 2,
-            145 + (64 - preview_size) / 2,
+            width - 84 + (64 - preview_size) / 2,
+            10 + (64 - preview_size) / 2,
             preview_size,
             preview_size,
         ),
-        (243, 22, 224, 42, 22),
-        (ID_ICON_COLOR, 74, 218, width - 218, 32),
-        (ID_SCREEN_PICK, width - 132, 218, 110, 32),
-        (235, 22, 260, width - 44, (height - 316).max(24)),
-        (ID_ICON_RESET, 22, height - 48, 104, 32),
-        (ID_ICON_APPLY, width - 126, height - 48, 104, 32),
+        (242, 36, 98, half, 18),
+        (ID_ICON_STYLE, 36, 122, half, 170),
+        (245, 52 + half, 98, half, 18),
+        (ID_ICON_SHAPE, 52 + half, 122, half, 170),
+        (246, 36, 176, 104, 18),
+        (ID_ICON_SIZE, 36, 200, 88, 34),
+        (243, 144, 176, width - 180, 18),
+        (ID_ICON_COLOR, 144, 200, width - 304, 34),
+        (ID_SCREEN_PICK, width - 144, 200, 108, 34),
+        (235, 24, height - 94, width - 48, 30),
+        (ID_ICON_RESET, 24, height - 48, 104, 32),
+        (ID_ICON_APPLY, width - 128, height - 48, 104, 32),
     ];
     for (id, x, y, w, h) in positions {
-        let face = if id == 240 {
-            font(scale, 21, FW_SEMIBOLD as i32)
-        } else {
-            face
+        let control_font = match id {
+            240 => font(scale, 22, FW_SEMIBOLD as i32),
+            241 | 235 | 242 | 245 | 246 | 243 => font(scale, 12, FW_NORMAL as i32),
+            _ => face,
         };
-        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, face);
+        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
     }
     redraw_layout(hwnd);
 }
@@ -550,19 +662,24 @@ pub(super) unsafe fn layout_inline(app: &mut App) {
     let width = rect.right * 96 / scale as i32;
     let height = rect.bottom * 96 / scale as i32;
     let positions = [
-        (250, 12, 12, width - 188, 24),
-        (ID_RETRY, width - 172, 8, 28, 28),
-        (ID_PIN, width - 140, 8, 28, 28),
-        (ID_COPY, width - 108, 8, 28, 28),
-        (ID_INLINE_EXPAND, width - 76, 8, 28, 28),
-        (ID_INLINE_CLOSE, width - 44, 8, 28, 28),
-        (251, 12, 44, width - 24, (height - 116).max(48)),
-        (254, 12, height - 65, width - 24, 20),
-        (ID_QUESTION, 12, height - 40, width - 64, 28),
-        (ID_SEND, width - 40, height - 40, 28, 28),
+        (250, 16, 14, width - 196, 24),
+        (ID_RETRY, width - 172, 12, 28, 28),
+        (ID_PIN, width - 140, 12, 28, 28),
+        (ID_COPY, width - 108, 12, 28, 28),
+        (ID_INLINE_EXPAND, width - 76, 12, 28, 28),
+        (ID_INLINE_CLOSE, width - 44, 12, 28, 28),
+        (251, 16, 52, width - 32, (height - 128).max(48)),
+        (254, 16, height - 68, width - 32, 18),
+        (ID_QUESTION, 16, height - 44, width - 72, 30),
+        (ID_SEND, width - 44, height - 44, 28, 30),
     ];
     for (id, x, y, w, h) in positions {
-        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, face);
+        let control_font = if id == 254 {
+            font(scale, 12, FW_NORMAL as i32)
+        } else {
+            face
+        };
+        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
     }
     redraw_layout(hwnd);
 }
@@ -628,28 +745,28 @@ pub(super) unsafe fn layout_result(app: &mut App) {
     GetClientRect(hwnd, &mut rect);
     let width = rect.right * 96 / scale as i32;
     let height = rect.bottom * 96 / scale as i32;
-    let inner = width - 40;
+    let inner = width - 48;
     let positions = [
-        (220, 20, 16, inner - 160, 28),
-        (ID_RETRY, width - 160, 13, 32, 32),
-        (ID_PIN, width - 124, 13, 32, 32),
-        (ID_COPY, width - 88, 13, 32, 32),
-        (ID_SETTINGS, width - 52, 13, 32, 32),
-        (221, 20, 58, inner, 20),
-        (222, 20, 82, inner, 58),
-        (223, 20, 152, inner, 20),
-        (224, 20, 176, inner, (height - 260).max(50)),
-        (225, 20, height - 76, inner, 22),
-        (ID_QUESTION, 20, height - 44, inner - 44, 30),
-        (ID_SEND, width - 52, height - 44, 32, 30),
+        (220, 24, 20, inner - 168, 28),
+        (ID_RETRY, width - 164, 17, 32, 32),
+        (ID_PIN, width - 128, 17, 32, 32),
+        (ID_COPY, width - 92, 17, 32, 32),
+        (ID_SETTINGS, width - 56, 17, 32, 32),
+        (221, 24, 66, inner, 18),
+        (222, 24, 90, inner, 64),
+        (223, 24, 170, inner, 18),
+        (224, 24, 194, inner, (height - 286).max(48)),
+        (225, 24, height - 80, inner, 18),
+        (ID_QUESTION, 24, height - 48, inner - 44, 32),
+        (ID_SEND, width - 56, height - 48, 32, 32),
     ];
     for (id, x, y, w, h) in positions {
-        let face = if id == 220 {
-            font(scale, 19, FW_SEMIBOLD as i32)
-        } else {
-            face
+        let control_font = match id {
+            220 => font(scale, 18, FW_SEMIBOLD as i32),
+            221 | 223 | 225 => font(scale, 12, FW_NORMAL as i32),
+            _ => face,
         };
-        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, face);
+        place(GetDlgItem(hwnd, id as i32), x, y, w, h, scale, control_font);
     }
     redraw_layout(hwnd);
 }

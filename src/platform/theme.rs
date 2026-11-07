@@ -1,14 +1,18 @@
-//! Warm native palette and owner drawing. These helpers never borrow App state,
+//! Native palette families and rounded owner drawing. These helpers never borrow App state,
 //! so synchronous WM_CTLCOLOR / WM_DRAWITEM callbacks can use them during layout.
 
-use crate::config::ThemeMode;
+use crate::{
+    config::{ThemeMode, ThemePreset},
+    visual::Palette,
+};
 use std::{mem::size_of, ptr::null};
 use windows_sys::Win32::{
     Foundation::{COLORREF, HWND, POINT, RECT},
     Graphics::{Dwm::*, Gdi::*},
     UI::{
         Controls::{
-            SetWindowTheme, DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED,
+            SetWindowTheme, DRAWITEMSTRUCT, ODS_COMBOBOXEDIT, ODS_DISABLED, ODS_FOCUS,
+            ODS_HOTLIGHT, ODS_SELECTED,
         },
         HiDpi::GetDpiForWindow,
         WindowsAndMessaging::{
@@ -17,73 +21,29 @@ use windows_sys::Win32::{
     },
 };
 
-const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
-    red as u32 | ((green as u32) << 8) | ((blue as u32) << 16)
-}
-
-pub(crate) const BACKGROUND: COLORREF = rgb(0x21, 0x1d, 0x1b);
-pub(crate) const SURFACE: COLORREF = rgb(0x30, 0x29, 0x25);
-pub(crate) const TEXT: COLORREF = rgb(0xf1, 0xe5, 0xd8);
-pub(crate) const MUTED: COLORREF = rgb(0xbb, 0xaa, 0x99);
-pub(crate) const ACCENT: COLORREF = rgb(0xd6, 0xa5, 0x75);
-pub(crate) const BORDER: COLORREF = rgb(0x59, 0x49, 0x3e);
-const SURFACE_ACTIVE: COLORREF = rgb(0x40, 0x34, 0x2c);
-const ACCENT_ACTIVE: COLORREF = rgb(0xbd, 0x8e, 0x62);
-
-#[derive(Clone, Copy)]
-struct Colors {
-    background: COLORREF,
-    surface: COLORREF,
-    text: COLORREF,
-    muted: COLORREF,
-    accent: COLORREF,
-    border: COLORREF,
-    surface_active: COLORREF,
-    accent_active: COLORREF,
-    combo_selected_text: COLORREF,
-}
-
-impl Colors {
-    const fn for_mode(mode: ThemeMode) -> Self {
-        match mode {
-            ThemeMode::Dark => Self {
-                background: BACKGROUND,
-                surface: SURFACE,
-                text: TEXT,
-                muted: MUTED,
-                accent: ACCENT,
-                border: BORDER,
-                surface_active: SURFACE_ACTIVE,
-                accent_active: ACCENT_ACTIVE,
-                combo_selected_text: ACCENT,
-            },
-            ThemeMode::Light => Self {
-                background: rgb(0xf4, 0xea, 0xd8),
-                surface: rgb(0xff, 0xf8, 0xea),
-                text: rgb(0x33, 0x27, 0x1e),
-                muted: rgb(0x75, 0x62, 0x4d),
-                accent: rgb(0x8d, 0x5a, 0x39),
-                border: rgb(0xa1, 0x8a, 0x6d),
-                surface_active: rgb(0xe6, 0xd6, 0xbc),
-                accent_active: rgb(0x73, 0x43, 0x29),
-                combo_selected_text: rgb(0x33, 0x27, 0x1e),
-            },
-        }
-    }
+pub(crate) const fn color(rgb: u32) -> COLORREF {
+    ((rgb >> 16) & 255) | (rgb & 0xFF00) | ((rgb & 255) << 16)
 }
 
 /// Keep this value on the UI thread until all windows using its brushes close.
 pub(crate) struct Theme {
     pub background_color: COLORREF,
     pub surface_color: COLORREF,
+    pub card_color: COLORREF,
+    pub raised_color: COLORREF,
+    pub on_accent_color: COLORREF,
+    mode: ThemeMode,
     pub text_color: COLORREF,
     pub muted_color: COLORREF,
     pub accent_color: COLORREF,
     pub border_color: COLORREF,
     pub background: HBRUSH,
     pub surface: HBRUSH,
+    pub card: HBRUSH,
+    pub raised: HBRUSH,
     pub accent: HBRUSH,
     surface_active: HBRUSH,
+    selection: HBRUSH,
     accent_active: HBRUSH,
     border_pen: HPEN,
     accent_pen: HPEN,
@@ -93,39 +53,234 @@ pub(crate) struct Theme {
 }
 
 impl Theme {
-    pub(crate) fn new(mode: ThemeMode) -> Result<Self, String> {
-        let colors = Colors::for_mode(mode);
+    pub(crate) fn new(mode: ThemeMode, preset: ThemePreset) -> Result<Self, String> {
+        let colors = Palette::for_theme(mode, preset);
         let mut theme = Self {
-            background_color: colors.background,
-            surface_color: colors.surface,
-            text_color: colors.text,
-            muted_color: colors.muted,
-            accent_color: colors.accent,
-            border_color: colors.border,
+            mode,
+            card_color: color(colors.card),
+            raised_color: color(colors.raised),
+            on_accent_color: color(colors.on_accent),
+            background_color: color(colors.background),
+            surface_color: color(colors.surface),
+            text_color: color(colors.text),
+            muted_color: color(colors.muted),
+            accent_color: color(colors.accent),
+            border_color: color(colors.border),
             background: std::ptr::null_mut(),
             surface: std::ptr::null_mut(),
+            card: std::ptr::null_mut(),
+            raised: std::ptr::null_mut(),
             accent: std::ptr::null_mut(),
             surface_active: std::ptr::null_mut(),
+            selection: std::ptr::null_mut(),
             accent_active: std::ptr::null_mut(),
             border_pen: std::ptr::null_mut(),
             accent_pen: std::ptr::null_mut(),
             primary_pen: std::ptr::null_mut(),
             check_pen: std::ptr::null_mut(),
-            combo_selected_text: colors.combo_selected_text,
+            combo_selected_text: color(colors.selection_text),
         };
         // Assign each resource immediately, so Drop also cleans partial failure.
         unsafe {
             theme.background = checked(CreateSolidBrush(theme.background_color))?;
             theme.surface = checked(CreateSolidBrush(theme.surface_color))?;
             theme.accent = checked(CreateSolidBrush(theme.accent_color))?;
-            theme.surface_active = checked(CreateSolidBrush(colors.surface_active))?;
-            theme.accent_active = checked(CreateSolidBrush(colors.accent_active))?;
+            theme.card = checked(CreateSolidBrush(theme.card_color))?;
+            theme.raised = checked(CreateSolidBrush(theme.raised_color))?;
+            theme.surface_active = checked(CreateSolidBrush(theme.raised_color))?;
+            theme.selection = checked(CreateSolidBrush(color(colors.selection)))?;
+            theme.accent_active = checked(CreateSolidBrush(color(colors.accent_active)))?;
             theme.border_pen = checked(CreatePen(PS_SOLID, 1, theme.border_color))?;
             theme.accent_pen = checked(CreatePen(PS_SOLID, 1, theme.accent_color))?;
-            theme.primary_pen = checked(CreatePen(PS_SOLID, 1, colors.accent_active))?;
-            theme.check_pen = checked(CreatePen(PS_SOLID, 2, colors.background))?;
+            theme.primary_pen = checked(CreatePen(PS_SOLID, 1, color(colors.accent_active)))?;
+            theme.check_pen = checked(CreatePen(PS_SOLID, 2, theme.on_accent_color))?;
         }
         Ok(theme)
+    }
+
+    unsafe fn control_backdrop(&self, control: HWND) -> HBRUSH {
+        if super::surfaces::is_card_control(control) {
+            self.card
+        } else {
+            self.background
+        }
+    }
+
+    /// Paint a rounded grouping surface after the window background is filled.
+    pub(crate) unsafe fn draw_card(&self, dc: HDC, rect: RECT, radius: i32) {
+        let saved = SaveDC(dc);
+        if saved == 0 {
+            return;
+        }
+        SelectObject(dc, self.card);
+        SelectObject(dc, self.border_pen);
+        RoundRect(
+            dc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        RestoreDC(dc, saved);
+    }
+
+    /// A real BUTTON remains underneath this preview for keyboard and MSAA.
+    pub(crate) unsafe fn draw_preset(
+        &self,
+        info: &DRAWITEMSTRUCT,
+        font: HFONT,
+        preset: ThemePreset,
+        selected: bool,
+    ) {
+        let dc = info.hDC;
+        let saved = SaveDC(dc);
+        if saved == 0 {
+            return;
+        }
+        let colors = Palette::for_theme(self.mode, preset);
+        let bounds = info.rcItem;
+        FillRect(dc, &bounds, self.background);
+        let card = CreateSolidBrush(color(colors.card));
+        let outline = CreatePen(
+            PS_SOLID,
+            if selected { scale(info.hwndItem, 2) } else { 1 },
+            color(if selected {
+                colors.accent
+            } else {
+                colors.border
+            }),
+        );
+        if card.is_null() || outline.is_null() {
+            RestoreDC(dc, saved);
+            if !card.is_null() {
+                DeleteObject(card);
+            }
+            if !outline.is_null() {
+                DeleteObject(outline);
+            }
+            return;
+        }
+        SelectObject(dc, card);
+        SelectObject(dc, outline);
+        let gap = scale(info.hwndItem, 2);
+        let rect = RECT {
+            left: bounds.left + gap,
+            top: bounds.top + gap,
+            right: bounds.right - gap,
+            bottom: bounds.bottom - gap,
+        };
+        let diameter = scale(info.hwndItem, 28);
+        RoundRect(
+            dc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            diameter,
+            diameter,
+        );
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        for (index, swatch) in [colors.accent, colors.raised, colors.background]
+            .into_iter()
+            .enumerate()
+        {
+            let brush = CreateSolidBrush(color(swatch));
+            if !brush.is_null() {
+                let previous = SelectObject(dc, brush);
+                let x = rect.left + scale(info.hwndItem, 16 + index as i32 * 16);
+                let y = rect.top + scale(info.hwndItem, 15);
+                let side = scale(info.hwndItem, 10);
+                Ellipse(dc, x, y, x + side, y + side);
+                SelectObject(dc, previous);
+                DeleteObject(brush);
+            }
+        }
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, color(colors.text));
+        SelectObject(dc, font);
+        let mut title = RECT {
+            left: rect.left + scale(info.hwndItem, 16),
+            top: rect.top + scale(info.hwndItem, 34),
+            right: rect.right - scale(info.hwndItem, 12),
+            bottom: rect.top + scale(info.hwndItem, 60),
+        };
+        DrawTextW(
+            dc,
+            wide(preset.label()).as_ptr(),
+            -1,
+            &mut title,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        let mut detail_face: LOGFONTW = std::mem::zeroed();
+        let mut detail_font = std::ptr::null_mut();
+        if GetObjectW(
+            font,
+            size_of::<LOGFONTW>() as i32,
+            (&mut detail_face as *mut LOGFONTW).cast(),
+        ) != 0
+        {
+            detail_face.lfHeight = -scale(info.hwndItem, 12);
+            detail_face.lfWeight = FW_NORMAL as i32;
+            detail_font = CreateFontIndirectW(&detail_face);
+            if !detail_font.is_null() {
+                SelectObject(dc, detail_font);
+            }
+        }
+        SetTextColor(dc, color(colors.muted));
+        let mut detail = RECT {
+            top: rect.top + scale(info.hwndItem, 64),
+            bottom: rect.bottom - scale(info.hwndItem, 8),
+            ..title
+        };
+        DrawTextW(
+            dc,
+            wide(preset.subtitle()).as_ptr(),
+            -1,
+            &mut detail,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        if selected {
+            SelectObject(dc, outline);
+            let x = rect.right - scale(info.hwndItem, 24);
+            let y = rect.top + scale(info.hwndItem, 20);
+            let points = [
+                POINT {
+                    x: x - scale(info.hwndItem, 5),
+                    y,
+                },
+                POINT {
+                    x: x - scale(info.hwndItem, 1),
+                    y: y + scale(info.hwndItem, 4),
+                },
+                POINT {
+                    x: x + scale(info.hwndItem, 7),
+                    y: y - scale(info.hwndItem, 5),
+                },
+            ];
+            Polyline(dc, points.as_ptr(), 3);
+        }
+        if info.itemState & ODS_FOCUS != 0 {
+            SelectObject(dc, outline);
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let inset = scale(info.hwndItem, 6);
+            RoundRect(
+                dc,
+                rect.left + inset,
+                rect.top + inset,
+                rect.right - inset,
+                rect.bottom - inset,
+                diameter - inset,
+                diameter - inset,
+            );
+        }
+        RestoreDC(dc, saved);
+        if !detail_font.is_null() {
+            DeleteObject(detail_font);
+        }
+        DeleteObject(outline);
+        DeleteObject(card);
     }
 
     /// Paint a BS_OWNERDRAW push button using the caller's current DPI font.
@@ -164,10 +319,10 @@ impl Theme {
             self.border_pen
         };
         let mut rect = info.rcItem;
-        FillRect(dc, &rect, self.background);
+        FillRect(dc, &rect, self.control_backdrop(info.hwndItem));
         SelectObject(dc, brush);
         SelectObject(dc, pen);
-        let radius = scale(info.hwndItem, 9);
+        let radius = scale(info.hwndItem, 26);
         RoundRect(
             dc,
             rect.left,
@@ -210,7 +365,7 @@ impl Theme {
             if disabled {
                 self.muted_color
             } else if primary {
-                self.background_color
+                self.on_accent_color
             } else {
                 self.text_color
             },
@@ -253,13 +408,22 @@ impl Theme {
             dc,
             &rect,
             if selected && !disabled {
-                self.surface_active
+                self.selection
             } else {
                 self.surface
             },
         );
-        if focused && !disabled {
+        let collapsed = info.itemState & ODS_COMBOBOXEDIT != 0;
+        if focused && !disabled && !collapsed {
             FrameRect(dc, &rect, self.accent);
+        }
+        if collapsed {
+            let mut combo: windows_sys::Win32::UI::Controls::COMBOBOXINFO = std::mem::zeroed();
+            combo.cbSize = size_of::<windows_sys::Win32::UI::Controls::COMBOBOXINFO>() as u32;
+            if windows_sys::Win32::UI::Controls::GetComboBoxInfo(info.hwndItem, &mut combo) != 0 {
+                let native_arrow = (combo.rcButton.right - combo.rcButton.left).max(0);
+                rect.right -= (scale(info.hwndItem, 34) - native_arrow).max(0);
+            }
         }
         let mut text: Vec<u16> = "选择服务\0".encode_utf16().collect();
         if info.itemID != u32::MAX {
@@ -322,7 +486,7 @@ impl Theme {
         let rect = info.rcItem;
         let left = rect.left + scale(info.hwndItem, 2);
         let top = rect.top + ((rect.bottom - rect.top - size) / 2);
-        FillRect(dc, &rect, self.background);
+        FillRect(dc, &rect, self.control_backdrop(info.hwndItem));
         SelectObject(
             dc,
             if checked && !disabled {
@@ -339,7 +503,7 @@ impl Theme {
                 self.border_pen
             },
         );
-        let radius = scale(info.hwndItem, 5);
+        let radius = scale(info.hwndItem, 8);
         RoundRect(dc, left, top, left + size, top + size, radius, radius);
         if checked {
             SelectObject(dc, self.check_pen);
@@ -390,6 +554,9 @@ impl Drop for Theme {
         for object in [
             self.background,
             self.surface,
+            self.card,
+            self.raised,
+            self.selection,
             self.accent,
             self.surface_active,
             self.accent_active,
@@ -420,16 +587,16 @@ fn checked(object: HGDIOBJ) -> Result<HGDIOBJ, String> {
 ///
 /// # Safety
 /// `hwnd` must refer to a live top-level window owned by the current UI thread.
-pub(crate) unsafe fn apply_window(hwnd: HWND, mode: ThemeMode) {
-    let colors = Colors::for_mode(mode);
+pub(crate) unsafe fn apply_window(hwnd: HWND, mode: ThemeMode, preset: ThemePreset) {
+    let colors = Palette::for_theme(mode, preset);
     attribute(
         hwnd,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
         &i32::from(mode == ThemeMode::Dark),
     );
-    attribute(hwnd, DWMWA_CAPTION_COLOR, &colors.background);
-    attribute(hwnd, DWMWA_TEXT_COLOR, &colors.text);
-    attribute(hwnd, DWMWA_BORDER_COLOR, &colors.border);
+    attribute(hwnd, DWMWA_CAPTION_COLOR, &color(colors.background));
+    attribute(hwnd, DWMWA_TEXT_COLOR, &color(colors.text));
+    attribute(hwnd, DWMWA_BORDER_COLOR, &color(colors.border));
     attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_ROUND);
 }
 
@@ -439,13 +606,26 @@ pub(crate) unsafe fn apply_window(hwnd: HWND, mode: ThemeMode) {
 /// # Safety
 /// `hwnd` must refer to a live native child control on the current UI thread.
 pub(crate) unsafe fn style_edit(hwnd: HWND, mode: ThemeMode) {
+    let mut class = [0u16; 24];
+    let length = windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW(
+        hwnd,
+        class.as_mut_ptr(),
+        class.len() as i32,
+    )
+    .max(0) as usize;
+    let combo = String::from_utf16_lossy(&class[..length]).eq_ignore_ascii_case("COMBOBOX");
     let theme: Vec<u16> = match mode {
         ThemeMode::Dark => "DarkMode_Explorer\0",
         ThemeMode::Light => "Explorer\0",
     }
     .encode_utf16()
     .collect();
-    let _ = SetWindowTheme(hwnd, theme.as_ptr(), null());
+    if combo {
+        let empty = [0u16];
+        let _ = SetWindowTheme(hwnd, empty.as_ptr(), empty.as_ptr());
+    } else {
+        let _ = SetWindowTheme(hwnd, theme.as_ptr(), null());
+    }
 }
 
 unsafe fn attribute<T>(hwnd: HWND, id: DWMWINDOWATTRIBUTE, value: &T) {
@@ -455,6 +635,10 @@ unsafe fn attribute<T>(hwnd: HWND, id: DWMWINDOWATTRIBUTE, value: &T) {
         (value as *const T).cast(),
         size_of::<T>() as u32,
     );
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
 }
 
 unsafe fn label(hwnd: HWND) -> Vec<u16> {

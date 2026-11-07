@@ -6,6 +6,7 @@ mod picker;
 mod popup;
 pub mod selection;
 mod selection_events;
+mod surfaces;
 mod symbols;
 mod theme;
 pub mod update_install;

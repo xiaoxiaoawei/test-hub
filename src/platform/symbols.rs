@@ -56,17 +56,23 @@ pub(crate) unsafe fn draw_button(
     let hot = item.itemState & ODS_HOTLIGHT != 0 && !disabled;
     let focused = item.itemState & ODS_FOCUS != 0 && !disabled;
     let latched = matches!(symbol, Symbol::PinActive) && !disabled;
-    let background = if pressed {
-        blend(palette.surface_color, palette.accent_color, 24)
-    } else if latched {
-        blend(palette.background_color, palette.accent_color, 18)
-    } else if hot {
-        palette.surface_color
+    let on_card = unsafe { super::surfaces::is_card_control(item.hwndItem) };
+    let backdrop = if on_card {
+        palette.card_color
     } else {
         palette.background_color
     };
+    let background = if pressed {
+        blend(palette.surface_color, palette.accent_color, 24)
+    } else if latched {
+        blend(backdrop, palette.accent_color, 18)
+    } else if hot {
+        palette.surface_color
+    } else {
+        backdrop
+    };
     let foreground = if disabled {
-        blend(palette.background_color, palette.muted_color, 58)
+        blend(backdrop, palette.muted_color, 58)
     } else if hot
         || pressed
         || latched
@@ -79,7 +85,15 @@ pub(crate) unsafe fn draw_button(
 
     unsafe {
         IntersectClipRect(item.hDC, rect.left, rect.top, rect.right, rect.bottom);
-        FillRect(item.hDC, &rect, palette.background);
+        FillRect(
+            item.hDC,
+            &rect,
+            if on_card {
+                palette.card
+            } else {
+                palette.background
+            },
+        );
         if hot || pressed || latched {
             if let Some(brush) = paint.brush(background) {
                 SelectObject(item.hDC, brush);

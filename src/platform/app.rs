@@ -1,7 +1,7 @@
 //! Native Windows message loop. UIA and HTTP never run on this thread.
 use super::{
-    clipboard_copy, icons, mouse, picker, popup, selection, selection_events, symbols, theme,
-    update_install,
+    clipboard_copy, icons, mouse, picker, popup, selection, selection_events, surfaces, symbols,
+    theme, update_install,
 };
 use crate::{cache::TranslationCache, config, mailbox, translation, update};
 use std::{
@@ -95,20 +95,26 @@ const ID_SERVICE_TAB: u16 = 270;
 const ID_PREFERENCES_TAB: u16 = 271;
 const ID_SOURCE_LANGUAGE: u16 = 272;
 const ID_TARGET_LANGUAGE: u16 = 273;
+const ID_APPEARANCE_TAB: u16 = 280;
+const ID_PRESET_OCEAN: u16 = 281;
+const ID_PRESET_AURORA: u16 = 282;
+const ID_PRESET_NEBULA: u16 = 283;
+const ID_PRESET_AMBER: u16 = 284;
 const APPEARANCE_WIDTH: i32 = 440;
 const APPEARANCE_HEIGHT: i32 = 380;
 const INLINE_WIDTH: i32 = 400;
-const INLINE_HEIGHT: i32 = 278;
-const SETTINGS_WIDTH: i32 = 460;
-const SETTINGS_HEIGHT: i32 = 548;
-const SETTINGS_CONTENT_HEIGHT: i32 = 506;
-const RESULT_WIDTH: i32 = 480;
-const RESULT_HEIGHT: i32 = 480;
+const INLINE_HEIGHT: i32 = 286;
+const SETTINGS_WIDTH: i32 = 520;
+const SETTINGS_HEIGHT: i32 = 636;
+const SETTINGS_CONTENT_HEIGHT: i32 = 588;
+const RESULT_WIDTH: i32 = 500;
+const RESULT_HEIGHT: i32 = 500;
 
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsPage {
     Service,
     Preferences,
+    Appearance,
 }
 
 thread_local! {
@@ -121,6 +127,9 @@ thread_local! {
     // Painting must also work during synchronous callbacks while App is borrowed.
     static THEME: RefCell<Option<theme::Theme>> = const { RefCell::new(None) };
     static FONTS: RefCell<HashMap<(u32, i32, i32), HFONT>> = RefCell::new(HashMap::new());
+    static CURRENT_PRESET: Cell<config::ThemePreset> = const { Cell::new(config::ThemePreset::Amber) };
+    static SETTINGS_WINDOW: Cell<isize> = const { Cell::new(0) };
+    static APPEARANCE_WINDOW: Cell<isize> = const { Cell::new(0) };
     static CHIP_WINDOW: Cell<isize> = const { Cell::new(0) };
     static AUTO_CHECKED: Cell<bool> = const { Cell::new(true) };
     static COMPATIBILITY_CHECKED: Cell<bool> = const { Cell::new(false) };
@@ -342,13 +351,15 @@ unsafe fn run_inner() -> Result<(), String> {
         Err(error) => (config::Settings::default(), Some(error)),
     };
     CURRENT_THEME.set(settings.theme_mode);
+    CURRENT_PRESET.set(settings.theme_preset);
     let instance = GetModuleHandleW(null());
     // Win32 integer resource ID, not an address that will be dereferenced.
     let mut icon = LoadIconW(instance, std::ptr::without_provenance(1));
     if icon.is_null() {
         icon = LoadIconW(null_mut(), IDI_APPLICATION);
     }
-    let palette = theme::Theme::new(settings.theme_mode)?;
+    let palette = theme::Theme::new(settings.theme_mode, settings.theme_preset)?;
+    surfaces::set_palette(&palette);
     THEME.with(|cell| *cell.borrow_mut() = Some(palette));
     let class = WNDCLASSW {
         style: 0,
@@ -430,9 +441,15 @@ unsafe fn run_inner() -> Result<(), String> {
         return Err("无法创建翻译窗口。".into());
     }
     CHIP_WINDOW.set(chip as isize);
-    theme::apply_window(settings_window, settings.theme_mode);
-    theme::apply_window(result_window, settings.theme_mode);
-    theme::apply_window(appearance_window, settings.theme_mode);
+    SETTINGS_WINDOW.set(settings_window as isize);
+    APPEARANCE_WINDOW.set(appearance_window as isize);
+    theme::apply_window(settings_window, settings.theme_mode, settings.theme_preset);
+    theme::apply_window(result_window, settings.theme_mode, settings.theme_preset);
+    theme::apply_window(
+        appearance_window,
+        settings.theme_mode,
+        settings.theme_preset,
+    );
     for window in [main, settings_window, result_window, appearance_window] {
         set_window_icons(window, &runtime_icons);
     }
@@ -787,6 +804,8 @@ unsafe fn run_inner() -> Result<(), String> {
     });
     THEME.with(|cell| drop(cell.borrow_mut().take()));
     CHIP_WINDOW.set(0);
+    SETTINGS_WINDOW.set(0);
+    APPEARANCE_WINDOW.set(0);
 
     Ok(())
 }
@@ -836,6 +855,8 @@ unsafe fn paint_message(
                     dc,
                     if surface {
                         palette.surface_color
+                    } else if surfaces::is_card_control(control) {
+                        palette.card_color
                     } else {
                         palette.background_color
                     },
@@ -843,7 +864,7 @@ unsafe fn paint_message(
                 SetBkMode(dc, OPAQUE as i32);
                 SetTextColor(
                     dc,
-                    if surface || id == 200 || id == 220 || id == 250 {
+                    if surface || matches!(id, 200 | 220 | 250 | 290) {
                         palette.text_color
                     } else {
                         palette.muted_color
@@ -851,6 +872,8 @@ unsafe fn paint_message(
                 );
                 if surface {
                     palette.surface as isize
+                } else if surfaces::is_card_control(control) {
+                    palette.card as isize
                 } else {
                     palette.background as isize
                 }
@@ -859,7 +882,7 @@ unsafe fn paint_message(
         WM_MEASUREITEM if lparam != 0 => {
             let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
             if item.CtlType == ODT_COMBOBOX {
-                item.itemHeight = scaled(26, dpi(hwnd)) as u32;
+                item.itemHeight = scaled(30, dpi(hwnd)) as u32;
                 Some(1)
             } else {
                 None
@@ -874,6 +897,8 @@ unsafe fn paint_message(
                 let face = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
                 if item.CtlType == ODT_COMBOBOX {
                     palette.draw_combo(item, face);
+                } else if let Some(preset) = preset_for_control(item.CtlID as u16) {
+                    palette.draw_preset(item, face, preset, preset == CURRENT_PRESET.get());
                 } else if item.CtlID == ID_AUTO as u32 {
                     palette.draw_checkbox(item, face, AUTO_CHECKED.get());
                 } else if item.CtlID == ID_COMPATIBILITY as u32 {
@@ -889,6 +914,8 @@ unsafe fn paint_message(
                                 && SETTINGS_PAGE.get() == SettingsPage::Service)
                             || (item.CtlID == ID_PREFERENCES_TAB as u32
                                 && SETTINGS_PAGE.get() == SettingsPage::Preferences)
+                            || (item.CtlID == ID_APPEARANCE_TAB as u32
+                                && SETTINGS_PAGE.get() == SettingsPage::Appearance)
                             || item.CtlID == ID_ICON_APPLY as u32,
                     );
                 }
@@ -900,6 +927,7 @@ unsafe fn paint_message(
             let mut rect: RECT = zeroed();
             GetClientRect(hwnd, &mut rect);
             FillRect(wparam as HDC, &rect, palette.background);
+            paint_panels(hwnd, wparam as HDC, palette, &rect);
             1
         }),
         WM_PAINT if hwnd as isize == CHIP_WINDOW.get() && CHIP_WINDOW.get() != 0 => {
@@ -910,6 +938,46 @@ unsafe fn paint_message(
         }
         _ => None,
     }
+}
+
+fn preset_for_control(id: u16) -> Option<config::ThemePreset> {
+    match id {
+        ID_PRESET_OCEAN => Some(config::ThemePreset::Ocean),
+        ID_PRESET_AURORA => Some(config::ThemePreset::Aurora),
+        ID_PRESET_NEBULA => Some(config::ThemePreset::Nebula),
+        ID_PRESET_AMBER => Some(config::ThemePreset::Amber),
+        _ => None,
+    }
+}
+
+unsafe fn paint_panels(hwnd: HWND, dc: HDC, palette: &theme::Theme, client: &RECT) {
+    let scale = dpi(hwnd);
+    let logical_width = client.right * 96 / scale as i32;
+    let (left, top, right, bottom, scroll) = if hwnd as isize == SETTINGS_WINDOW.get() {
+        let mut info: SCROLLINFO = zeroed();
+        info.cbSize = size_of::<SCROLLINFO>() as u32;
+        info.fMask = SIF_POS;
+        GetScrollInfo(hwnd, SB_VERT, &mut info);
+        if SETTINGS_PAGE.get() == SettingsPage::Appearance {
+            (24, 416, logical_width - 24, 468, info.nPos)
+        } else {
+            (24, 148, logical_width - 24, 448, info.nPos)
+        }
+    } else if hwnd as isize == APPEARANCE_WINDOW.get() {
+        (20, 84, logical_width - 20, 244, 0)
+    } else {
+        return;
+    };
+    palette.draw_card(
+        dc,
+        RECT {
+            left: scaled(left, scale),
+            top: scaled(top - scroll, scale),
+            right: scaled(right, scale),
+            bottom: scaled(bottom - scroll, scale),
+        },
+        scaled(16, scale),
+    );
 }
 
 fn button_symbol(id: u32) -> Option<symbols::Symbol> {
@@ -1624,7 +1692,7 @@ unsafe extern "system" fn window_proc(
                 let dpi = dpi(hwnd);
                 info.ptMinTrackSize = POINT {
                     x: scaled(400, dpi),
-                    y: scaled(360, dpi),
+                    y: scaled(400, dpi),
                 };
                 handled = true;
             }
@@ -1707,17 +1775,22 @@ unsafe extern "system" fn window_proc(
 
 unsafe fn command(app: &mut App, id: u16) {
     match id {
-        ID_SERVICE_TAB | ID_PREFERENCES_TAB => {
-            SETTINGS_PAGE.set(if id == ID_SERVICE_TAB {
-                SettingsPage::Service
-            } else {
-                SettingsPage::Preferences
+        ID_SERVICE_TAB | ID_PREFERENCES_TAB | ID_APPEARANCE_TAB => {
+            SETTINGS_PAGE.set(match id {
+                ID_SERVICE_TAB => SettingsPage::Service,
+                ID_PREFERENCES_TAB => SettingsPage::Preferences,
+                _ => SettingsPage::Appearance,
             });
-            if id == ID_PREFERENCES_TAB {
+            if id != ID_SERVICE_TAB {
                 mask_api_key(app);
             }
             app.settings_scroll = 0;
             layout_settings(app);
+        }
+        ID_PRESET_OCEAN | ID_PRESET_AURORA | ID_PRESET_NEBULA | ID_PRESET_AMBER => {
+            if let Some(preset) = preset_for_control(id) {
+                apply_visual_theme(app, app.settings.theme_mode, preset);
+            }
         }
         ID_RETRY => {
             if app.streaming {
@@ -2586,29 +2659,55 @@ unsafe fn show_settings(app: &mut App) {
     SetForegroundWindow(app.settings_window);
 }
 
+unsafe fn update_preset_controls(app: &App) {
+    for id in [
+        ID_PRESET_OCEAN,
+        ID_PRESET_AURORA,
+        ID_PRESET_NEBULA,
+        ID_PRESET_AMBER,
+    ] {
+        if let Some(preset) = preset_for_control(id) {
+            let label = if preset == app.settings.theme_preset {
+                format!("{}，已选择", preset.label())
+            } else {
+                preset.label().to_owned()
+            };
+            let control = GetDlgItem(app.settings_window, id as i32);
+            set_text(control, &label);
+            InvalidateRect(control, null(), 0);
+        }
+    }
+}
+
 unsafe fn toggle_theme(app: &mut App) {
     let mode = if app.settings.theme_mode == config::ThemeMode::Dark {
         config::ThemeMode::Light
     } else {
         config::ThemeMode::Dark
     };
-    let next = match theme::Theme::new(mode) {
+    apply_visual_theme(app, mode, app.settings.theme_preset);
+}
+
+unsafe fn apply_visual_theme(app: &mut App, mode: config::ThemeMode, preset: config::ThemePreset) {
+    let next = match theme::Theme::new(mode, preset) {
         Ok(next) => next,
         Err(error) => {
             enqueue_notice(app, Notice::Error(error));
             return;
         }
     };
-    let mut settings = app.settings.clone();
-    settings.theme_mode = mode;
-    if let Err(error) = config::save(&settings) {
+    let mut saved = app.settings.clone();
+    saved.theme_mode = mode;
+    saved.theme_preset = preset;
+    if let Err(error) = config::save(&saved) {
         enqueue_notice(app, Notice::Error(error));
         return;
     }
-    app.settings = settings;
+    app.settings = saved;
     CURRENT_THEME.set(mode);
-    // Native theme calls can synchronously request colors. Release the borrow
-    // before calling Windows or destroying the previous brush resources.
+    CURRENT_PRESET.set(preset);
+    update_preset_controls(app);
+    surfaces::set_palette(&next);
     let previous = THEME.with(|cell| cell.replace(Some(next)));
     for window in [
         app.settings_window,
@@ -2616,7 +2715,7 @@ unsafe fn toggle_theme(app: &mut App) {
         app.inline_window,
         app.appearance_window,
     ] {
-        theme::apply_window(window, mode);
+        theme::apply_window(window, mode, preset);
         EnumChildWindows(window, Some(retheme_child), 0);
         redraw_layout(window);
     }
@@ -2631,11 +2730,15 @@ unsafe fn toggle_theme(app: &mut App) {
     );
     set_text(
         app.settings_ui.status,
-        if mode == config::ThemeMode::Dark {
-            "已切换暗夜模式 · 已保存"
-        } else {
-            "已切换白天模式 · 已保存"
-        },
+        &format!(
+            "已应用{} · {} · 已保存",
+            preset.label(),
+            if mode == config::ThemeMode::Dark {
+                "暗夜"
+            } else {
+                "白天"
+            }
+        ),
     );
 }
 
@@ -2643,11 +2746,11 @@ unsafe extern "system" fn retheme_child(window: HWND, _data: LPARAM) -> BOOL {
     let mut class = [0u16; 64];
     let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
     let class = String::from_utf16_lossy(&class[..length.max(0) as usize]);
-    if class.eq_ignore_ascii_case("EDIT")
-        || class.eq_ignore_ascii_case("COMBOBOX")
-        || class.eq_ignore_ascii_case("ComboLBox")
-    {
+    if class.eq_ignore_ascii_case("EDIT") {
         theme::style_edit(window, CURRENT_THEME.get());
+        surfaces::layout_control(window);
+    } else if class.eq_ignore_ascii_case("COMBOBOX") {
+        surfaces::install_combo(window);
     }
     1
 }
@@ -2838,6 +2941,7 @@ unsafe fn pick_icon_color(owner: HWND, rgb: u32) -> Option<u32> {
 }
 
 unsafe fn fill_settings(app: &App) {
+    update_preset_controls(app);
     mask_api_key(app);
     update_pause_ui(app);
     for (control, languages, value) in [
@@ -3045,8 +3149,9 @@ unsafe fn child(parent: HWND, class: &str, label: &str, style: u32, id: u16) -> 
             10 | (10 << 16),
         );
         theme::style_edit(hwnd, CURRENT_THEME.get());
+        surfaces::install_edit(hwnd);
     } else if class == "COMBOBOX" {
-        theme::style_edit(hwnd, CURRENT_THEME.get());
+        surfaces::install_combo(hwnd);
     }
     hwnd
 }
@@ -3054,6 +3159,7 @@ unsafe fn child(parent: HWND, class: &str, label: &str, style: u32, id: u16) -> 
 unsafe fn layout_chip(_app: &mut App) {}
 
 unsafe fn redraw_layout(hwnd: HWND) {
+    surfaces::round_window(hwnd);
     // One deferred paint for the complete layout; never force per-child redraws.
     RedrawWindow(
         hwnd,
@@ -3075,6 +3181,7 @@ unsafe fn place(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, dpi: u32, face: HFON
     if SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT != face {
         SendMessageW(hwnd, WM_SETFONT, face as usize, 0);
     }
+    surfaces::layout_control(hwnd);
     if matches!(GetDlgCtrlID(hwnd), 210..=213) {
         let inset = scaled(10, dpi) as isize;
         SendMessageW(

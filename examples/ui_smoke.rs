@@ -18,6 +18,10 @@ fn main() {
 
 #[cfg(windows)]
 mod windows {
+    use lingoleaf::{
+        config::{ThemeMode, ThemePreset},
+        visual::Palette,
+    };
     use std::{
         fs,
         mem::{size_of, zeroed},
@@ -38,15 +42,18 @@ mod windows {
             AttachThreadInput, CreateEventW, GetCurrentThreadId, GetProcessTimes,
             WaitForSingleObject,
         },
-        UI::Input::KeyboardAndMouse::{IsWindowEnabled, SetFocus},
+        UI::Input::KeyboardAndMouse::{
+            IsWindowEnabled, SendInput, SetFocus, INPUT, INPUT_KEYBOARD, INPUT_MOUSE,
+            KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_HOME, VK_RETURN,
+        },
         UI::WindowsAndMessaging::{
             FindWindowExW, FindWindowW, GetCursorPos, GetDlgItem, GetForegroundWindow,
             GetGUIThreadInfo, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow,
-            IsWindowVisible, PeekMessageW, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
-            SetWindowPos, BM_CLICK, CBN_SELCHANGE, CB_ERR, CB_GETCURSEL, CB_SETCURSEL,
-            GUITHREADINFO, GW_OWNER, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-            SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_APP, WM_CLOSE, WM_COMMAND, WM_GETTEXT,
-            WM_SETTEXT,
+            IsWindowVisible, PeekMessageW, PostMessageW, SendMessageTimeoutW, SetCursorPos,
+            SetForegroundWindow, SetWindowPos, BM_CLICK, CBN_SELCHANGE, CB_ERR, CB_GETCURSEL,
+            CB_GETDROPPEDSTATE, CB_SETCURSEL, GUITHREADINFO, GW_OWNER, MSG, PM_NOREMOVE,
+            SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_APP,
+            WM_CLOSE, WM_COMMAND, WM_GETTEXT, WM_SETTEXT,
         },
     };
 
@@ -72,6 +79,13 @@ mod windows {
     const UPDATE_STATUS: i32 = 219;
     const SERVICE_TAB: i32 = 270;
     const PREFERENCES_TAB: i32 = 271;
+    const APPEARANCE_TAB: i32 = 280;
+    const PRESET_CARDS: [(i32, ThemePreset, &str); 4] = [
+        (281, ThemePreset::Ocean, "ocean"),
+        (282, ThemePreset::Aurora, "aurora"),
+        (283, ThemePreset::Nebula, "nebula"),
+        (284, ThemePreset::Amber, "amber"),
+    ];
     const SOURCE_LANGUAGE: i32 = 272;
     const TARGET_LANGUAGE: i32 = 273;
     const PAUSE_SELECTION: i32 = 264;
@@ -154,7 +168,7 @@ mod windows {
             return Err("Opening settings took over five seconds; startup update checking may be blocking the UI.".into());
         }
         require_centered(settings)?;
-        for id in [THEME, SERVICE_TAB, PREFERENCES_TAB, SAVE] {
+        for id in [THEME, SERVICE_TAB, PREFERENCES_TAB, APPEARANCE_TAB, SAVE] {
             require_visible(settings, id)?;
         }
         require_visible(settings, PROVIDER)?;
@@ -192,6 +206,7 @@ mod windows {
             );
         }
 
+        check_native_combo_interaction(settings)?;
         select_provider(settings, 0)?;
         require_text(settings, 210, "https://api.deepseek.com/v1")?;
         require_text(settings, 212, "deepseek-chat")?;
@@ -213,6 +228,7 @@ mod windows {
         let settings = check_preference_actions(&mut owned, settings)?;
         check_live_save(&mut owned, settings)?;
         let settings = check_theme(&mut owned, settings)?;
+        let settings = check_theme_presets(&mut owned, settings)?;
         check_icon_appearance(&mut owned, settings)?;
 
         owned.stop()?;
@@ -642,6 +658,10 @@ mod windows {
             APPEARANCE,
             UPDATE,
             UPDATE_STATUS,
+            281,
+            282,
+            283,
+            284,
         ] {
             require_hidden(settings, id)?;
         }
@@ -657,15 +677,235 @@ mod windows {
             PAUSE_SELECTION,
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
-            APPEARANCE,
             UPDATE,
             UPDATE_STATUS,
         ] {
             require_visible(settings, id)?;
         }
-        for id in [PROVIDER, KEY, KEY_VISIBILITY, 210, 212, 213, 106] {
+        for id in [
+            PROVIDER,
+            KEY,
+            KEY_VISIBILITY,
+            210,
+            212,
+            213,
+            106,
+            APPEARANCE,
+            281,
+            282,
+            283,
+            284,
+        ] {
             require_hidden(settings, id)?;
         }
+        Ok(())
+    }
+
+    fn show_appearance_page(settings: HWND) -> Result<(), String> {
+        click(settings, APPEARANCE_TAB)?;
+        for id in [APPEARANCE, 281, 282, 283, 284] {
+            require_visible(settings, id)?;
+        }
+        for id in [
+            PROVIDER,
+            KEY,
+            KEY_VISIBILITY,
+            210,
+            212,
+            213,
+            106,
+            SOURCE_LANGUAGE,
+            TARGET_LANGUAGE,
+            SWAP_LANGUAGES,
+            PAUSE_SELECTION,
+            SELECTION_MODE,
+            COMPATIBILITY_CAPTURE,
+            UPDATE,
+            UPDATE_STATUS,
+        ] {
+            require_hidden(settings, id)?;
+        }
+        Ok(())
+    }
+
+    fn background_color(settings: HWND) -> Result<u32, String> {
+        let dc = unsafe { GetDC(settings) };
+        if dc.is_null() {
+            return Err("Cannot sample settings palette.".into());
+        }
+        let color = unsafe { GetPixel(dc, 8, 8) };
+        unsafe { ReleaseDC(settings, dc) };
+        if color == u32::MAX {
+            return Err("The settings background pixel is unavailable.".into());
+        }
+        Ok(color)
+    }
+
+    fn colorref(rgb: u32) -> u32 {
+        ((rgb >> 16) & 255) | (rgb & 0x00ff00) | ((rgb & 255) << 16)
+    }
+
+    fn require_palette(settings: HWND, mode: ThemeMode, preset: ThemePreset) -> Result<(), String> {
+        let expected = colorref(Palette::for_theme(mode, preset).background);
+        let end = Instant::now() + Duration::from_secs(3);
+        while background_color(settings)? != expected {
+            if Instant::now() >= end {
+                return Err(format!(
+                    "The live palette did not update for {preset:?}/{mode:?}."
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    fn check_theme_presets(owned: &mut OwnedApplication, settings: HWND) -> Result<HWND, String> {
+        let baseline = saved_settings(owned)?;
+        if baseline
+            .get("theme_preset")
+            .and_then(serde_json::Value::as_str)
+            != Some("amber")
+        {
+            return Err("A legacy profile did not migrate to the warm Amber palette.".into());
+        }
+        show_service(settings)?;
+        // Appearance previews must save only their explicit preference, never
+        // the unfinished API form or language drafts on the other pages.
+        set_control_text(settings, 210, "http://127.0.0.1:47777/v1")?;
+        set_control_text(settings, 212, "discardable-theme-model")?;
+        set_control_text(settings, KEY, "fixed-public-theme-draft-not-a-key")?;
+        set_control_text(settings, 213, "47")?;
+        show_preferences(settings)?;
+        select_combo(settings, SOURCE_LANGUAGE, 6)?;
+        select_combo(settings, TARGET_LANGUAGE, 0)?;
+        show_appearance_page(settings)?;
+        let mut observed = Vec::new();
+        for (id, preset, name) in PRESET_CARDS {
+            click(settings, id)?;
+            for (mode, encoded) in [(ThemeMode::Dark, "dark"), (ThemeMode::Light, "light")] {
+                let current = saved_settings(owned)?;
+                if current
+                    .get("theme_mode")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(encoded)
+                {
+                    click(settings, THEME)?;
+                }
+                require_palette(settings, mode, preset)?;
+                let mut expected = baseline.clone();
+                expected["theme_mode"] = serde_json::Value::String(encoded.into());
+                expected["theme_preset"] = serde_json::Value::String(name.into());
+                if saved_settings(owned)? != expected {
+                    return Err("A theme preview saved unfinished API/language drafts or lost unrelated settings.".into());
+                }
+                observed.push(background_color(settings)?);
+            }
+            show_service(settings)?;
+            require_text(settings, 210, "http://127.0.0.1:47777/v1")?;
+            require_text(settings, 212, "discardable-theme-model")?;
+            require_text(settings, KEY, "fixed-public-theme-draft-not-a-key")?;
+            require_text(settings, 213, "47")?;
+            show_preferences(settings)?;
+            require_combo(settings, SOURCE_LANGUAGE, 6)?;
+            require_combo(settings, TARGET_LANGUAGE, 0)?;
+            show_appearance_page(settings)?;
+        }
+        observed.sort_unstable();
+        observed.dedup();
+        if observed.len() != 8 {
+            return Err("The four day/night families were not visually distinct.".into());
+        }
+        click(settings, THEME)?; // Last family is Amber Light: restore baseline Dark.
+        require_palette(settings, ThemeMode::Dark, ThemePreset::Amber)?;
+        let mut expected = baseline.clone();
+        expected["theme_preset"] = serde_json::Value::String("amber".into());
+        expected["theme_mode"] = serde_json::Value::String("dark".into());
+        if saved_settings(owned)? != expected {
+            return Err("Restoring the initial palette changed other preferences.".into());
+        }
+        send(settings, WM_CLOSE, 0, 0)?;
+        let main = owned.wait_for_window(BACKGROUND_TITLE, false)?;
+        if unsafe { PostMessageW(main, WM_APP + 4, 0, 0) } == 0 {
+            return Err("Cannot reopen the owned settings window.".into());
+        }
+        let settings = owned.wait_for_settings()?;
+        require_text(
+            settings,
+            210,
+            baseline["base_url"]
+                .as_str()
+                .ok_or("Missing saved base URL.")?,
+        )?;
+        require_text(
+            settings,
+            212,
+            baseline["model"].as_str().ok_or("Missing saved model.")?,
+        )?;
+        require_text(settings, KEY, "")?;
+        // A real restart additionally verifies the selected family is loaded.
+        let settings = owned.restart()?;
+        require_palette(settings, ThemeMode::Dark, ThemePreset::Amber)?;
+        println!("All eight theme variants painted immediately; theme saves preserved API/language drafts and only persisted appearance, with legacy Amber migration and restart restoration.");
+        Ok(settings)
+    }
+
+    fn key_input(key: u16) -> Result<(), String> {
+        let mut inputs: [INPUT; 2] = unsafe { zeroed() };
+        for (index, input) in inputs.iter_mut().enumerate() {
+            input.r#type = INPUT_KEYBOARD;
+            input.Anonymous.ki.wVk = key;
+            input.Anonymous.ki.dwFlags = if index == 0 { 0 } else { KEYEVENTF_KEYUP };
+        }
+        if unsafe { SendInput(2, inputs.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
+            return Err("Cannot inject the owned combo keyboard input.".into());
+        }
+        Ok(())
+    }
+
+    fn check_native_combo_interaction(settings: HWND) -> Result<(), String> {
+        let provider = control(settings, PROVIDER)?;
+        let mut rect: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(provider, &mut rect) } == 0 {
+            return Err("Cannot locate the owned provider combo.".into());
+        }
+        let mut clicks: [INPUT; 2] = unsafe { zeroed() };
+        for (index, input) in clicks.iter_mut().enumerate() {
+            input.r#type = INPUT_MOUSE;
+            input.Anonymous.mi.dwFlags = if index == 0 {
+                MOUSEEVENTF_LEFTDOWN
+            } else {
+                MOUSEEVENTF_LEFTUP
+            };
+        }
+        unsafe {
+            SetCursorPos(rect.right - 12, (rect.top + rect.bottom) / 2);
+        }
+        if unsafe { SendInput(2, clicks.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
+            return Err("Cannot click the owned combo arrow.".into());
+        }
+        let end = Instant::now() + Duration::from_secs(2);
+        while send(provider, CB_GETDROPPEDSTATE, 0, 0)? == 0 {
+            if Instant::now() >= end {
+                return Err(
+                    "The rounded native combo did not open after a real arrow click.".into(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        key_input(VK_HOME)?;
+        key_input(VK_RETURN)?;
+        let end = Instant::now() + Duration::from_secs(2);
+        while send(provider, CB_GETDROPPEDSTATE, 0, 0)? != 0 {
+            if Instant::now() >= end {
+                return Err("The native combo did not close with Enter.".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        require_combo(settings, PROVIDER, 0)?;
+        require_text(settings, 210, "https://api.deepseek.com/v1")?;
+        println!(
+            "Rounded provider combo retained a real arrow click and native Home/Enter selection."
+        );
         Ok(())
     }
 
@@ -722,7 +962,7 @@ mod windows {
         // Save a key-free baseline first. Appearance saves must preserve every
         // unrelated field, including provider, timeout and selection preference.
         show_preferences(settings)?;
-        require_visible(settings, APPEARANCE)?;
+        require_hidden(settings, APPEARANCE)?;
         require_visible(settings, SELECTION_MODE)?;
         require_visible(settings, COMPATIBILITY_CAPTURE)?;
         require_combo(settings, SELECTION_MODE, 0)?;
@@ -834,6 +1074,7 @@ mod windows {
         }
         require_same_nonappearance_settings(&baseline, &restored)?;
         close_appearance(appearance, settings)?;
+        show_preferences(settings)?;
         select_combo(settings, SELECTION_MODE, 0)?;
         save_settings(owned, settings)?;
         if saved_settings(owned)?
@@ -890,7 +1131,7 @@ mod windows {
     }
 
     fn open_appearance(owned: &mut OwnedApplication, settings: HWND) -> Result<HWND, String> {
-        show_preferences(settings)?;
+        show_appearance_page(settings)?;
         click(settings, APPEARANCE)?;
         let appearance = owned.wait_for_window(APPEARANCE_TITLE, true)?;
         if unsafe { GetWindow(appearance, GW_OWNER) } != settings

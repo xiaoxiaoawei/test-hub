@@ -1,6 +1,6 @@
 # 0.7.1 构建验证记录
 
-日期：2026-11-07。开发分支：`lingoleaf`。本记录区分 Linux、Windows 原生 CI、Wine 兼容层与公开更新源；发行包保留发布前验证，公开下载与升级结果在发布后追加。0.6.0 历史记录保留在对应 Git 标签。
+日期：2026-11-07。开发分支：`lingoleaf`。本记录区分 Linux、Windows 原生 CI、Wine 兼容层与公开更新源；发行包保留发布前验证，公开下载与升级结果已在末尾补记。0.6.0 历史记录保留在对应 Git 标签。
 
 环境：Debian 13、Rust 1.99.1、Windows GNU 交叉工具链、Wine 10 / Xvfb。目标为 Windows 11 x64，另有 Windows runner 的 MSVC 静态 CRT 构建；Wine 不能代替 Edge 或 Windows 桌面实机验收。
 
@@ -15,7 +15,7 @@
 | 最终 Wine 设置回归 | 0.7.1 通过；6.21 秒；显隐、交换、暂停、保存、主题与原有外观 |
 | 连续选区 / 问答 / 交互控制 | 0.7.1 真编辑框菜单、18 次本地 POST 全通过；8.46 秒 |
 | 更新 helper | 0.7.1 使用 0.7.2 夹具的隔离替换 / 启动确认 / 失败回滚通过；7.25 秒 |
-| 正式发行资产与旧版升级 | 发布后核验；不以标签页面 HTTP 200 代替真实资产 |
+| 正式发行资产与旧版升级 | 0.7.1 公开清单与 4 payload 校验通过，旧 0.6.0 升级正式 MSVC 版本成功 |
 
 ## 取消与内存安全
 
@@ -78,3 +78,27 @@ Wine 的 WinHTTP 在“已缓冲 chunk 的末尾，但下一 chunk header 尚未
 0.7.1 永久回归已改为向译文编辑框本身请求右键菜单，菜单 API 可读时断言三项；Wine 菜单信息 API 不可读时，实际执行 Home → Down → Enter，验证复制整段译文且原 0..6 文字选区与首行滚动位置不变。旧默认菜单该操作会变成“全选”，无法通过此语义断言。菜单期间请求完成、菜单关闭后队列继续处理的检查也保留。
 
 0.7.1 最终字节的设置 6.21 秒、18 请求与真编辑框菜单 8.46 秒、0.7.2 helper 替换 / ACK / 精确回滚 7.25 秒均通过。已完成格式、Windows 全 targets 严格 Clippy、14 项打包测试、版本一致性检查；正式 Windows 标签 CI 与公开分发结果在发布后补记。
+
+
+## 0.7.1 正式公开分发
+
+源码提交 `53f8752`、标签 `v0.7.1` 的 [原生 Windows / Linux / 发布流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42332348604) 三项任务均成功；原生 Windows 的完整测试不包含 Wine 的过滤参数，stalled chunked SSE 取消用例正常执行并通过。
+
+已实际匿名下载公开的 `lingoleaf.exe`、`lingoleaf-windows-x64.zip`、版本化兼容 EXE、SHA256SUMS、固定 latest 更新清单。四个 payload 的 SHA 全部通过，主 EXE 与兼容副本逐字节相同，ZIP CRC 完整且其中 EXE 与公开独立文件一致。ZIP 为 25 项明确允许的条目，不含配置、日志、测试 DLL、浏览器或私有数据。
+
+正式 MSVC EXE 为 819712 字节（不到 1 MiB），SHA-256 `4f741d0862e4387b0f7eea75f1d6390e7fe0a410ff4b2a16495ce6f1a9fce9d6`。文件为 x64 GUI，仅依赖系统 DLL；它由独立工具链生成，不能拿本地 GNU 哈希混用。固定更新清单实际为 0.7.1、schema 1 六字段和对应版本兼容 EXE 地址，面向用户的主下载名始终为 `lingoleaf.exe`。
+
+### 网页与 PDF 实际划选
+
+在 Wine 10 / Xvfb 中运行真实 Windows Chromium 103 / PDFium，使用最终 0.7.1 GNU 候选进行真实鼠标拖选。网页原文 `The quick brown fox jumps over the lazy dog.` 和文本 PDF 第 1 页 `Dynamic languages` 各发出一次精确原文的本地请求，均无认证头，界面显示完整中文模拟译文。
+
+该测试主动开启兼容取词，网页和 PDF 两次临时复制后，原 Unicode 与 HTML 剪贴板 marker 均逐字节恢复。PDF 夹具 SHA-256 为 `3662ff519e485810520552bf301d8c3b2b917fd2f83303f4965d7abed367e113`。这验证当前浏览器 / PDFium 路径，不冒充 Edge 或 Windows 桌面实机结果，也不代表真实模型速度或质量。
+
+
+### 旧 0.6.0 升级正式 0.7.1
+
+使用原始已公开的 0.6.0 MSVC EXE 与隔离 LOCALAPPDATA，旧 GUI 成功发现正式 0.7.1，确认下载、生产校验、确认重启后旧进程正常退出，新 MSVC 设置页实际可见并显示“v0.7.1 · 已是最新版本”。目标文件为公开的 819712 字节 / SHA-256 `4f741d0862e4387b0f7eea75f1d6390e7fe0a410ff4b2a16495ce6f1a9fce9d6`；原 settings.json 逐字节保留，GUI 核对源 Auto、目标日语、37 秒超时、Direct、兼容取词、Light 和字母 A / 圆形 / 48 px 均保留；AppReady 后备份和安装票据均为 0。
+
+此项是在 Wine 中本地传输回放实际公开的原始清单和正式 MSVC 字节，不改版本、URL、大小、哈希或生产 guard；旧 feed、正式兼容资产、新 feed 三条 GET 均无认证头。测试 DLL 仅为了更新回放，新增异步回调符号只供 loader 解析，若误调用会失败而不伪造翻译成功；实际升级流程未调用该符号。公开网络下载另由匿名 HTTPS 实际验证，不把本地回放冒充目标 Windows 机器的 GitHub 联通。
+
+正式程序和公开资产没有为测试修改或重写；测试 EXE、DLL、配置、浏览器、日志均未打入发行包。主下载仍为不带版本号的 `lingoleaf.exe`，已发布资产保持不覆盖。

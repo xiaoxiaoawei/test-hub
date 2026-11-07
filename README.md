@@ -4,6 +4,8 @@
 
 当前版本 **0.7.1**，代码在 `lingoleaf` 分支维护。本版增加停止与重新翻译、停止回答并保留问题草稿、临时暂停自动划词、保持翻译框显示、交换语言和密钥显隐，并改善取消旧请求与流式阅读体验。版本变化见 [更新记录](CHANGELOG.md)，实际测试和发布状态见 [构建记录](docs/build-validation.md)。
 
+[**下载 lingoleaf.exe**](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe) · [v0.7.1 版本页面](https://github.com/xiaoxiaoawei/test-hub/releases/tag/v0.7.1)
+
 发行文件统一使用 **`lingoleaf.exe`** 和 **`lingoleaf-windows-x64.zip`**，版本号保留在程序内部、标签和更新记录中。[发行页](https://github.com/xiaoxiaoawei/test-hub/releases) 提供已公开版本；已有 0.5.0 / 0.6.0 客户端可继续通过“检查更新”升级。
 
 ![0.7.0 服务设置，Wine 兼容层截图](docs/images/settings-dark-0.7.0.png)

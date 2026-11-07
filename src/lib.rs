@@ -10,3 +10,5 @@ mod mailbox;
 
 #[cfg(windows)]
 pub mod platform;
+
+pub mod selection_text;

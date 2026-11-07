@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::selection_text::has_visible_text;
+
 use windows::{
     core::Interface,
     Win32::{
@@ -341,6 +343,9 @@ impl Target {
         if unsafe { GetForegroundWindow() } != self.foreground {
             return Err("前台窗口已改变，请重新选择文字。".into());
         }
+        if !has_visible_text(&text) {
+            return Err(no_selection());
+        }
         Ok(CapturedText { text, source })
     }
 }
@@ -391,7 +396,7 @@ fn native_edit_selection(target: &Target, window: HWND) -> Result<NativeSelectio
     let selected = String::from_utf16(&text[start..end])
         .map_err(|_| UiaFailure::Unavailable("选区含不完整的 Unicode 字符，请重新选择。".into()))?;
     let selected = selected.trim().to_owned();
-    Ok(if selected.is_empty() {
+    Ok(if !has_visible_text(&selected) {
         NativeSelection::Empty
     } else {
         NativeSelection::Text(selected)
@@ -1309,7 +1314,16 @@ unsafe fn selected_text(
         }
     }
     let text = text.trim().to_owned();
-    Ok((!text.is_empty()).then_some(text))
+    if !has_visible_text(&text) {
+        // An explicitly selected run of spaces/formatting is not a provider
+        // failure or a request to translate an ancestor's document contents.
+        return if units == 0 {
+            Ok(None)
+        } else {
+            Err(UiaFailure::Unavailable(no_selection()))
+        };
+    }
+    Ok(Some(text))
 }
 
 unsafe fn range_matches_gesture(
@@ -1417,7 +1431,7 @@ fn decode_unicode(bytes: &[u8]) -> Result<String, String> {
         .map_err(|_| "剪贴板包含无效的 Unicode 文字。".to_owned())?
         .trim()
         .to_owned();
-    if text.is_empty() {
+    if !has_visible_text(&text) {
         return Err("剪贴板中没有可翻译的文字。".into());
     }
     Ok(text)
@@ -1433,9 +1447,15 @@ fn capture_by_copy(foreground: HWND) -> Result<CapturedText, String> {
         unsafe { GetClipboardSequenceNumber() },
         || unsafe { GetForegroundWindow() } != foreground,
     )
-    .map(|text| CapturedText {
-        text,
-        source: "模拟复制",
+    .and_then(|text| {
+        if has_visible_text(&text) {
+            Ok(CapturedText {
+                text,
+                source: "模拟复制",
+            })
+        } else {
+            Err(no_selection())
+        }
     })
 }
 
@@ -1650,6 +1670,25 @@ mod tests {
     }
 
     #[test]
+    fn native_edit_filters_blank_runs_but_preserves_joiners_inside_visible_text() {
+        for selected in [" \t\r\n\u{00a0}", "\u{200b}\u{200d}\u{feff}"] {
+            let (_root, window, target) = edit(selected, false);
+            select(window, 0, selected.encode_utf16().count());
+            assert!(matches!(
+                native_edit_selection(&target, window),
+                Ok(NativeSelection::Empty)
+            ));
+        }
+        let selected = "👩\u{200d}💻 می\u{200c}روم 0 .";
+        let (_root, window, target) = edit(selected, false);
+        select(window, 0, selected.encode_utf16().count());
+        match native_edit_selection(&target, window).unwrap() {
+            NativeSelection::Text(actual) => assert_eq!(actual, selected),
+            _ => panic!("visible text and its joiners were not preserved"),
+        }
+    }
+
+    #[test]
     fn native_edit_rejects_other_windows_and_unbounded_document_prefixes() {
         let (_first, first, first_target) = edit("first window", false);
         let (_second, second, _) = edit("second window", false);
@@ -1685,5 +1724,14 @@ mod tests {
         assert!(decode_unicode(&[b'a', 0]).is_err());
         assert!(decode_unicode(&[0x00, 0xd8, 0, 0]).is_err());
         assert!(decode_unicode(&[0]).is_err());
+    }
+
+    #[test]
+    fn clipboard_decode_rejects_invisible_only_text() {
+        let bytes: Vec<u8> = " \u{200b}\u{200c}\u{feff}\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert!(decode_unicode(&bytes).is_err());
     }
 }

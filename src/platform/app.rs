@@ -1615,13 +1615,8 @@ unsafe extern "system" fn window_proc(
                     app.auto_foreground = foreground as isize;
                     app.auto_started = Some(Instant::now());
                     app.auto_attempt = 0;
-                    if app.auto_strong {
-                        if app.window_pinned {
-                            conversation_ui::reset(app);
-                            app.display_pending = true;
-                        }
-                        show_selection_pending(app);
-                    }
+                    // A gesture is only a probe candidate. Blank drags and
+                    // delayed providers must never create a speculative popup.
                     SetTimer(app.main, TIMER_SELECTION, 60, None);
                 }
                 handled = true;
@@ -2015,10 +2010,8 @@ unsafe fn command(app: &mut App, id: u16) {
             }
             let text = app.chip_text.clone();
             app.pending_icon_click = true;
-            if !text.is_empty() {
+            if crate::selection_text::has_visible_text(&text) {
                 start_translation_in(app, text, "划词选区", app.auto_point, true);
-            } else if app.auto_started.is_some() {
-                show_selection_pending(app);
             }
         }
         ID_SAVE => {
@@ -2167,38 +2160,13 @@ unsafe fn begin_automatic_press(app: &mut App, point: POINT) {
     if !app.window_pinned {
         conversation_ui::reset(app);
     }
-    let reuse = !app.window_pinned && app.inline_active && IsWindowVisible(app.inline_window) != 0;
     reset_automatic(app);
+    if !app.window_pinned {
+        ShowWindow(app.inline_window, SW_HIDE);
+    }
     app.auto_origin = Some(point);
     app.auto_source_root = GetAncestor(WindowFromPoint(point), GA_ROOT) as isize;
     app.auto_pressed = true;
-    if reuse {
-        selection_pending_text(app);
-        SetTimer(app.main, TIMER_CHIP, 200, None);
-    }
-}
-
-unsafe fn selection_pending_text(app: &mut App) {
-    app.rendered_text.clear();
-    set_text(app.inline_ui.translated, "正在读取选区…");
-    EnableWindow(app.result_ui.copy, 0);
-    EnableWindow(app.inline_ui.copy, 0);
-    conversation_ui::refresh(app);
-    EnableWindow(GetDlgItem(app.inline_window, ID_INLINE_EXPAND as i32), 0);
-    translation_status(app, "正在读取新选区");
-}
-
-unsafe fn show_selection_pending(app: &mut App) {
-    app.chip_foreground = app.auto_foreground;
-    if app.settings.selection_mode == config::SelectionMode::Direct || app.pending_icon_click {
-        selection_pending_text(app);
-        present_translation(app, true, app.auto_point);
-    } else {
-        if !app.window_pinned {
-            ShowWindow(app.inline_window, SW_HIDE);
-        }
-        let _ = show_chip(app, app.auto_point);
-    }
 }
 
 unsafe fn warm_foreground(app: &mut App, foreground: isize) {
@@ -2238,29 +2206,17 @@ unsafe fn retry_automatic(app: &mut App) {
         SetTimer(app.main, TIMER_SELECTION, delay, None);
     } else {
         app.auto_started = None;
+        // A late duplicate failure cannot dismiss an already confirmed selection.
         if app.auto_text.is_none() {
-            ShowWindow(app.chip, SW_HIDE);
-            if app.auto_strong || app.pending_icon_click {
-                app.chip_foreground = app.auto_foreground;
-                set_text(
-                    app.inline_ui.translated,
-                    if app.settings.compatibility_capture {
-                        "暂未读取到这次选区，请重新划选。\r\n\r\n也可手动复制后，从托盘选择“翻译剪贴板”。"
-                    } else {
-                        "暂未读取到这次选区，请重新划选。\r\n\r\n网页或 PDF 可在设置开启“兼容取词”。"
-                    },
-                );
-                translation_status(app, "请重新划选");
-                translation_copy_enabled(app, false);
-                present_translation(app, true, app.auto_point);
-            } else if !app.window_pinned {
-                ShowWindow(app.inline_window, SW_HIDE);
-            }
+            cancel_automatic(app);
         }
     }
 }
 
 unsafe fn show_chip(app: &mut App, point: POINT) -> Result<(), String> {
+    if !crate::selection_text::has_visible_text(&app.chip_text) {
+        return Ok(());
+    }
     let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
     let mut info: MONITORINFO = zeroed();
     info.cbSize = size_of::<MONITORINFO>() as u32;
@@ -2439,7 +2395,7 @@ unsafe fn drain_events(app: &mut App) {
                         || GetForegroundWindow() as isize == job.foreground)
                 {
                     match result {
-                        Ok(captured) if !captured.text.trim().is_empty() => {
+                        Ok(captured) if crate::selection_text::has_visible_text(&captured.text) => {
                             if captured.text.chars().count() > translation::MAX_TEXT_CHARS {
                                 if job.kind == CaptureKind::Auto {
                                     cancel_automatic(app);
@@ -2477,28 +2433,19 @@ unsafe fn drain_events(app: &mut App) {
                             }
                         }
                         Ok(_) => {
-                            if job.kind == CaptureKind::Auto {
+                            if job.kind == CaptureKind::Auto && app.auto_text.is_none() {
                                 cancel_automatic(app);
                             }
                         }
+                        Err(_) if job.kind == CaptureKind::Auto && app.auto_text.is_some() => {}
                         Err(error) if job.kind != CaptureKind::Auto => {
                             show_error(app, &error, job.point)
                         }
                         Err(error) => {
                             if job.compatibility_checked && job.copy_retryable {
                                 retry_automatic(app);
-                            } else if job.compatibility_checked {
-                                KillTimer(app.main, TIMER_SELECTION);
-                                app.auto_started = None;
-                                app.capture_generation += 1;
-                                app.latest_capture
-                                    .store(app.capture_generation, Ordering::Release);
-                                app.pending = None;
-                                set_text(app.inline_ui.translated, &error);
-                                translation_status(app, "可手动复制后从托盘翻译");
-                                translation_copy_enabled(app, false);
-                                present_translation(app, true, job.point);
-                            } else if selection::is_no_selection_error(&error)
+                            } else if job.compatibility_checked
+                                || selection::is_no_selection_error(&error)
                                 || selection::is_protected_error(&error)
                             {
                                 cancel_automatic(app);

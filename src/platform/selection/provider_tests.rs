@@ -278,6 +278,21 @@ fn unsupported_selection_is_not_read_as_a_document_or_caret() {
 }
 
 #[test]
+fn whitespace_and_invisible_ranges_are_no_selection_not_provider_text() {
+    for text in [" \t\r\n\u{00a0}", "\u{200b}\u{200c}\u{feff}"] {
+        let (pattern, calls) = pattern(&[(text, &[])], SupportedTextSelection_Single);
+        let result =
+            unsafe { selected_text(&pattern, None, Instant::now() + Duration::from_secs(1)) };
+        assert!(matches!(
+            result,
+            Err(super::UiaFailure::Unavailable(ref reason)) if super::is_no_selection_error(reason)
+        ));
+        assert_eq!(calls.text.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.forbidden.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
 fn missing_range_geometry_uses_the_already_verified_point_scope() {
     let (pattern, calls) = pattern(
         &[("PDF provider without range rectangles", &[])],

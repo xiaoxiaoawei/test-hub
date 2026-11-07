@@ -16,7 +16,10 @@ use windows_sys::Win32::{
     Graphics::Gdi::{RedrawWindow, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE},
     System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
     UI::{
-        Controls::{EM_EMPTYUNDOBUFFER, EM_GETFIRSTVISIBLELINE, EM_LINESCROLL, EM_SCROLLCARET},
+        Controls::{
+            EM_EMPTYUNDOBUFFER, EM_GETFIRSTVISIBLELINE, EM_GETRECT, EM_LINESCROLL, EM_SCROLLCARET,
+            EM_SETRECTNP,
+        },
         HiDpi::GetDpiForWindow,
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::*,
@@ -145,6 +148,7 @@ pub(crate) unsafe fn install(editor: HWND, mode: ThemeMode, preset: ThemePreset)
     SendMessageW(editor, EM_EXLIMITTEXT, 0, MAX_TEXT as isize);
     SendMessageW(editor, EM_AUTOURLDETECT, 0, 0);
     SendMessageW(editor, EM_SETUNDOLIMIT, 0, 0);
+    apply_padding(editor);
     set_background(editor, mode, preset);
     plain_format(editor, mode, preset, false);
 }
@@ -174,6 +178,7 @@ pub(crate) unsafe fn restyle(editor: HWND, mode: ThemeMode, preset: ThemePreset)
     if let Some(Some(source)) = source {
         render_inner(editor, &source, false, mode, preset, true);
     } else {
+        apply_padding(editor);
         plain_format(editor, mode, preset, true);
     }
 }
@@ -199,6 +204,9 @@ unsafe fn render_inner(
     if editor.is_null() || RENDERING.with(|set| set.borrow().contains(&(editor as usize))) {
         return;
     }
+    let Some(content) = apply_padding(editor) else {
+        return;
+    };
     let mut bounds: RECT = zeroed();
     if GetClientRect(editor, &mut bounds) == 0 {
         return;
@@ -219,7 +227,8 @@ unsafe fn render_inner(
         return;
     }
     let colors = Palette::for_theme(mode, preset);
-    let available = ((i64::from(width) * 1440) / i64::from(dpi) - 240).clamp(720, 28_800);
+    let available = (i64::from((content.right - content.left).max(1)) * 1440 / i64::from(dpi))
+        .clamp(720, 28_800);
     let style = RenderStyle {
         text: colors.text,
         background: colors.surface,
@@ -273,6 +282,9 @@ unsafe fn render_inner(
         SetWindowTextW(editor, plain.as_ptr());
         plain_format(editor, mode, preset, true);
     }
+    // Some RichEdit versions reset the formatting rectangle while importing
+    // document margins. Restore the native content inset before scroll/selection.
+    apply_padding(editor);
     SendMessageW(editor, EM_EMPTYUNDOBUFFER, 0, 0);
     let new_text = document_text(editor);
     if follow {
@@ -364,6 +376,40 @@ unsafe fn set_background(editor: HWND, mode: ThemeMode, preset: ThemePreset) {
     SendMessageW(editor, EM_SETBKGNDCOLOR, 0, rgb(colors.surface) as isize);
 }
 
+/// Keep the real editor's text rectangle inset from its rounded shell. Read the
+/// native rectangle first so stream updates do not repeatedly force a reflow.
+/// A temporary rendering guard prevents a scrollbar/layout notification from
+/// synchronously reentering Markdown rendering; no RefCell borrow crosses it.
+unsafe fn apply_padding(editor: HWND) -> Option<RECT> {
+    let mut client: RECT = zeroed();
+    if GetClientRect(editor, &mut client) == 0 {
+        return None;
+    }
+    let dpi = GetDpiForWindow(editor).max(96);
+    let width = (client.right - client.left).max(1);
+    let height = (client.bottom - client.top).max(1);
+    let horizontal = ((12 * i64::from(dpi) + 48) / 96) as i32;
+    let vertical = ((8 * i64::from(dpi) + 48) / 96) as i32;
+    let horizontal = horizontal.min((width - 1) / 2);
+    let vertical = vertical.min((height - 1) / 2);
+    let content = RECT {
+        left: client.left + horizontal,
+        top: client.top + vertical,
+        right: client.right - horizontal,
+        bottom: client.bottom - vertical,
+    };
+    let mut native: RECT = zeroed();
+    SendMessageW(editor, EM_GETRECT, 0, &mut native as *mut _ as isize);
+    if (native.left, native.top, native.right, native.bottom)
+        != (content.left, content.top, content.right, content.bottom)
+    {
+        let rendering = RENDERING.with(|set| set.borrow().contains(&(editor as usize)));
+        let _rendering = (!rendering).then(|| Rendering::begin(editor));
+        SendMessageW(editor, EM_SETRECTNP, 0, &content as *const _ as isize);
+    }
+    Some(content)
+}
+
 unsafe fn plain_format(editor: HWND, mode: ThemeMode, preset: ThemePreset, all: bool) {
     let colors = Palette::for_theme(mode, preset);
     let mut face = [0u16; 32];
@@ -415,6 +461,7 @@ unsafe extern "system" fn view_proc(
         let state = VIEWS.with(|views| views.borrow().get(&(editor as usize)).cloned());
         if let Some(view) = state {
             if message == WM_SETTEXT {
+                apply_padding(editor);
                 plain_format(editor, view.mode, view.preset, true);
             } else if matches!(message, WM_SIZE | WM_DPICHANGED_AFTERPARENT | WM_SETFONT) {
                 if let Some(source) = view.source {
@@ -426,6 +473,8 @@ unsafe extern "system" fn view_proc(
                         view.preset,
                         message != WM_SIZE,
                     );
+                } else {
+                    apply_padding(editor);
                 }
             }
         }

@@ -128,17 +128,23 @@ pub fn close_unfinished_fence(output: &mut String) {
                     && matches!(tag, Tag::CodeBlock(CodeBlockKind::Fenced(_)))
                     && range.end == output.len()
                 {
-                    candidate = Some(range);
+                    candidate = Some((range, 0usize));
                 }
                 depth += 1;
             }
             Event::End(_) => depth = depth.saturating_sub(1),
+            Event::Text(_) if depth == 1 => {
+                if let Some((_, text_end)) = &mut candidate {
+                    *text_end = (*text_end).max(range.end);
+                }
+            }
             _ => {}
         }
     }
-    let Some(range) = candidate else {
+    let Some((range, text_end)) = candidate else {
         return;
     };
+    let block_start = range.start;
     let block = &output[range];
     let mut lines = block.lines();
     let Some(opening) = lines.next() else {
@@ -159,6 +165,9 @@ pub fn close_unfinished_fence(output: &mut String) {
         let markers = line.bytes().take_while(|byte| *byte == marker).count();
         spaces <= 3
             && markers >= count
+            // Match the parser, including line endings/whitespace it treats as
+            // code rather than an actual closing delimiter.
+            && text_end <= block_start + block.rfind(line).unwrap_or(block.len())
             && line[markers..]
                 .bytes()
                 .all(|byte| matches!(byte, b' ' | b'\t'))
@@ -822,6 +831,7 @@ mod tests {
             "````markdown\n```\nnot closed by three ticks",
             "~~~~text\r\n中文 😀\r\n",
             "  ```info\nbody\n",
+            "~~~text\r\ncode\r\n  ~~~~\t\r\n",
             "```",
         ] {
             let mut display = initial.to_owned();
@@ -841,7 +851,7 @@ mod tests {
         for source in [
             "```rust\ncode\n```",
             "````info\ncode\n`````  ",
-            "~~~text\r\ncode\r\n  ~~~~\t\r\n",
+            "~~~text\r\ncode\r\n  ~~~~  \r\n",
             "```\ncode\n```\n\nnormal text",
             "> ```rust\n> code",
             "- ```rust\n  code",
@@ -851,7 +861,10 @@ mod tests {
             close_unfinished_fence(&mut display);
             assert_eq!(display, source);
             display.push_str("\n\n**Next exchange**");
-            assert!(!plain_text(&display).contains("**Next exchange**"), "source: {source:?}");
+            assert!(
+                !plain_text(&display).contains("**Next exchange**"),
+                "source: {source:?}"
+            );
         }
     }
 }

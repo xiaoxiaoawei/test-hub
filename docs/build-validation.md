@@ -6,15 +6,15 @@
 
 | 检查 | 结果 |
 |---|---|
-| Linux 全 targets 单元测试 | 70/70 通过 |
+| Linux 全 targets 单元测试 | 72/72 通过 |
 | Linux 全 targets 严格 Clippy | 通过 |
 | Windows GNU release / 全 targets 测试编译 | 构建通过；不当作已运行测试 |
 | Windows GNU 全 targets 严格 Clippy | 通过 |
-| Markdown 解析与安全转义 | 8 项跨平台测试通过；原生格式待 GUI 检验 |
+| Markdown 解析与安全转义 | 10 项跨平台测试通过；原生格式待 GUI 检验 |
 | RichEdit / 朗读控制 / 高清图标 | 已编译，原生测试与界面正在验证 |
 | 三页设置、Markdown / 问答 / 润色交互 | 正在验证 |
 | 更新 helper 成功 / 回滚 | 使用 0.9.1 固定夹具，待最终候选回归 |
-| 发行工具与版本一致性 | 待本轮最终检查 |
+| 发行工具与版本一致性 | Python 14/14、版本检查通过 |
 | 原生 Windows 全测试 / 构建 / 打包 | 待本轮 CI |
 | 公开更新源 / 旧版实际升级 | 待发布后验证 |
 | Windows 11 / Edge / 混合 DPI / 实际语音发声 | 未执行，不能用 Wine 或无音频测试替代 |
@@ -38,3 +38,5 @@ Wine WinHTTP 在已缓冲 chunk 尾部、下一 chunk header 尚未到达时，�
 ## 分发
 
 主文件为 `lingoleaf.exe`，ZIP 为 `lingoleaf-windows-x64.zip`。版本化 EXE 仅作旧更新器兼容副本，需与主 EXE 字节相同；清单保持 schema 1 六字段。发布前检查版本、校验和、ZIP 允许清单和文档链接，发布后实际匿名下载并以旧 0.8.0 验证下载、替换、启动确认及配置保留。标签页面可访问本身不能证明更新可用。
+
+当前最终 GNU 候选为 1149440 字节，SHA-256 `9e67eb2279bd31a4fd465635d9382df571059673945f687bacf310e9b40c0bc7`。该标识仅用于本地交叉构建，不与后续 CI 的 MSVC 字节混用。

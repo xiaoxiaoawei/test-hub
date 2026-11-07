@@ -29,29 +29,8 @@ OPTIONAL_DOCUMENTS = (
     "docs/images/appearance-0.9.0.png",
     "docs/images/settings-200pct-0.9.0.png",
     "docs/design-0.9.0.md",
-    "docs/images/settings-ocean-dark-0.8.0.png",
-    "docs/images/settings-amber-light-0.8.0.png",
-    "docs/images/themes-0.8.0.png",
-    "docs/images/questions-nebula-0.8.0.png",
-    "docs/images/settings-dark-0.7.0.png",
-    "docs/images/settings-day-0.7.0.png",
-    "docs/images/preferences-0.7.0.png",
-    "docs/images/settings-dark-0.6.0.png",
-    "docs/images/settings-day-0.6.0.png",
-    "docs/images/preferences-0.6.0.png",
-    "docs/images/appearance-0.6.0.png",
-    "docs/images/questions-0.6.0.png",
-    "docs/images/settings-warm-dark.png",
-    "docs/images/appearance.png",
-    "docs/images/streaming.png",
-    "docs/images/cache.png",
-    "docs/images/inline.png",
-    "docs/images/selection-icon.png",
-    "docs/images/browser-web-0.4.2.png",
-    "docs/images/browser-pdf-0.4.2.png",
-    "docs/images/settings-dark-0.5.0.png",
-    "docs/images/settings-day-0.5.0.png",
 )
+
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 UPDATE_REPOSITORY = "https://github.com/xiaoxiaoawei/test-hub"
 PRIMARY_EXECUTABLE = "lingoleaf.exe"

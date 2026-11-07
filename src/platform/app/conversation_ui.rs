@@ -446,6 +446,7 @@ pub(super) fn has_content(state: &State) -> bool {
 }
 
 fn append_exchange(output: &mut String, question: &str, answer: &str) {
+    crate::markdown::close_unfinished_fence(output);
     output.push_str("\n\n**你：** ");
     let question = if question == POLISH_PROMPT {
         "检查并润色"
@@ -454,7 +455,7 @@ fn append_exchange(output: &mut String, question: &str, answer: &str) {
     };
     // User questions are literal content, including backticks/links/HTML.
     for character in question.chars() {
-        if "\\`*_{}[]<>()#+-.!|~>".contains(character) {
+        if character.is_ascii_punctuation() {
             output.push('\\');
         }
         output.push(character);

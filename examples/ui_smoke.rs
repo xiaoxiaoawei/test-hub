@@ -35,8 +35,8 @@ mod windows {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, FILETIME, HANDLE, HWND, POINT, RECT, WAIT_OBJECT_0},
         Graphics::Gdi::{
-            GetDC, GetMonitorInfoW, GetPixel, MonitorFromPoint, ReleaseDC, MONITORINFO,
-            MONITOR_DEFAULTTONEAREST,
+            ClientToScreen, GetDC, GetMonitorInfoW, GetPixel, MonitorFromPoint, ReleaseDC,
+            MONITORINFO, MONITOR_DEFAULTTONEAREST,
         },
         System::Threading::{
             AttachThreadInput, CreateEventW, GetCurrentThreadId, GetProcessTimes,
@@ -47,13 +47,14 @@ mod windows {
             KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_HOME, VK_RETURN,
         },
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetCursorPos, GetDlgItem, GetForegroundWindow,
-            GetGUIThreadInfo, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow,
-            IsWindowVisible, PeekMessageW, PostMessageW, SendMessageTimeoutW, SetCursorPos,
-            SetForegroundWindow, SetWindowPos, BM_CLICK, CBN_SELCHANGE, CB_ERR, CB_GETCURSEL,
-            CB_GETDROPPEDSTATE, CB_SETCURSEL, GUITHREADINFO, GW_OWNER, MSG, PM_NOREMOVE,
-            SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_APP,
-            WM_CLOSE, WM_COMMAND, WM_GETTEXT, WM_SETTEXT,
+            FindWindowExW, FindWindowW, GetClientRect, GetCursorPos, GetDlgItem,
+            GetForegroundWindow, GetGUIThreadInfo, GetWindow, GetWindowRect,
+            GetWindowThreadProcessId, IsWindow, IsWindowVisible, PeekMessageW, PostMessageW,
+            SendMessageTimeoutW, SetCursorPos, SetForegroundWindow, SetWindowPos, BM_CLICK,
+            CBN_SELCHANGE, CB_ERR, CB_GETCURSEL, CB_GETDROPPEDSTATE, CB_SETCURSEL, GUITHREADINFO,
+            GW_OWNER, MSG, PM_NOREMOVE, SB_BOTTOM, SB_TOP, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+            SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_APP, WM_CLOSE, WM_COMMAND, WM_GETTEXT,
+            WM_SETTEXT, WM_VSCROLL,
         },
     };
 
@@ -91,9 +92,15 @@ mod windows {
     const PAUSE_SELECTION: i32 = 264;
     const SWAP_LANGUAGES: i32 = 265;
     const KEY_VISIBILITY: i32 = 267;
+    const MANUAL_HOTKEY: i32 = 301;
+    const SPEECH_SETTINGS: i32 = 303;
     const EM_GETPASSWORDCHAR: u32 = 0x00D2;
     const SAVE_TITLE: &str = "轻译 · 保存成功";
-    const SAVE_BODY: &str = "设置保存成功，已立即生效。";
+    const SAVE_BODY: &str = "保存成功。";
+
+    mod shortcut_actions {
+        include!("support/ui_shortcuts_0100.rs");
+    }
 
     pub(super) fn run() -> Result<(), String> {
         let executable = std::env::args_os()
@@ -207,6 +214,7 @@ mod windows {
         }
 
         check_native_combo_interaction(settings)?;
+        check_resizing(settings)?;
         select_provider(settings, 0)?;
         require_text(settings, 210, "https://api.deepseek.com/v1")?;
         require_text(settings, 212, "deepseek-chat")?;
@@ -227,11 +235,17 @@ mod windows {
         let settings = check_languages(&mut owned, settings)?;
         let settings = check_preference_actions(&mut owned, settings)?;
         check_live_save(&mut owned, settings)?;
+        let migrated = saved_settings(&owned)?;
+        if migrated["icon_shape"] != "leaf" || migrated["icon_color"] != 0x19A97C_u32 {
+            return Err("The legacy profile without custom icon settings did not receive the green leaf default.".into());
+        }
+        shortcut_actions::check(&mut owned, settings)?;
         let settings = check_theme(&mut owned, settings)?;
         let settings = check_theme_presets(&mut owned, settings)?;
         check_icon_appearance(&mut owned, settings)?;
 
         owned.stop()?;
+        shortcut_actions::require_released()?;
         println!("UI smoke check passed; no translation API request was sent.");
         Ok(())
     }
@@ -418,6 +432,96 @@ mod windows {
             thread::sleep(Duration::from_millis(30));
         }
         Err("A repeated launch did not center and focus the existing settings window.".into())
+    }
+
+    fn check_resizing(settings: HWND) -> Result<(), String> {
+        let mut original: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(settings, &mut original) } == 0 {
+            return Err("Cannot inspect settings before resizing.".into());
+        }
+        let scale = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(settings) }.max(96);
+        for (width, height) in [(820_i32, 720_i32), (600, 480), (940, 800)] {
+            if unsafe {
+                SetWindowPos(
+                    settings,
+                    null_mut(),
+                    20,
+                    20,
+                    width * scale as i32 / 96,
+                    height * scale as i32 / 96,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            } == 0
+            {
+                return Err("Cannot resize the owned settings window.".into());
+            }
+            thread::sleep(Duration::from_millis(100));
+            for (tab, controls) in [
+                (
+                    SERVICE_TAB,
+                    &[PROVIDER, KEY, 210, 212, 213, SPEECH_SETTINGS][..],
+                ),
+                (
+                    PREFERENCES_TAB,
+                    &[
+                        SOURCE_LANGUAGE,
+                        TARGET_LANGUAGE,
+                        MANUAL_HOTKEY,
+                        SELECTION_MODE,
+                        COMPATIBILITY_CAPTURE,
+                    ][..],
+                ),
+                (APPEARANCE_TAB, &[281, 282, 283, 284, APPEARANCE][..]),
+            ] {
+                click(settings, tab)?;
+                send(settings, WM_VSCROLL, SB_TOP as usize, 0)?;
+                let mut client: RECT = unsafe { zeroed() };
+                let mut origin = POINT { x: 0, y: 0 };
+                if unsafe { GetClientRect(settings, &mut client) } == 0
+                    || unsafe { ClientToScreen(settings, &mut origin) } == 0
+                {
+                    return Err("Cannot inspect the resized client area.".into());
+                }
+                for &id in controls {
+                    let mut rect: RECT = unsafe { zeroed() };
+                    if unsafe { GetWindowRect(control(settings, id)?, &mut rect) } == 0
+                        || rect.left < origin.x
+                        || rect.right > origin.x + client.right
+                        || rect.right <= rect.left
+                    {
+                        return Err(format!("Control {id} clips horizontally at logical {width}×{height}, DPI {scale}."));
+                    }
+                }
+                send(settings, WM_VSCROLL, SB_BOTTOM as usize, 0)?;
+                let mut save: RECT = unsafe { zeroed() };
+                if unsafe { GetWindowRect(control(settings, SAVE)?, &mut save) } == 0
+                    || save.top < origin.y
+                    || save.bottom > origin.y + client.bottom
+                {
+                    return Err(format!(
+                        "Save cannot be reached after resizing to {width}×{height}, DPI {scale}."
+                    ));
+                }
+            }
+        }
+        if unsafe {
+            SetWindowPos(
+                settings,
+                null_mut(),
+                original.left,
+                original.top,
+                original.right - original.left,
+                original.bottom - original.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        } == 0
+        {
+            return Err("Cannot restore the settings size.".into());
+        }
+        send(settings, WM_VSCROLL, SB_TOP as usize, 0)?;
+        show_service(settings)?;
+        println!("Settings responsive widths and scroll-reachable Save passed at 600×480, 820×720 and 940×800 logical pixels, DPI {scale}.");
+        Ok(())
     }
 
     fn save_settings(owned: &OwnedApplication, settings: HWND) -> Result<(), String> {
@@ -653,6 +757,7 @@ mod windows {
             212,
             213,
             106,
+            SPEECH_SETTINGS,
             UPDATE,
             UPDATE_STATUS,
         ] {
@@ -665,6 +770,7 @@ mod windows {
             PAUSE_SELECTION,
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
+            MANUAL_HOTKEY,
             APPEARANCE,
             281,
             282,
@@ -685,6 +791,7 @@ mod windows {
             PAUSE_SELECTION,
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
+            MANUAL_HOTKEY,
             UPDATE,
             UPDATE_STATUS,
         ] {
@@ -698,6 +805,7 @@ mod windows {
             212,
             213,
             106,
+            SPEECH_SETTINGS,
             APPEARANCE,
             281,
             282,
@@ -722,12 +830,14 @@ mod windows {
             212,
             213,
             106,
+            SPEECH_SETTINGS,
             SOURCE_LANGUAGE,
             TARGET_LANGUAGE,
             SWAP_LANGUAGES,
             PAUSE_SELECTION,
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
+            MANUAL_HOTKEY,
         ] {
             require_hidden(settings, id)?;
         }
@@ -1028,7 +1138,7 @@ mod windows {
         }
         select_combo(appearance, ICON_STYLE, 2)?;
         // Both supported size endpoints must save, together with each shape.
-        for (index, shape, size) in [(0, "rounded", 16_u32), (1, "square", 64)] {
+        for (index, shape, size) in [(0, "rounded", 16_u32), (1, "square", 64), (3, "leaf", 32)] {
             select_combo(appearance, ICON_SHAPE, index)?;
             set_control_text(appearance, ICON_SIZE, &size.to_string())?;
             click(appearance, ICON_APPLY)?;

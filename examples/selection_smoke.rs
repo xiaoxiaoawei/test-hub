@@ -38,7 +38,9 @@ mod windows {
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            ClientToScreen, GetStockObject, UpdateWindow, COLOR_WINDOW, DEFAULT_GUI_FONT,
+            ClientToScreen, CreateRectRgn, DeleteObject, GetPixel, GetRgnBox, GetStockObject,
+            GetWindowDC, GetWindowRgn, PtInRegion, ReleaseDC, UpdateWindow, COLOR_WINDOW,
+            DEFAULT_GUI_FONT,
         },
         System::{
             LibraryLoader::GetModuleHandleW,
@@ -77,6 +79,12 @@ mod windows {
     }
     mod markdown_actions {
         include!("support/selection_markdown_090.rs");
+    }
+    mod speech_actions {
+        include!("support/selection_speech_0100.rs");
+    }
+    mod manual_actions {
+        include!("support/selection_manual_0100.rs");
     }
     const QUESTION_ONE: &str = "What does this word mean?";
     const QUESTION_TWO: &str = "Give a short example.";
@@ -122,14 +130,16 @@ mod windows {
         };
         std::env::set_var("LOCALAPPDATA", &directory);
         let mock = Mock::start()?;
-        config::save(&Settings {
+        let speech = speech_actions::SpeechMock::start()?;
+        let fixture_settings = Settings {
             base_url: format!("http://127.0.0.1:{}/v1", mock.port),
             model: "selection-smoke-model".into(),
             selection_mode: SelectionMode::Direct,
             source_language: Language::Auto,
             target_language: Language::Japanese,
             ..Settings::default()
-        })?;
+        };
+        config::save(&fixture_settings)?;
         let source = Source::start()?;
         let mut app = Application::start(executable, &directory)?;
         let background = app.window(BACKGROUND)?;
@@ -159,6 +169,7 @@ mod windows {
         }
         let first = bounds(inline)?;
         require_visible(inline)?;
+        check_popup_corners(inline)?;
 
         source.gesture(background, false, 5, 10)?;
         require_same_inline(&app, inline)?;
@@ -189,8 +200,10 @@ mod windows {
             return Err("The blocked previous translation was released too early.".into());
         }
         mock.finish_warm.store(true, Ordering::Release);
-        if bounds(inline)? == first {
-            return Err("The compact window did not follow the new selection position.".into());
+        if bounds(inline)? != first {
+            return Err(
+                "A continuous selection moved the compact window's original anchor.".into(),
+            );
         }
 
         // Select the same word on the next line while its HTTP stream is active.
@@ -207,9 +220,9 @@ mod windows {
             Ok(translated == "新译文" && text(inline, 254)?.contains("完成"))
         })?;
         require_visible(inline)?;
-        if bounds(inline)? == before_move {
+        if bounds(inline)? != before_move {
             return Err(
-                "Repeating a word at a different position did not move the compact window.".into(),
+                "Repeating a word at a different position moved the compact window.".into(),
             );
         }
         mock.require_requests(&["warm", "light"])?;
@@ -225,6 +238,7 @@ mod windows {
         question_actions::check(inline, &mock)?;
         check_controls(&source, &app, background, inline, &mock)?;
         markdown_actions::check(&source, &app, background, inline, &mock)?;
+        speech_actions::check(&app, inline, &mock, &speech)?;
         let expected = all_requests();
 
         // Both an empty selection and a password selection must remain local.
@@ -234,8 +248,14 @@ mod windows {
         source.gesture(background, true, 0, 5)?;
         thread::sleep(Duration::from_millis(2400));
         mock.require_requests(&expected)?;
+        manual_actions::check(&source, &app, background, inline, &mock)?;
+        let expected: Vec<_> = expected
+            .into_iter()
+            .chain(manual_actions::REQUESTS)
+            .collect();
+        mock.require_requests(&expected)?;
         app.stop()?;
-        println!("Selection controller passed: one compact HWND, updated positions, stale-progress isolation, in-flight/cache deduplication, and no requests for empty/password selections.");
+        println!("Selection controller passed: one compact HWND, fixed position across continuous selections, stale-progress isolation, in-flight/cache deduplication, and no requests for empty/password selections.");
         println!("Questions passed: current source/translation reference data, two-turn history, independent translation while an old answer is blocked, and a fresh conversation after reselection.");
         println!("Controls passed: blocked-request cancellation, forced retranslation, failure retry, pin across foreground changes, session pause with manual capture, and preserving text selection/scroll during streaming.");
         println!("{} local mock POSTs; no real API credential or remote service was used. Mouse-hook and keyboard behavior require separate actual-input checks.", expected.len());
@@ -416,6 +436,7 @@ mod windows {
             return Err("Stopping translation discarded its visible partial text.".into());
         }
         let retry_started = Instant::now();
+        let retry_anchor = bounds(inline)?;
         press_button(inline, ACTION)?;
         wait_for("retry after cancelling a blocked response", || {
             Ok(text(inline, 251)? == "重新完成" && text(inline, 254)?.contains("完成"))
@@ -424,6 +445,9 @@ mod windows {
             || mock.finish_control.load(Ordering::Acquire)
         {
             return Err("Retry waited for a cancelled body to finish.".into());
+        }
+        if bounds(inline)? != retry_anchor {
+            return Err("Retrying a cancelled request moved the translation window.".into());
         }
         let before = mock.request_count()?;
         press_button(inline, ACTION)?;
@@ -435,9 +459,12 @@ mod windows {
                     && text(inline, 254)?.contains("完成"))
             },
         )?;
+        if bounds(inline)? != retry_anchor {
+            return Err("Forced retranslation moved the translation window.".into());
+        }
 
-        // Pin only keeps the bubble visible. It must not freeze its text or
-        // prevent the next genuine selection from moving/updating the same HWND.
+        // Pin keeps the bubble visible. A new selection updates its text while
+        // preserving the same user-chosen window anchor.
         let before_pin = bounds(inline)?;
         let pin_label = text(inline, PIN)?;
         press_button(inline, PIN)?;
@@ -485,13 +512,16 @@ mod windows {
         })?;
         require_same_inline(app, inline)?;
         require_visible(inline)?;
-        if bounds(inline)? == before_pin {
-            return Err("Pinning incorrectly froze the next selection's position.".into());
+        if bounds(inline)? != before_pin {
+            return Err("A pinned continuous selection moved the window's anchor.".into());
         }
         press_button(inline, ACTION)?;
         wait_for("retrying an HTTP failure", || {
             Ok(text(inline, 251)? == "重试成功" && text(inline, 254)?.contains("完成"))
         })?;
+        if bounds(inline)? != before_pin {
+            return Err("Retrying an HTTP failure moved the translation window.".into());
+        }
 
         let before_pause = mock.request_count()?;
         send(background, WM_COMMAND, PAUSE, 0)?;
@@ -1317,6 +1347,9 @@ mod windows {
         if question_actions::try_serve(&body, &mut stream, requests, control, stop)? {
             return Ok(());
         }
+        if manual_actions::try_serve(&body, &mut stream, requests, control, stop)? {
+            return Ok(());
+        }
         if matches!(source, "wait" | "retry" | "manual" | "scroll") {
             if body["messages"].as_array().map(Vec::len) != Some(2)
                 || body["messages"][0]["role"] != "system"
@@ -1525,6 +1558,64 @@ mod windows {
         if app.window(INLINE)? != expected {
             return Err("A new compact window replaced the existing HWND.".into());
         }
+        Ok(())
+    }
+    fn check_popup_corners(window: HWND) -> Result<(), String> {
+        let bounds = bounds(window)?;
+        let width = bounds.2 - bounds.0;
+        let height = bounds.3 - bounds.1;
+        let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+        if region.is_null() {
+            return Err("Cannot create the popup's bounded region probe.".into());
+        }
+        let mut extent: RECT = unsafe { zeroed() };
+        let kind = unsafe { GetWindowRgn(window, region) };
+        let region_kind = unsafe { GetRgnBox(region, &mut extent) };
+        let corners = [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ]
+        .map(|(x, y)| unsafe { PtInRegion(region, x, y) });
+        let edges = [
+            (width / 2, 0),
+            (width - 1, height / 2),
+            (width / 2, height - 1),
+            (0, height / 2),
+        ]
+        .map(|(x, y)| unsafe { PtInRegion(region, x, y) });
+        unsafe { DeleteObject(region) };
+        if kind != 3
+            || region_kind != 3
+            || (extent.left, extent.top, extent.right, extent.bottom) != (0, 0, width, height)
+            || corners != [0; 4]
+            || edges.contains(&0)
+        {
+            return Err(format!("The popup is not one full-size rounded silhouette: kind={kind}, box={},{},{},{}, corners={corners:?}, edges={edges:?}, size={width}×{height}.", extent.left,extent.top,extent.right,extent.bottom));
+        }
+        unsafe { UpdateWindow(window) };
+        let dc = unsafe { GetWindowDC(window) };
+        if dc.is_null() {
+            return Err("Cannot sample the popup's painted edges.".into());
+        }
+        let pixels = [
+            (width / 2, 1),
+            (width - 2, height / 2),
+            (width / 2, height - 2),
+            (1, height / 2),
+        ]
+        .map(|(x, y)| unsafe { GetPixel(dc, x, y) });
+        unsafe { ReleaseDC(window, dc) };
+        if pixels
+            .iter()
+            .any(|value| *value == u32::MAX || *value == 0x00ff_ffff)
+        {
+            return Err(format!(
+                "The dark popup has an unpainted/white edge: {pixels:x?}."
+            ));
+        }
+        println!("Popup corner proof: native region box 0,0,{width},{height}; all four corners excluded, all four final edge centers included; painted edge COLORREF={pixels:x?}.");
         Ok(())
     }
     fn require_visible(window: HWND) -> Result<(), String> {

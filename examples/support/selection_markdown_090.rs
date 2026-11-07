@@ -307,9 +307,8 @@ pub(super) const REQUESTS: [&str; 3] = [
     "markdown:question",
     "markdown:polish",
 ];
-const POLISH_PROMPT: &str = "请结合当前原文和译文，对译文做一次完整检查与润色。检查准确性、遗漏、术语、语法和表达，保留原意、事实和数字，不添加未经原文支持的信息。使用当前目标语言，以 Markdown 给出两个简洁部分：检查要点、润色后的完整译文；无问题时如实说明。";
-const POLISH_FIRST: &str =
-    "## 检查要点\n\n- 原意保持准确。\n\n## 润色后的完整译文\n\n**Polished result中文**";
+const POLISH_PROMPT: &str = "结合原文检查并润色当前译文，保留原意、事实与数字。只输出目标语言的完整润色译文，不列检查要点，不加开场白、解释、总结或重复版本；无需修改则直接输出原译文。";
+const POLISH_FIRST: &str = "**Polished result中文**";
 const POLISH_TAIL: &str = " 完整结束。";
 const UNSENT_DRAFT: &str = "An unsent *draft* remains literal.";
 const SPEAK: i32 = 285;
@@ -492,26 +491,9 @@ pub(super) fn check(
     {
         return Err("Polish overwrote the selected passage's original translation.".into());
     }
-    let requests_before_speech = mock.request_count()?;
-    press_button(inline, SPEAK)?;
-    wait_for(
-        "the offline speech action or its explicit unavailable-engine result",
-        || Ok(text(inline, 254)?.contains("朗读") || text(inline, 254)?.contains("语音")),
-    )?;
-    // This Wine prefix may not contain SAPI voices. Both a real offline voice
-    // and an explicit unavailable-engine state must leave the UI responsive and
-    // must not send another paid translation POST.
-    if text(inline, SPEAK)?.contains("停止") {
-        press_button(inline, SPEAK)?;
-    }
     send(inline, WM_NULL, 0, 0)?;
-    if mock.request_count()? != requests_before_speech || text(inline, QUESTION)? != UNSENT_DRAFT {
-        return Err(
-            "Offline speech sent a translation request or changed an unsent question.".into(),
-        );
-    }
     println!("Markdown passed: actual native heading/bold/italic/strikeout/monospace formats; streamed incomplete syntax; list/table/Unicode/literal HTML and RTF text; plain and explicit Markdown copying; raw question context.");
-    println!("Polish passed: one real POST with raw source/translation/history, busy-state gating, original translation and unsent draft preserved; offline speech remained responsive and added no API POST.");
+    println!("Polish passed: one real POST with raw source/translation/history, busy-state gating, original translation and unsent draft preserved.");
     Ok(())
 }
 

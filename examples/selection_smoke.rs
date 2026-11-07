@@ -47,7 +47,8 @@ mod windows {
         UI::{
             Input::KeyboardAndMouse::{
                 IsWindowEnabled, SendInput, SetFocus, INPUT, INPUT_KEYBOARD, INPUT_MOUSE,
-                KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_ESCAPE,
+                KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_DOWN, VK_HOME,
+                VK_RETURN,
             },
             WindowsAndMessaging::*,
         },
@@ -504,26 +505,49 @@ mod windows {
         // Complete the stream while the native menu is pumping messages. Closing
         // the menu must drain the queued event, even if its first WM_WORK was
         // delivered during App's mutable menu borrow.
-        if unsafe { PostMessageW(inline, WM_CONTEXTMENU, editor as usize, -1) } == 0 {
+        let before_menu = text(inline, 251)?;
+        if unsafe { PostMessageW(editor, WM_CONTEXTMENU, editor as usize, -1) } == 0 {
             return Err("Cannot request the owned translation context menu.".into());
         }
         wait_for("the native translation context menu", || {
             Ok(owned_menu_visible(app.child.id()))
         })?;
+        let popup = owned_menu(app.child.id()).ok_or("The native context menu disappeared.")?;
+        if let Some(count) = native_menu_count(popup) {
+            if count != 3 {
+                return Err(format!("The editor opened the default {count}-item menu instead of three translation actions."));
+            }
+        } else {
+            println!("Native menu count API is unavailable in this runtime; the actual second action and unchanged selection are checked below.");
+        }
         mock.finish_control.store(true, Ordering::Release);
         thread::sleep(Duration::from_millis(250));
-        let mut keys: [INPUT; 2] = unsafe { zeroed() };
+        // Custom menu: Home selects Copy selection, Down selects Copy translation.
+        // The old native read-only EDIT menu instead reaches Select All, which
+        // cannot satisfy the clipboard and original-selection assertions.
+        let mut keys: [INPUT; 6] = unsafe { zeroed() };
         for (index, key) in keys.iter_mut().enumerate() {
             key.r#type = INPUT_KEYBOARD;
-            key.Anonymous.ki.wVk = VK_ESCAPE;
-            key.Anonymous.ki.dwFlags = if index == 0 { 0 } else { KEYEVENTF_KEYUP };
+            key.Anonymous.ki.wVk = [VK_HOME, VK_DOWN, VK_RETURN][index / 2];
+            key.Anonymous.ki.dwFlags = if index % 2 == 0 { 0 } else { KEYEVENTF_KEYUP };
         }
-        if unsafe { SendInput(2, keys.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
-            return Err("Cannot close the owned context menu with Escape.".into());
+        if unsafe { SendInput(6, keys.as_ptr(), size_of::<INPUT>() as i32) } != 6 {
+            return Err("Cannot invoke the owned context menu's Copy translation action.".into());
         }
         wait_for("closing the native translation menu", || {
             Ok(!owned_menu_visible(app.child.id()))
         })?;
+        // Menu visibility can clear before its returned command finishes. Read
+        // the clipboard only after Copy or the subsequent completion status, so
+        // the harness cannot steal OpenClipboard from the app's own write.
+        wait_for("the completed menu action", || {
+            let status = text(inline, 254)?;
+            Ok(status == "译文已复制" || status.contains("完成"))
+        })?;
+        let copied = lingoleaf::platform::selection::read_clipboard_text()?.text;
+        if copied.replace("\r\n", "\n") != before_menu.trim() {
+            return Err("The editor's actual second menu action did not copy the complete partial translation.".into());
+        }
         wait_for(
             "completion without stealing the user's scroll position",
             || Ok(text(inline, 251)?.ends_with("尾行结束") && text(inline, 254)?.contains("完成")),
@@ -545,7 +569,7 @@ mod windows {
         mock.require_requests(&all_requests())
     }
 
-    fn owned_menu_visible(pid: u32) -> bool {
+    fn owned_menu(pid: u32) -> Option<HWND> {
         unsafe {
             let mut window = GetTopWindow(null_mut());
             while !window.is_null() {
@@ -555,13 +579,49 @@ mod windows {
                     let mut class = [0_u16; 64];
                     let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
                     if String::from_utf16_lossy(&class[..length.max(0) as usize]) == "#32768" {
-                        return true;
+                        return Some(window);
                     }
                 }
                 window = GetWindow(window, GW_HWNDNEXT);
             }
         }
-        false
+        None
+    }
+
+    fn owned_menu_visible(pid: u32) -> bool {
+        owned_menu(pid).is_some()
+    }
+
+    fn native_menu_count(popup: HWND) -> Option<i32> {
+        unsafe {
+            let mut info: MENUBARINFO = zeroed();
+            info.cbSize = size_of::<MENUBARINFO>() as u32;
+            if GetMenuBarInfo(popup, OBJID_CLIENT, 0, &mut info) != 0 && !info.hMenu.is_null() {
+                let count = GetMenuItemCount(info.hMenu);
+                if count >= 0 {
+                    return Some(count);
+                }
+            }
+            const MN_GETHMENU: u32 = 0x01E1;
+            let mut handle = 0;
+            if SendMessageTimeoutW(
+                popup,
+                MN_GETHMENU,
+                0,
+                0,
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                1000,
+                &mut handle,
+            ) != 0
+                && handle != 0
+            {
+                let count = GetMenuItemCount(handle as HMENU);
+                if count >= 0 {
+                    return Some(count);
+                }
+            }
+        }
+        None
     }
 
     fn ask(parent: HWND, question: &str) -> Result<(), String> {
@@ -814,19 +874,31 @@ mod windows {
             let mut queue: MSG = unsafe { zeroed() };
             unsafe { PeekMessageW(&mut queue, null_mut(), 0, 0, PM_NOREMOVE) };
             let caller = unsafe { GetCurrentThreadId() };
-            if unsafe { AttachThreadInput(caller, self.thread, 1) } == 0 {
-                return Err("Cannot attach to the owned source input queue.".into());
+            let started = Instant::now();
+            loop {
+                if unsafe { AttachThreadInput(caller, self.thread, 1) } == 0 {
+                    return Err("Cannot attach to the owned source input queue.".into());
+                }
+                unsafe {
+                    SetForegroundWindow(self.window as HWND);
+                    SetFocus(edit);
+                    AttachThreadInput(caller, self.thread, 0);
+                }
+                let mut info: GUITHREADINFO = unsafe { zeroed() };
+                info.cbSize = size_of::<GUITHREADINFO>() as u32;
+                if unsafe { GetForegroundWindow() } == self.window as HWND
+                    && unsafe { GetGUIThreadInfo(self.thread, &mut info) } != 0
+                    && info.hwndFocus == edit
+                {
+                    return Ok(());
+                }
+                if started.elapsed() >= Duration::from_millis(500) {
+                    return Err("Cannot foreground and focus the owned selection source.".into());
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            unsafe {
-                SetForegroundWindow(self.window as HWND);
-                SetFocus(edit);
-                AttachThreadInput(caller, self.thread, 0);
-            }
-            if unsafe { GetForegroundWindow() } != self.window as HWND {
-                return Err("Cannot foreground the owned selection source.".into());
-            }
-            Ok(())
         }
+
         fn diagnostics(&self) -> String {
             let foreground = unsafe { GetForegroundWindow() };
             let mut info: GUITHREADINFO = unsafe { zeroed() };

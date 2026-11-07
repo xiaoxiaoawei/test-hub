@@ -2993,6 +2993,26 @@ unsafe fn create_window(
     )
 }
 
+// EDIT handles WM_CONTEXTMENU itself; it will not propagate the native menu
+// request to the parent the way a button does. Route only translated outputs,
+// keeping ordinary editing behavior and keyboard selection/copy unchanged.
+unsafe extern "system" fn translation_edit_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass_id: usize,
+    _data: usize,
+) -> LRESULT {
+    if message == WM_CONTEXTMENU {
+        return SendMessageW(GetParent(window), message, window as usize, lparam);
+    }
+    if message == WM_NCDESTROY {
+        RemoveWindowSubclass(window, Some(translation_edit_proc), subclass_id);
+    }
+    DefSubclassProc(window, message, wparam, lparam)
+}
+
 unsafe fn child(parent: HWND, class: &str, label: &str, style: u32, id: u16) -> HWND {
     let style = if class == "BUTTON" {
         (style & !0x0f) | BS_OWNERDRAW as u32
@@ -3014,6 +3034,9 @@ unsafe fn child(parent: HWND, class: &str, label: &str, style: u32, id: u16) -> 
         null(),
     );
     if class == "EDIT" {
+        if matches!(id, 224 | 251) {
+            SetWindowSubclass(hwnd, Some(translation_edit_proc), 1, 0);
+        }
         SendMessageW(hwnd, EM_SETLIMITTEXT, 32768, 0);
         SendMessageW(
             hwnd,

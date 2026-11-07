@@ -1730,6 +1730,11 @@ unsafe fn command(app: &mut App, id: u16) {
         }
         ID_PIN => {
             app.window_pinned = !app.window_pinned;
+            // Settings and pause can cancel the auto-hide timer while keeping
+            // a pinned view. Restoring normal behavior must restore its timer.
+            if app.inline_active && IsWindowVisible(app.inline_window) != 0 {
+                SetTimer(app.main, TIMER_CHIP, 200, None);
+            }
             refresh_translation_actions(app);
             translation_status(
                 app,

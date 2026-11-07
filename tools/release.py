@@ -24,6 +24,9 @@ REQUIRED_DOCUMENTS = (
     "docs/windows-validation.md",
 )
 OPTIONAL_DOCUMENTS = (
+    "docs/images/settings-dark-0.7.0.png",
+    "docs/images/settings-day-0.7.0.png",
+    "docs/images/preferences-0.7.0.png",
     "docs/images/settings-dark-0.6.0.png",
     "docs/images/settings-day-0.6.0.png",
     "docs/images/preferences-0.6.0.png",

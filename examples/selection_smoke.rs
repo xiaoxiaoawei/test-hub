@@ -424,9 +424,35 @@ mod windows {
                 "Pinning did not preserve the current translation on foreground change.".into(),
             );
         }
+        drop(other);
+        // Move the owned source below the pinned bubble. A real selection must
+        // start on the source, not on a topmost translation covering its text.
+        if unsafe {
+            SetWindowPos(
+                source.window as HWND,
+                null_mut(),
+                60,
+                560,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        } == 0
+        {
+            return Err("Cannot move the owned source clear of the pinned bubble.".into());
+        }
         select_word(source, background, "retry")?;
         wait_for("an HTTP failure on the new pinned selection", || {
             Ok(text(inline, 254)?.contains("失败"))
+        })
+        .map_err(|error| {
+            format!(
+                "{error}; {}; {}; output={:?}; status={:?}",
+                mock.diagnostics(),
+                source.diagnostics(),
+                text(inline, 251),
+                text(inline, 254)
+            )
         })?;
         require_same_inline(app, inline)?;
         require_visible(inline)?;
@@ -547,7 +573,8 @@ mod windows {
         wait_for("the enabled question composer", || {
             Ok(unsafe { IsWindowVisible(input) } != 0
                 && unsafe { IsWindowVisible(submit) } != 0
-                && unsafe { IsWindowEnabled(submit) } != 0)
+                && unsafe { IsWindowEnabled(submit) } != 0
+                && !text(parent, ASK)?.contains("停止"))
         })
         .map_err(|error| {
             format!(
@@ -560,12 +587,28 @@ mod windows {
             )
         })?;
         focus_question(parent)?;
-        let question = wide(question);
-        send(input, WM_SETTEXT, 0, question.as_ptr() as isize)?;
-        send(submit, BM_CLICK, 0, 0)?;
-        if !text(parent, QUESTION)?.is_empty() {
-            return Err("Submitting a question did not clear the input.".into());
-        }
+        let native_question = wide(question);
+        send(input, WM_SETTEXT, 0, native_question.as_ptr() as isize)?;
+        press_button(parent, ASK)?;
+        // A local HTTP failure may finish and restore the question before the
+        // harness can observe its initial empty field. Successful replies must
+        // still leave it empty; failure-specific checks verify exact recovery.
+        wait_for(
+            "a submitted question or its immediate failure recovery",
+            || {
+                let remaining = text(parent, QUESTION)?;
+                Ok(remaining.is_empty()
+                    || (remaining == question && text(parent, 254)?.contains("提问失败")))
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "{error}; question={question:?}; input={:?}; status={:?}; action={:?}",
+                text(parent, QUESTION),
+                text(parent, 254),
+                text(parent, ASK)
+            )
+        })?;
         Ok(())
     }
 
@@ -754,6 +797,10 @@ mod windows {
             }
             let down = character(edit, start)?;
             let up = character(edit, if end > start { end - 1 } else { end })?;
+            let hit = unsafe { WindowFromPoint(down) };
+            if unsafe { GetAncestor(hit, GA_ROOT) } != self.window as HWND {
+                return Err(format!("The owned gesture origin ({},{}) is occluded: hit={hit:?}, root={:?}, expected={:?}.",down.x,down.y,unsafe{GetAncestor(hit,GA_ROOT)},self.window as HWND));
+            }
             // Mirror the documented controller notification wire format. Real
             // mouse input is deliberately tested separately by the host runner.
             let packed_down = u64::from(down.x as u32) | (u64::from(down.y as u32) << 32);
@@ -1166,18 +1213,10 @@ mod windows {
             .lock()
             .map_err(|_| "Mock request lock failed.")?
             .push(label.to_owned());
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").map_err(|_| "Cannot write local response headers.")?;
-        let first = format!(
-            "data: {}\n\n",
-            serde_json::json!({"choices":[{"delta":{"content":first}}]})
-        );
-        // A comment supplies the next HTTP chunk header on Wine/WinHTTP too.
-        if write_chunk(&mut stream, first.as_bytes())
-            .and_then(|_| write_chunk(&mut stream, b": heartbeat\n\n"))
-            .is_err()
-        {
-            return Ok(());
-        }
+        let tail = match begin_sse_response(&mut stream, first, last) {
+            Ok(tail) => tail,
+            Err(_) => return Ok(()),
+        };
         let started = Instant::now();
         while gate.is_some_and(|gate| !gate.load(Ordering::Acquire))
             && !stop.load(Ordering::Acquire)
@@ -1185,10 +1224,8 @@ mod windows {
         {
             thread::sleep(Duration::from_millis(10));
         }
-        let tail = format!("data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"content":last}}]}));
         // Disconnects are expected when the controller cancels an old generation.
-        let _ =
-            write_chunk(&mut stream, tail.as_bytes()).and_then(|_| stream.write_all(b"0\r\n\r\n"));
+        let _ = stream.write_all(&tail).and_then(|_| stream.flush());
         Ok(())
     }
 
@@ -1232,19 +1269,10 @@ mod windows {
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .map_err(|_| "Cannot write the fixture's HTTP failure.".into());
         }
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
-            .map_err(|_| "Cannot write controller fixture headers.".to_string())?;
-        let event = format!(
-            "data: {}\n\n",
-            serde_json::json!({"choices":[{"delta":{"content":first}}]})
-        );
-        if write_chunk(stream, event.as_bytes())
-            .and_then(|_| write_chunk(stream, b": heartbeat\n\n"))
-            .is_err()
-        {
-            return Ok(());
-        }
+        let tail = match begin_sse_response(stream, &first, last) {
+            Ok(tail) => tail,
+            Err(_) => return Ok(()),
+        };
         let started = Instant::now();
         while blocked
             && !control.load(Ordering::Acquire)
@@ -1253,9 +1281,8 @@ mod windows {
         {
             thread::sleep(Duration::from_millis(10));
         }
-        let event = format!("data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"content":last}}]}));
         // A cancelled client is expected to close its socket before this tail.
-        let _ = write_chunk(stream, event.as_bytes()).and_then(|_| stream.write_all(b"0\r\n\r\n"));
+        let _ = stream.write_all(&tail).and_then(|_| stream.flush());
         Ok(())
     }
 
@@ -1335,11 +1362,24 @@ mod windows {
         Ok((label, first, last, blocked))
     }
 
-    fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
-        write!(stream, "{:x}\r\n", bytes.len())?;
-        stream.write_all(bytes)?;
-        stream.write_all(b"\r\n")?;
-        stream.flush()
+    // A finite, fixed-length SSE body avoids Wine's HTTP chunk-parser boundary
+    // bug without releasing any gated response bytes. The real Windows WinHTTP
+    // tests separately cover arbitrary chunk/header timing and cancellation.
+    // The old synchronous client still blocks waiting for this held tail body.
+    fn begin_sse_response(
+        stream: &mut TcpStream,
+        first: &str,
+        last: &str,
+    ) -> std::io::Result<Vec<u8>> {
+        let first = format!(
+            "data: {}\n\n: heartbeat\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":first}}]})
+        );
+        let tail = format!("data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"content":last}}]})).into_bytes();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", first.len()+tail.len())?;
+        stream.write_all(first.as_bytes())?;
+        stream.flush()?;
+        Ok(tail)
     }
 
     fn require_pending(inline: HWND) -> Result<(), String> {

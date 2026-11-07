@@ -56,7 +56,7 @@ pub(super) fn check(inline: HWND, mock: &Mock) -> Result<(), String> {
     .map_err(|error| question_failure(error, mock, inline))?;
     let draft = wide(NEXT_DRAFT);
     send(input, WM_SETTEXT, 0, draft.as_ptr() as isize)?;
-    send(button, BM_CLICK, 0, 0)?;
+    press_button(inline, ASK)?;
     wait_for(
         "stopping an answer without overwriting a newer draft",
         || {
@@ -94,15 +94,22 @@ pub(super) fn check(inline: HWND, mock: &Mock) -> Result<(), String> {
 
     // These intentionally distinct commands protect the existing copy-only-
     // translation behavior and the new opt-in copy of the successful transcript.
-    send(inline, WM_COMMAND, COPY_CONVERSATION, 0)?;
-    wait_for(
-        "copying the translation and successful conversation",
-        || Ok(selection::read_clipboard_text()?.text.replace("\r\n", "\n") == continued),
-    )?;
-    send(inline, WM_COMMAND, 104, 0)?;
-    wait_for("copying only the original translation", || {
-        Ok(selection::read_clipboard_text()?.text == "静译文")
+    if unsafe { PostMessageW(inline, WM_COMMAND, COPY_CONVERSATION, 0) } == 0 {
+        return Err("Cannot queue copying the successful conversation.".into());
+    }
+    wait_for("the completed transcript copy command", || {
+        Ok(text(inline, 254)? == "译文与问答已复制")
     })?;
+    if selection::read_clipboard_text()?.text.replace("\r\n", "\n") != continued {
+        return Err("The complete-copy command did not write the successful transcript.".into());
+    }
+    press_button(inline, 104)?;
+    wait_for("the completed translation-only copy command", || {
+        Ok(text(inline, 254)? == "译文已复制")
+    })?;
+    if selection::read_clipboard_text()?.text != "静译文" {
+        return Err("The copy glyph did not preserve translation-only copying.".into());
+    }
     println!("Question controls passed: HTTP 503 retry, failure/stop history isolation, newer draft preservation, independent next request before the old gate opens, and distinct translation/transcript copy commands.");
     Ok(())
 }
@@ -164,20 +171,10 @@ pub(super) fn try_serve(
             .map_err(|_| "Cannot write the local temporary failure response.")?;
         return Ok(true);
     }
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
-        .map_err(|_| "Cannot write the local controlled answer headers.")?;
-    let first = format!(
-        "data: {}\n\n",
-        serde_json::json!({"choices":[{"delta":{"content":first}}]})
-    );
-    if write_chunk(stream, first.as_bytes())
-        .and_then(|_| write_chunk(stream, b": heartbeat\n\n"))
-        .is_err()
-    {
-        // Closing a superseded request is an expected cancellation outcome.
-        return Ok(true);
-    }
+    let tail = match begin_sse_response(stream, first, last) {
+        Ok(tail) => tail,
+        Err(_) => return Ok(true),
+    };
     let started = Instant::now();
     while blocked
         && !control.load(Ordering::Acquire)
@@ -186,13 +183,9 @@ pub(super) fn try_serve(
     {
         thread::sleep(Duration::from_millis(10));
     }
-    let tail = format!(
-        "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
-        serde_json::json!({"choices":[{"delta":{"content":last}}]})
-    );
     // A stopped request will normally have disconnected by this point. The
     // caller later releases the gate and verifies it cannot repaint the view.
-    let _ = write_chunk(stream, tail.as_bytes()).and_then(|_| stream.write_all(b"0\r\n\r\n"));
+    let _ = stream.write_all(&tail).and_then(|_| stream.flush());
     Ok(true)
 }
 

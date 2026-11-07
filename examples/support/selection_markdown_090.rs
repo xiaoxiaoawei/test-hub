@@ -113,7 +113,11 @@ fn read_remote(
     }
 }
 
-fn native_format(editor: HWND, expected_pid: u32, token: &str) -> Result<NativeFormat, String> {
+fn native_probe(
+    editor: HWND,
+    expected_pid: u32,
+    token: &str,
+) -> Result<(NativeFormat, NativeRange), String> {
     let mut pid = 0;
     let mut class = [0_u16; 64];
     unsafe { GetWindowThreadProcessId(editor, &mut pid) };
@@ -233,7 +237,34 @@ fn native_format(editor: HWND, expected_pid: u32, token: &str) -> Result<NativeF
         previous & 0xffff,
         ((previous >> 16) & 0xffff) as isize,
     )?;
-    Ok(format)
+    Ok((format, find.found))
+}
+
+fn native_format(editor: HWND, expected_pid: u32, token: &str) -> Result<NativeFormat, String> {
+    native_probe(editor, expected_pid, token).map(|value| value.0)
+}
+
+fn copy_native_code(editor: HWND, pid: u32) -> Result<(), String> {
+    let (_, first) = native_probe(editor, pid, "let icon")?;
+    let (_, last) = native_probe(editor, pid, "let size = 32;")?;
+    let previous = send(editor, EM_GETSEL, 0, 0)?;
+    send(editor, EM_SETSEL, first.first as usize, last.last as isize)?;
+    send(editor, WM_COPY, 0, 0)?;
+    let copied = lingoleaf::platform::selection::read_clipboard_text()?
+        .text
+        .replace("\r\n", "\n");
+    send(
+        editor,
+        EM_SETSEL,
+        previous & 0xffff,
+        ((previous >> 16) & 0xffff) as isize,
+    )?;
+    if copied != "let icon = \"叶🌿\";\nlet size = 32;" {
+        return Err(format!(
+            "Native copying collapsed or changed a multiline Markdown code block: {copied:?}."
+        ));
+    }
+    Ok(())
 }
 
 fn require_effect(editor: HWND, pid: u32, token: &str, effect: u32) -> Result<(), String> {
@@ -284,8 +315,8 @@ const UNSENT_DRAFT: &str = "An unsent *draft* remains literal.";
 const SPEAK: i32 = 285;
 const POLISH: i32 = 286;
 const QUESTION_MARKDOWN: &str = "Explain *this* Markdown response.";
-const TRANSLATION_FIRST: &str = "# Clear translation\n\n**bold中文** with *italic* and ~~removed~~.\nInline `value` and [docs](https://example.com).\n\n- first item\n- second item\n\n> quoted text\n\n```rust\nlet icon = \"叶🌿\";\n```\n\n| Word | Meaning |\n| --- | --- |\n| warm | 温暖 |\n\n<script>literal</script>\n\n**stream";
-const TRANSLATION_TAIL: &str = "_suffix**";
+const TRANSLATION_FIRST: &str = "# Clear translation\n\n**bold中文** with *italic* and ~~removed~~.\nInline `value` and [docs](https://example.com).\n\n- first item\n- second item\n\n> quoted text\n\n```rust\nlet icon = \"叶🌿\";\nlet size = 32;\n```\n\n| Word | Meaning |\n| --- | --- |\n| warm | 温暖 |\n\n<script>literal</script>\n\n**stream";
+const TRANSLATION_TAIL: &str = "_suffix**\n\n```text\nunfinished_code";
 const ANSWER_MARKDOWN: &str = "## Clear answer\n\n**response中文** with `reply_code`.\n\n1. alpha\n2. beta\n\n```text\n{\\rtf1\\b unsafe}\n```";
 
 fn translation() -> String {
@@ -344,6 +375,7 @@ pub(super) fn check(
         );
     }
     require_effect(editor, pid, "stream_suffix", BOLD)?;
+    copy_native_code(editor, pid)?;
     press_button(inline, 104)?;
     wait_for("the plain-text translation copy", || {
         Ok(text(inline, 254)?.contains("译文已复制"))
@@ -410,12 +442,18 @@ pub(super) fn check(
     }
     copy_command(inline, 287)?;
     wait_for("the explicitly requested Markdown source copy", || {
-        Ok(
-            lingoleaf::platform::selection::read_clipboard_text().is_ok_and(|value| {
-                value.text.contains(&translation()) && value.text.contains(ANSWER_MARKDOWN)
-            }),
-        )
+        // Do not OpenClipboard while the queued application command is trying
+        // to write it; its native status is the completion barrier.
+        Ok(text(inline, 254)? == "Markdown 原文已复制")
     })?;
+    let raw = lingoleaf::platform::selection::read_clipboard_text()?
+        .text
+        .replace("\r\n", "\n");
+    if !raw.contains(&translation()) || !raw.contains(ANSWER_MARKDOWN) {
+        return Err(
+            "Explicit Markdown copying changed the original translation or reply source.".into(),
+        );
+    }
     let input = unsafe { GetDlgItem(inline, QUESTION) };
     let draft = wide(UNSENT_DRAFT);
     send(input, WM_SETTEXT, 0, draft.as_ptr() as isize)?;
@@ -448,7 +486,10 @@ pub(super) fn check(
         Ok(text(inline, 254)?.contains("译文已复制"))
     })?;
     let original = lingoleaf::platform::selection::read_clipboard_text()?.text;
-    if !original.contains("bold中文") || original.contains("Polished result") {
+    if !original.contains("bold中文")
+        || original.contains("Polished result")
+        || original.contains("**bold中文**")
+    {
         return Err("Polish overwrote the selected passage's original translation.".into());
     }
     let requests_before_speech = mock.request_count()?;

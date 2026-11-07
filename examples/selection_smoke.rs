@@ -69,6 +69,7 @@ mod windows {
     const PIN: i32 = 263;
     const PAUSE: usize = 264;
     const EM_GETFIRSTVISIBLELINE: u32 = 0xCE;
+    const EM_GETLINECOUNT: u32 = 0xBA;
     const EM_LINESCROLL: u32 = 0xB6;
 
     mod question_actions {
@@ -161,21 +162,22 @@ mod windows {
 
         source.gesture(background, false, 5, 10)?;
         require_same_inline(&app, inline)?;
-        require_visible(inline)?;
-        require_pending(inline)?;
+        // A gesture alone no longer shows a placeholder. Only confirmed text
+        // may make the reader visible; test the first valid result below.
         let switch_started = Instant::now();
         // Warm deliberately sends another fragment after light has been selected.
         // No subsequent snapshot may display that superseded translation.
         wait_for("the second streamed selection", || {
             let translated = text(inline, 251)?;
-            if translated.contains('旧') {
+            if unsafe { IsWindowVisible(inline) } != 0 && translated.contains('旧') {
                 return Err(
                     "A late fragment from the previous selection replaced the new selection."
                         .into(),
                 );
             }
-            Ok(translated == "新")
+            Ok(translated == "新" && unsafe { IsWindowVisible(inline) } != 0)
         })?;
+        require_visible(inline)?;
         if switch_started.elapsed() >= Duration::from_secs(3) {
             return Err(
                 "The next selection waited too long for a blocked old HTTP response.".into(),
@@ -195,7 +197,6 @@ mod windows {
         let before_move = bounds(inline)?;
         source.gesture(background, false, 18, 23)?;
         require_same_inline(&app, inline)?;
-        require_visible(inline)?;
         thread::sleep(Duration::from_millis(200));
         mock.finish_light.store(true, Ordering::Release);
         wait_for("the reused in-flight translation", || {
@@ -205,6 +206,7 @@ mod windows {
             }
             Ok(translated == "新译文" && text(inline, 254)?.contains("完成"))
         })?;
+        require_visible(inline)?;
         if bounds(inline)? == before_move {
             return Err(
                 "Repeating a word at a different position did not move the compact window.".into(),
@@ -356,13 +358,19 @@ mod windows {
         "scroll",
     ];
 
-    fn all_requests() -> Vec<&'static str> {
+    fn controller_requests() -> Vec<&'static str> {
         ALL_REQUESTS
             .iter()
             .chain(question_actions::REQUESTS.iter())
             .chain(CONTROL_REQUESTS.iter())
-            .chain(markdown_actions::REQUESTS.iter())
             .copied()
+            .collect()
+    }
+
+    fn all_requests() -> Vec<&'static str> {
+        controller_requests()
+            .into_iter()
+            .chain(markdown_actions::REQUESTS.iter().copied())
             .collect()
     }
 
@@ -525,7 +533,43 @@ mod windows {
         // Complete the stream while the native menu is pumping messages. Closing
         // the menu must drain the queued event, even if its first WM_WORK was
         // delivered during App's mutable menu borrow.
+        let expected_partial = (0..80)
+            .map(|line| format!("line-{line:03}: public test text"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if send(editor, EM_GETLINECOUNT, 0, 0)? < 80 {
+            return Err(
+                "Markdown rendering did not preserve the long fixture's 80 visible lines.".into(),
+            );
+        }
+        // RichEdit versions can expose soft line breaks as spaces through
+        // WM_GETTEXT. Do not collapse arbitrary whitespace: native rendering
+        // must contain exactly this fixture and copying must retain every LF.
         let before_menu = text(inline, 251)?;
+        if before_menu != expected_partial && before_menu != expected_partial.replace('\n', " ") {
+            return Err(
+                "The native long translation lost or changed public fixture content.".into(),
+            );
+        }
+        send(editor, EM_SETSEL, 0, -1)?;
+        send(editor, WM_COPY, 0, 0)?;
+        let native_copied = lingoleaf::platform::selection::read_clipboard_text()?
+            .text
+            .replace("\r\n", "\n");
+        if native_copied != expected_partial {
+            return Err(
+                "Native RichEdit copying did not preserve the 80-line fixture's exact line breaks."
+                    .into(),
+            );
+        }
+        send(editor, EM_SETSEL, 0, 6)?;
+        send(editor, WM_COPY, 0, 0)?;
+        if lingoleaf::platform::selection::read_clipboard_text()?.text != "line-0" {
+            return Err("Native selected-text copying changed the requested 0..6 range.".into());
+        }
+        // A distinct clipboard sentinel proves that the menu really performed
+        // its second action; a no-op cannot reuse the preceding full-copy result.
+        send(editor, EM_LINESCROLL, 0, -10_000)?;
         if unsafe { PostMessageW(editor, WM_CONTEXTMENU, editor as usize, -1) } == 0 {
             return Err("Cannot request the owned translation context menu.".into());
         }
@@ -565,8 +609,8 @@ mod windows {
             Ok(status == "译文已复制" || status.contains("完成"))
         })?;
         let copied = lingoleaf::platform::selection::read_clipboard_text()?.text;
-        if copied.replace("\r\n", "\n") != before_menu.trim() {
-            return Err("The editor's actual second menu action did not copy the complete partial translation.".into());
+        if copied.replace("\r\n", "\n") != expected_partial {
+            return Err("The editor's actual second menu action did not copy the exact complete 80-line partial translation.".into());
         }
         wait_for(
             "completion without stealing the user's scroll position",
@@ -586,7 +630,7 @@ mod windows {
         {
             return Err("A cancelled response became visible after its server gate opened.".into());
         }
-        mock.require_requests(&all_requests())
+        mock.require_requests(&controller_requests())
     }
 
     fn owned_menu(pid: u32) -> Option<HWND> {
@@ -1477,15 +1521,6 @@ mod windows {
         Ok(tail)
     }
 
-    fn require_pending(inline: HWND) -> Result<(), String> {
-        if text(inline, 251)? != "正在读取选区…" || text(inline, 254)? != "正在读取新选区"
-        {
-            return Err(
-                "A new selection did not replace the previous text with pending feedback.".into(),
-            );
-        }
-        Ok(())
-    }
     fn require_same_inline(app: &Application, expected: HWND) -> Result<(), String> {
         if app.window(INLINE)? != expected {
             return Err("A new compact window replaced the existing HWND.".into());

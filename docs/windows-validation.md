@@ -475,3 +475,6 @@
 | 保持显示时拖空白 | 原译文、会话与窗口位置保留，不新增请求或改成读取错误 | 未执行 |
 | 单字、数字、标点和含 ZWJ 的 emoji / 自然语言 | 仍可翻译，不以字符长度或宽泛类别误删有效选择 | 未执行 |
 | 手动快捷键 / 翻译剪贴板遇无文本 | 仍提供显式操作的错误反馈，与静默自动取词区分 | 未执行 |
+
+
+空白回归的原生输入与观察夹具保存在 [blank_selection_090.c](https://github.com/xiaoxiaoawei/test-hub/blob/lingoleaf/examples/support/blank_selection_090.c)，仅供开发验证，不打入发行包。使用 MinGW 编译为 `lingoleaf-v090-blank-source.exe`，按源码的 `source` / `blank-tail` / `blank-line` / `blank-spaces` / `blank-invisible` / `close` 命令运行。观察器先校准原生 Show 事件，再按目标应用 PID 监听 Show 并以 10 ms 轮询观察，默认 mouse-up 后覆盖 6500 ms；正例和旧版本负对照均须验证观察器真实有效。

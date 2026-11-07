@@ -6,7 +6,7 @@
 
 [**下载已公开最新版 lingoleaf.exe**](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe) · [发行页](https://github.com/xiaoxiaoawei/test-hub/releases)
 
-发行文件统一使用 **`lingoleaf.exe`** 和 **`lingoleaf-windows-x64.zip`**，版本号保留在程序内部、标签和更新记录中。[发行页](https://github.com/xiaoxiaoawei/test-hub/releases) 提供已公开版本；已有 0.5.0 及之后客户端可继续通过“检查更新”升级。源码版本不代表已进入公开更新源，以发行页和构建记录为准。
+发行文件统一使用 **`lingoleaf.exe`** 和 **`lingoleaf-windows-x64.zip`**，版本号保留在程序内部、标签和更新记录中。[发行页](https://github.com/xiaoxiaoawei/test-hub/releases) 提供已公开版本；已有 0.5.0 及之后客户端可继续通过“检查更新”升级。0.9.0 已公开并设为 latest，可通过现有更新按钮升级。
 
 目标平台为 Windows 11 x64；Windows 10、Edge、混合 DPI 和跨软件交互按 [验证清单](docs/windows-validation.md) 分别验收。Wine 回归、原生 Windows CI 和真实 Windows 桌面结果分别记录；旧版截图不作为本版界面或实机验证证据。
 

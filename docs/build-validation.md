@@ -16,10 +16,11 @@
 | Markdown / 问答 / 润色交互 | 21 次本地 POST 通过；9.495 秒 |
 | 更新 helper 成功 / 回滚 | 0.9.1 固定夹具替换 / ACK / 精确回滚通过；8.245 秒 |
 | 发行工具与版本一致性 | Python 14/14、版本检查通过 |
-| 原生 Windows 全测试 / 构建 / 打包 | [最终源码分支 CI 通过](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42343760492)，无过滤；最终标签待核验 |
+| 原生 Windows 全测试 / 构建 / 打包 | [最终标签 CI 通过](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42344866928)，全部 167 项、无过滤；Linux 与发布任务均成功 |
 | 固定 150% / 200% DPI | 独立 Wine profile 实际 144 / 192 DPI；字段 60 / 80 px，滚动至保存并实际保存通过 |
 | 空白划选 | Direct / Click 共 8 个真实输入负例，全部零 Show / 零可见采样 / 零 POST；保持内容不变 |
-| 公开更新源 / 旧版实际升级 | 待发布后验证 |
+| 公开更新源 | latest 实际 0.9.0，五资产 / 四 payload SHA / 12 项 ZIP / 系统 DLL 核验通过 |
+| 旧 0.8.0 升级正式版本 | 真实 GUI 下载 / 校验 / 重启正式 MSVC 0.9.0 成功，配置逐字节保留 |
 | Windows 11 / Edge / 混合 DPI / 实际语音发声 | 未执行，不能用 Wine 或无音频测试替代 |
 
 ## 实现与测试重点
@@ -77,3 +78,31 @@ Wine WinHTTP 在已缓冲 chunk 尾部、下一 chunk header 尚未到达时，�
 旧 `91466b…` 候选在真实行尾空白拖拽后，原生 Show 事件捕获到一次译文弹出，10 ms 观察抓到 7 次可见采样，最终虽隐藏仍判失败；证明只看末尾隐藏会漏掉闪现。观察器用自有真实窗口的 Show 校准，并在最终程序有效选词时捕获 Show 与对应本地请求，排除了未启用、未命中或坏观察器的假通过。
 
 最终 `67e5…` 在 Direct 与 Click 各验证行尾空白、空行、实际非空的五空格选区、实际非空的换行 / 零宽选区。每例 mouse-up 后持续至少 6500 ms，累计覆盖自动重试尾部，均无新 Show 事件、无可见采样、无模型 POST。保持模式另验已有译文持续可见而内容、会话、草稿及位置不变。鼠标输入为真实 SendInput，未注入应用的选区完成消息。证据来自 Wine 原生文本控件，不冒充 Edge / Windows 硬件。
+
+
+## 正式公开分发
+
+标签 `v0.9.0`、源码提交 `6f437bd` 的 [原生 Windows / Linux / 发布流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42344866928) 全部成功。Windows 完整测试不带 Wine 的过滤参数，stalled chunked SSE 取消测试实际通过；正式 MSVC 构建使用静态 CRT 并核验内嵌版本。
+
+已实际匿名 HTTPS 下载主 EXE、兼容 EXE、ZIP、更新清单与 SHA256SUMS，均 HTTP 200。四个 payload SHA 全部通过；主文件与兼容副本逐字节相同，ZIP CRC 正常且内含 EXE 完全一致。ZIP 仅有允许的 12 项：当前程序、使用说明、文档与本版截图，不含旧截图、配置、测试源码、DLL、日志或凭据。文档与标签源码一致，Windows checkout 的 CRLF 差异单独规范化核对。
+
+固定 latest 与标签清单完全相同，普通缓存请求也实际返回 0.9.0；稳定主下载地址亦 HTTP 200 并与标签 EXE 完全相同。清单保持 schema 1 六字段和精确版本兼容地址，旧更新器可继续使用。未覆盖任何已发布旧版本或标签。
+
+正式 MSVC 主程序为 **1122816 字节（约 1.07 MiB）**，仅依赖 Windows 系统 DLL，SHA-256：
+
+```text
+b019e4396c9982d998f78f733a59fd49172334275700e9456627f1089be6e31e
+```
+
+它与本地 GNU 候选使用独立工具链，哈希分别记录。主下载仍为 [lingoleaf.exe](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe)，ZIP 为 `lingoleaf-windows-x64.zip`，不要求安装浏览器、WebView 或额外运行时。旧版 GUI 升级与原配置保留结果如下；发布后记录不修改已公开的标签与资产。
+
+
+## 旧 0.8.0 更新到正式 0.9.0
+
+以原始公开的 0.8.0 MSVC EXE、隔离 LOCALAPPDATA 与真实更新 GUI 执行。旧 GUI 发现 0.9.0，确认下载后显示已通过校验；重启前独立递归读取缓存文件，大小 1122816 与正式 SHA 完全匹配。实际点击确认重启后，旧父进程退出 0，新 0.9.0 GUI 可见、前台且 enabled，状态为“v0.9.0 · 已是最新版本”；目标 EXE 与公开资产一致，AppReady 后无备份、stage 或安装票据。
+
+468 字节 settings.json 从升级前到退出保持逐字节相同。原星云紫白天模板、背景 `#F5F0FC`、Auto → 日语、37 秒、Direct、兼容取词、字母 A / 圆形 / 48 px / `#D6A575` 图标均实际 GUI 核对，没有自动保存或重置模型、密钥或偏好。
+
+这是 Wine 中对真实公开清单和 MSVC 字节的本地传输回放，不修改版本、URL、大小、哈希、生产 guard、helper 或启动确认。仅有旧 latest feed、正式兼容 EXE、新 latest feed 三条 GET，全部 200、无认证头；测试 DLL 的异步回调导出若被误用于翻译会失败，不虚构翻译成功。真实匿名 HTTPS 分发由前述独立下载验证，不冒充目标 Windows 的 GitHub WinHTTP 联通、Edge 或语音设备验收。
+
+回放结束后再次核对配置逐字节相同，所有自有测试应用、源窗口、模拟服务、临时 DPI profile 和专用 Xvfb / Openbox 桌面均已清理。最终升级报告为 `passed`；Windows / Edge / 混合 DPI 与实际语音发声的未执行边界仍保持如上，不因发布成功而改写。

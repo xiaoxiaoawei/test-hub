@@ -87,7 +87,7 @@ class ReleaseTests(unittest.TestCase):
             {path.name: path.read_bytes() for path in first.iterdir()},
             {path.name: path.read_bytes() for path in second.iterdir()},
         )
-        with zipfile.ZipFile(first / "lingoleaf-1.2.3-windows-x64.zip") as archive:
+        with zipfile.ZipFile(first / release.PRIMARY_ARCHIVE) as archive:
             self.assertEqual(
                 set(archive.namelist()),
                 {*release.REQUIRED_DOCUMENTS, "lingoleaf.exe", "开始使用.txt"},
@@ -100,13 +100,52 @@ class ReleaseTests(unittest.TestCase):
             expected, name = line.split("  ")
             self.assertEqual(hashlib.sha256((first / name).read_bytes()).hexdigest(), expected)
 
+    def test_stable_download_names_and_legacy_alias_are_identical_and_checked(self):
+        output = self.root / "output"
+        created = release.package(self.root, self.executable, output, "v1.2.3")
+        legacy = "lingoleaf-1.2.3-windows-x64.exe"
+        self.assertEqual(
+            {path.name for path in created},
+            {release.PRIMARY_EXECUTABLE, release.PRIMARY_ARCHIVE, legacy, "update.json", "SHA256SUMS"},
+        )
+        self.assertEqual((output / release.PRIMARY_EXECUTABLE).read_bytes(), self.executable.read_bytes())
+        self.assertEqual((output / legacy).read_bytes(), (output / release.PRIMARY_EXECUTABLE).read_bytes())
+        metadata = json.loads((output / "update.json").read_text(encoding="utf-8"))
+        # This exact URL is the contract already enforced by 0.5/0.6 clients.
+        self.assertEqual(metadata["download_url"], f"{release.UPDATE_REPOSITORY}/releases/download/v1.2.3/{legacy}")
+        checksum_files = {
+            line.split("  ")[1]
+            for line in (output / "SHA256SUMS").read_text(encoding="ascii").splitlines()
+        }
+        self.assertEqual(checksum_files, {release.PRIMARY_EXECUTABLE, release.PRIMARY_ARCHIVE, legacy, "update.json"})
+        self.assertFalse((output / "lingoleaf-1.2.3-windows-x64.zip").exists())
+
+    def test_stable_manifest_asset_is_exactly_scoped_to_its_release(self):
+        metadata = json.loads(release.update_manifest("1.2.3", self.executable.read_bytes()))
+        stable_url = f"{release.UPDATE_REPOSITORY}/releases/download/v1.2.3/lingoleaf.exe"
+        metadata["download_url"] = stable_url
+        self.assertEqual(release.validate_update_manifest(metadata), metadata)
+        for url in (
+            stable_url.replace("v1.2.3/", "v1.2.4/"),
+            stable_url + "?download=1",
+            stable_url + "#fragment",
+            stable_url.replace("lingoleaf.exe", "LingoLeaf.exe"),
+            stable_url.replace("lingoleaf.exe", "../lingoleaf.exe"),
+            stable_url.replace("lingoleaf.exe", "%6cingoleaf.exe"),
+            stable_url.replace("github.com/", "github.com.evil.invalid/"),
+            stable_url.replace("/test-hub/", "/other/"),
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(release.ReleaseError):
+                    release.validate_update_manifest({**metadata, "download_url": url})
+
     def test_optional_screenshot_preserves_relative_path(self):
         image = self.root / release.OPTIONAL_DOCUMENTS[0]
         image.parent.mkdir(parents=True)
         image.write_bytes(b"dummy image")
         output = self.root / "output"
         release.package(self.root, self.executable, output)
-        with zipfile.ZipFile(output / "lingoleaf-1.2.3-windows-x64.zip") as archive:
+        with zipfile.ZipFile(output / release.PRIMARY_ARCHIVE) as archive:
             self.assertEqual(archive.read(release.OPTIONAL_DOCUMENTS[0]), b"dummy image")
 
     def test_update_manifest_identifies_exact_executable_and_release(self):
@@ -130,7 +169,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release.validate_update_manifest(metadata), metadata)
         checksums = (output / "SHA256SUMS").read_text(encoding="ascii")
         self.assertIn("  update.json\n", checksums)
-        with zipfile.ZipFile(output / "lingoleaf-1.2.3-windows-x64.zip") as archive:
+        with zipfile.ZipFile(output / release.PRIMARY_ARCHIVE) as archive:
             self.assertNotIn("update.json", archive.namelist())
 
     def test_update_manifest_rejects_url_spoofing_and_version_mismatches(self):
@@ -153,6 +192,9 @@ class ReleaseTests(unittest.TestCase):
     def test_update_manifest_rejects_ambiguous_or_unsupported_metadata(self):
         metadata = json.loads(release.update_manifest("1.2.3", self.executable.read_bytes()))
         for key, value in (
+            ("download_url", []),
+            ("download_url", {}),
+            ("download_url", None),
             ("schema_version", True),
             ("schema_version", 2),
             ("version", "1.2.3-beta.1"),

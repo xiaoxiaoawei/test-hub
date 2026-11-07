@@ -22,6 +22,13 @@ pub(crate) enum Symbol {
     Expand,
     Settings,
     Close,
+    Stop,
+    Retry,
+    Pin,
+    PinActive,
+    Swap,
+    Eye,
+    EyeClosed,
 }
 
 /// Draw a quiet icon button; its native text remains available to assistive tools.
@@ -48,8 +55,11 @@ pub(crate) unsafe fn draw_button(
     let pressed = item.itemState & ODS_SELECTED != 0 && !disabled;
     let hot = item.itemState & ODS_HOTLIGHT != 0 && !disabled;
     let focused = item.itemState & ODS_FOCUS != 0 && !disabled;
+    let latched = matches!(symbol, Symbol::PinActive) && !disabled;
     let background = if pressed {
         blend(palette.surface_color, palette.accent_color, 24)
+    } else if latched {
+        blend(palette.background_color, palette.accent_color, 18)
     } else if hot {
         palette.surface_color
     } else {
@@ -57,7 +67,11 @@ pub(crate) unsafe fn draw_button(
     };
     let foreground = if disabled {
         blend(palette.background_color, palette.muted_color, 58)
-    } else if hot || pressed || matches!(symbol, Symbol::Sun | Symbol::Moon | Symbol::Send) {
+    } else if hot
+        || pressed
+        || latched
+        || matches!(symbol, Symbol::Sun | Symbol::Moon | Symbol::Send)
+    {
         palette.accent_color
     } else {
         palette.text_color
@@ -66,7 +80,7 @@ pub(crate) unsafe fn draw_button(
     unsafe {
         IntersectClipRect(item.hDC, rect.left, rect.top, rect.right, rect.bottom);
         FillRect(item.hDC, &rect, palette.background);
-        if hot || pressed {
+        if hot || pressed || latched {
             if let Some(brush) = paint.brush(background) {
                 SelectObject(item.hDC, brush);
                 SelectObject(item.hDC, GetStockObject(NULL_PEN));
@@ -309,6 +323,64 @@ impl Canvas {
                 Symbol::Close => {
                     self.line(&[(6, 6), (18, 18)]);
                     self.line(&[(18, 6), (6, 18)]);
+                }
+                Symbol::Stop => {
+                    self.line(&[(6, 6), (18, 6), (18, 18), (6, 18), (6, 6)]);
+                }
+                Symbol::Retry => {
+                    self.curve(&[
+                        (20, 9),
+                        (16, 3),
+                        (10, 2),
+                        (6, 6),
+                        (1, 11),
+                        (4, 20),
+                        (11, 21),
+                        (17, 23),
+                        (22, 18),
+                        (21, 13),
+                    ]);
+                    self.line(&[(14, 9), (20, 9), (20, 3)]);
+                }
+                Symbol::Pin | Symbol::PinActive => {
+                    self.line(&[
+                        (8, 3),
+                        (18, 3),
+                        (16, 7),
+                        (16, 12),
+                        (20, 16),
+                        (6, 16),
+                        (10, 12),
+                        (10, 7),
+                        (8, 3),
+                    ]);
+                    self.line(&[(13, 16), (13, 23)]);
+                    if symbol == Symbol::PinActive {
+                        self.line(&[(12, 6), (14, 6)]);
+                        self.line(&[(12, 9), (14, 9)]);
+                        self.line(&[(11, 13), (15, 13)]);
+                    }
+                }
+                Symbol::Swap => {
+                    self.line(&[(3, 7), (20, 7)]);
+                    self.line(&[(16, 3), (20, 7), (16, 11)]);
+                    self.line(&[(21, 17), (4, 17)]);
+                    self.line(&[(8, 13), (4, 17), (8, 21)]);
+                }
+                Symbol::Eye | Symbol::EyeClosed => {
+                    self.curve(&[
+                        (2, 12),
+                        (6, 4),
+                        (18, 4),
+                        (22, 12),
+                        (18, 20),
+                        (6, 20),
+                        (2, 12),
+                    ]);
+                    self.circle(9, 9, 15, 15);
+                    if symbol == Symbol::EyeClosed {
+                        self.line(&[(4, 3), (20, 21)]);
+                    }
                 }
             }
         }

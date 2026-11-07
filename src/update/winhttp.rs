@@ -99,7 +99,9 @@ fn trusted_github_path(path: &str) -> bool {
     let Ok(version) = Version::parse(version) else {
         return false;
     };
-    name == "update.json" || name == format!("lingoleaf-{version}-windows-x64.exe")
+    name == "update.json"
+        || name == "lingoleaf.exe"
+        || name == format!("lingoleaf-{version}-windows-x64.exe")
 }
 
 enum Response {
@@ -586,6 +588,24 @@ mod tests {
     fn redirects_are_https_exact_project_or_release_cdn_only() {
         for accepted in [FEED_URL,"https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.5.0/update.json","https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.5.0/lingoleaf-0.5.0-windows-x64.exe","https://release-assets.githubusercontent.com/github-production-release-asset/123/id?sig=a%2Bb"] {assert!(Endpoint::trusted(accepted).is_ok(),"{accepted}");}
         for rejected in ["http://github.com/xiaoxiaoawei/test-hub/releases/latest/download/update.json","https://github.com@evil.invalid/file","https://github.com.evil.invalid/file","https://github.com/other/repo/releases/download/v0.5.0/update.json","https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.5.0/lingoleaf-0.6.0-windows-x64.exe","https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.5.0-beta/update.json","https://release-assets.githubusercontent.com/anything.exe","https://release-assets.githubusercontent.com.evil.invalid/github-production-release-asset/test","https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/update.json#fragment","https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/update.json\r\nInjected: yes"] {assert!(Endpoint::trusted(rejected).is_err(),"{rejected}");}
+    }
+
+    #[test]
+    fn stable_asset_redirect_path_remains_exactly_scoped() {
+        let stable =
+            "https://github.com/xiaoxiaoawei/test-hub/releases/download/v0.7.0/lingoleaf.exe";
+        assert!(Endpoint::trusted(stable).is_ok());
+        for invalid in [
+            stable.replace("v0.7.0/", "v0.7.0-beta/"),
+            stable.replace("/test-hub/", "/other/"),
+            stable.replace("lingoleaf.exe", "LingoLeaf.exe"),
+            stable.replace("lingoleaf.exe", "../lingoleaf.exe"),
+            stable.replace("lingoleaf.exe", "%6cingoleaf.exe"),
+            format!("{stable}?download=1"),
+            format!("{stable}#fragment"),
+        ] {
+            assert!(Endpoint::trusted(&invalid).is_err(), "{invalid}");
+        }
     }
 
     fn fixture(response: Vec<u8>) -> (u16, thread::JoinHandle<()>) {

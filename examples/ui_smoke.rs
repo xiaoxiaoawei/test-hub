@@ -74,6 +74,10 @@ mod windows {
     const PREFERENCES_TAB: i32 = 271;
     const SOURCE_LANGUAGE: i32 = 272;
     const TARGET_LANGUAGE: i32 = 273;
+    const PAUSE_SELECTION: i32 = 264;
+    const SWAP_LANGUAGES: i32 = 265;
+    const KEY_VISIBILITY: i32 = 267;
+    const EM_GETPASSWORDCHAR: u32 = 0x00D2;
     const SAVE_TITLE: &str = "轻译 · 保存成功";
     const SAVE_BODY: &str = "设置保存成功，已立即生效。";
 
@@ -194,14 +198,7 @@ mod windows {
         require_text(settings, 213, "30")?;
         require_text(settings, KEY, "")?;
 
-        let marker = wide("ui-smoke-placeholder-not-a-secret");
-        send(
-            control(settings, KEY)?,
-            WM_SETTEXT,
-            0,
-            marker.as_ptr() as isize,
-        )?;
-        require_text(settings, KEY, "ui-smoke-placeholder-not-a-secret")?;
+        check_key_visibility(&owned, settings)?;
         select_provider(settings, 1)?;
         require_text(settings, 210, "https://api.openai.com/v1")?;
         require_text(settings, 212, "gpt-4o-mini")?;
@@ -213,6 +210,7 @@ mod windows {
         println!("Provider presets, credential clearing, model label and Save visibility passed.");
 
         let settings = check_languages(&mut owned, settings)?;
+        let settings = check_preference_actions(&mut owned, settings)?;
         check_live_save(&mut owned, settings)?;
         let settings = check_theme(&mut owned, settings)?;
         check_icon_appearance(&mut owned, settings)?;
@@ -476,6 +474,127 @@ mod windows {
         Ok(())
     }
 
+    fn check_key_visibility(owned: &OwnedApplication, settings: HWND) -> Result<(), String> {
+        require_visible(settings, KEY_VISIBILITY)?;
+        let input = control(settings, KEY)?;
+        if send(input, EM_GETPASSWORDCHAR, 0, 0)? == 0 {
+            return Err("The API key field was not masked before explicit reveal.".into());
+        }
+        // This is the same fixed public marker already used by the provider
+        // regression. It is cleared by the following provider preset, and no
+        // Save operation occurs while it is present. Never echo field contents.
+        let marker = "ui-smoke-placeholder-not-a-secret";
+        set_control_text(settings, KEY, marker)?;
+        let saved = saved_settings_bytes(owned)?;
+        click(settings, KEY_VISIBILITY)?;
+        if send(input, EM_GETPASSWORDCHAR, 0, 0)? != 0 {
+            return Err("Explicit API key reveal did not remove the password mask.".into());
+        }
+        require_text(settings, KEY, marker)?;
+        require_settings_bytes(owned, &saved, "revealing the API key draft")?;
+        click(settings, KEY_VISIBILITY)?;
+        if send(input, EM_GETPASSWORDCHAR, 0, 0)? == 0 {
+            return Err("The second API key eye click did not restore masking.".into());
+        }
+        require_text(settings, KEY, marker)?;
+        require_settings_bytes(owned, &saved, "masking the API key draft")?;
+        println!("Explicit API key reveal/mask preserved the draft and never saved it.");
+        Ok(())
+    }
+
+    fn check_preference_actions(
+        owned: &mut OwnedApplication,
+        settings: HWND,
+    ) -> Result<HWND, String> {
+        show_preferences(settings)?;
+        require_combo(settings, SOURCE_LANGUAGE, 0)?;
+        require_combo(settings, TARGET_LANGUAGE, 3)?;
+        if unsafe { IsWindowEnabled(control(settings, SWAP_LANGUAGES)?) } != 0 {
+            return Err("Language swap must be disabled for an automatic source.".into());
+        }
+        let saved = saved_settings_bytes(owned)?;
+        // Both are drafts: swapping English -> Japanese should produce
+        // Japanese -> English, while the saved Auto -> Japanese stays intact.
+        select_combo(settings, SOURCE_LANGUAGE, 1)?;
+        select_combo(settings, TARGET_LANGUAGE, 3)?;
+        if unsafe { IsWindowEnabled(control(settings, SWAP_LANGUAGES)?) } == 0 {
+            return Err("Language swap did not enable for two explicit languages.".into());
+        }
+        click(settings, SWAP_LANGUAGES)?;
+        require_combo(settings, SOURCE_LANGUAGE, 4)?;
+        require_combo(settings, TARGET_LANGUAGE, 0)?;
+        require_settings_bytes(owned, &saved, "swapping unsaved language preferences")?;
+        send(settings, WM_CLOSE, 0, 0)?;
+        let main = owned.wait_for_window(BACKGROUND_TITLE, false)?;
+        if unsafe { PostMessageW(main, WM_APP + 4, 0, 0) } == 0 {
+            return Err(
+                "Cannot reopen the owned settings after discarding language drafts.".into(),
+            );
+        }
+        let settings = owned.wait_for_settings()?;
+        show_preferences(settings)?;
+        require_combo(settings, SOURCE_LANGUAGE, 0)?;
+        require_combo(settings, TARGET_LANGUAGE, 3)?;
+        require_settings_bytes(owned, &saved, "discarding swapped language drafts")?;
+
+        require_text(settings, PAUSE_SELECTION, "暂停划词")?;
+        let running = control_label(settings, PAUSE_SELECTION)?;
+        click(settings, PAUSE_SELECTION)?;
+        if control_label(settings, PAUSE_SELECTION)? == running {
+            return Err("Pausing automatic selection did not expose a resume action.".into());
+        }
+        require_settings_bytes(owned, &saved, "temporarily pausing automatic selection")?;
+        click(settings, PAUSE_SELECTION)?;
+        require_text(settings, PAUSE_SELECTION, &running)?;
+        require_settings_bytes(owned, &saved, "resuming automatic selection")?;
+        click(settings, PAUSE_SELECTION)?;
+        if control_label(settings, PAUSE_SELECTION)? == running {
+            return Err("A second pause did not enter the temporary paused state.".into());
+        }
+        let settings = owned.restart()?;
+        show_preferences(settings)?;
+        require_text(settings, PAUSE_SELECTION, &running)?;
+        require_combo(settings, SOURCE_LANGUAGE, 0)?;
+        require_combo(settings, TARGET_LANGUAGE, 3)?;
+        require_settings_bytes(owned, &saved, "restarting after a session-only pause")?;
+        show_service(settings)?;
+        println!("Language swap remained a discardable draft, Auto source disabled swap, and session pause/resume never persisted across restart.");
+        Ok(settings)
+    }
+
+    fn control_label(parent: HWND, id: i32) -> Result<String, String> {
+        if id == KEY {
+            return Err("Refusing to expose the API key through a generic label helper.".into());
+        }
+        let mut buffer = [0_u16; 256];
+        let length = send(
+            control(parent, id)?,
+            WM_GETTEXT,
+            buffer.len(),
+            buffer.as_mut_ptr() as isize,
+        )?;
+        if length >= buffer.len() - 1 {
+            return Err("The test action label exceeded its bounded buffer.".into());
+        }
+        Ok(String::from_utf16_lossy(&buffer[..length]))
+    }
+
+    fn saved_settings_bytes(owned: &OwnedApplication) -> Result<Vec<u8>, String> {
+        fs::read(owned.directory.join("LingoLeaf").join("settings.json"))
+            .map_err(|_| "Cannot read the test application's private settings snapshot.".into())
+    }
+
+    fn require_settings_bytes(
+        owned: &OwnedApplication,
+        expected: &[u8],
+        action: &str,
+    ) -> Result<(), String> {
+        if saved_settings_bytes(owned)? != expected {
+            return Err(format!("Settings changed on disk while {action}."));
+        }
+        Ok(())
+    }
+
     fn check_languages(owned: &mut OwnedApplication, settings: HWND) -> Result<HWND, String> {
         show_preferences(settings)?;
         require_combo(settings, SOURCE_LANGUAGE, 1)?;
@@ -510,12 +629,14 @@ mod windows {
 
     fn show_service(settings: HWND) -> Result<(), String> {
         click(settings, SERVICE_TAB)?;
-        for id in [PROVIDER, KEY, 210, 212, 213, 106] {
+        for id in [PROVIDER, KEY, KEY_VISIBILITY, 210, 212, 213, 106] {
             require_visible(settings, id)?;
         }
         for id in [
             SOURCE_LANGUAGE,
             TARGET_LANGUAGE,
+            SWAP_LANGUAGES,
+            PAUSE_SELECTION,
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
             APPEARANCE,
@@ -532,6 +653,8 @@ mod windows {
         for id in [
             SOURCE_LANGUAGE,
             TARGET_LANGUAGE,
+            SWAP_LANGUAGES,
+            PAUSE_SELECTION,
             SELECTION_MODE,
             COMPATIBILITY_CAPTURE,
             APPEARANCE,
@@ -540,7 +663,7 @@ mod windows {
         ] {
             require_visible(settings, id)?;
         }
-        for id in [PROVIDER, KEY, 210, 212, 213, 106] {
+        for id in [PROVIDER, KEY, KEY_VISIBILITY, 210, 212, 213, 106] {
             require_hidden(settings, id)?;
         }
         Ok(())

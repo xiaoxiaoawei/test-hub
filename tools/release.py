@@ -42,6 +42,8 @@ OPTIONAL_DOCUMENTS = (
 )
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 UPDATE_REPOSITORY = "https://github.com/xiaoxiaoawei/test-hub"
+PRIMARY_EXECUTABLE = "lingoleaf.exe"
+PRIMARY_ARCHIVE = "lingoleaf-windows-x64.zip"
 MAX_EXECUTABLE_BYTES = 32 * 1024 * 1024
 UPDATE_FIELDS = {"schema_version", "version", "download_url", "sha256", "size", "notes_url"}
 
@@ -132,8 +134,11 @@ def validate_update_manifest(value: object) -> dict:
         raise ReleaseError("Unsupported update metadata schema")
     version = stable_version(value["version"])
     asset = f"lingoleaf-{version}-windows-x64.exe"
-    expected_url = f"{UPDATE_REPOSITORY}/releases/download/v{version}/{asset}"
-    if value["download_url"] != expected_url:
+    allowed_urls = {
+        f"{UPDATE_REPOSITORY}/releases/download/v{version}/{asset}",
+        f"{UPDATE_REPOSITORY}/releases/download/v{version}/{PRIMARY_EXECUTABLE}",
+    }
+    if not isinstance(value["download_url"], str) or value["download_url"] not in allowed_urls:
         raise ReleaseError("Update download URL must match this repository, version and EXE")
     if value["notes_url"] != f"{UPDATE_REPOSITORY}/releases/tag/v{version}":
         raise ReleaseError("Update notes URL must match this repository and version")
@@ -145,6 +150,12 @@ def validate_update_manifest(value: object) -> dict:
 
 
 def update_manifest(version: str, executable: bytes) -> bytes:
+    """Keep the original six-field URL contract for installed 0.5/0.6 clients.
+
+    The primary user download is lingoleaf.exe. The feed deliberately refers to
+    its byte-identical compatibility alias because older clients reject any
+    other asset filename before downloading.
+    """
     version = stable_version(version)
     metadata = validate_update_manifest({
         "schema_version": 1,
@@ -193,10 +204,11 @@ def package(root: Path, executable_path: Path, out_dir: Path, tag: str | None = 
             info.compress_type = zipfile.ZIP_DEFLATED
             bundle.writestr(info, content, compresslevel=9)
 
-    stem = f"lingoleaf-{version}-windows-x64"
+    compatibility_asset = f"lingoleaf-{version}-windows-x64.exe"
     payloads = {
-        f"{stem}.exe": executable,
-        f"{stem}.zip": archive.getvalue(),
+        PRIMARY_EXECUTABLE: executable,
+        PRIMARY_ARCHIVE: archive.getvalue(),
+        compatibility_asset: executable,
         "update.json": update_manifest(version, executable),
     }
     checksums = "".join(

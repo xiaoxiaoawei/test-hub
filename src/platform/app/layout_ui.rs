@@ -169,6 +169,12 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         (ES_AUTOHSCROLL | ES_PASSWORD) as u32 | WS_TABSTOP,
         211,
     );
+    icon_button(
+        parent,
+        "显示密钥",
+        ID_KEY_VISIBILITY,
+        "显示 / 隐藏 API 密钥",
+    );
     child(parent, "STATIC", "服务地址", SS_LEFT, 203);
     let base = child(parent, "EDIT", "", ES_AUTOHSCROLL as u32 | WS_TABSTOP, 210);
     child(parent, "STATIC", "模型", SS_LEFT, 205);
@@ -198,6 +204,12 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
             .iter()
             .map(|language| language.label()),
     );
+    icon_button(
+        parent,
+        "交换语言",
+        ID_SWAP_LANGUAGES,
+        "交换原始语言与目标语言；自动检测时不可交换",
+    );
     let auto = child(parent, "BUTTON", "自动划词", WS_TABSTOP, ID_AUTO);
     let mode = combo(
         parent,
@@ -211,6 +223,8 @@ pub(super) unsafe fn make_settings(parent: HWND) -> SettingsUi {
         WS_TABSTOP,
         ID_COMPATIBILITY,
     );
+    let pause = child(parent, "BUTTON", "暂停划词", WS_TABSTOP, ID_PAUSE);
+    tooltip(parent, pause, "仅本次运行暂停自动划词，快捷键仍可用");
     child(
         parent,
         "STATIC",
@@ -287,6 +301,7 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
     let margin = 24;
     let inner = (width - margin * 2).max(260);
     let half = (inner - 16) / 2;
+    let language_width = (inner - 56) / 2;
     let service = SETTINGS_PAGE.get() == SettingsPage::Service;
     page_visible(
         hwnd,
@@ -295,6 +310,7 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_PROVIDER,
             204,
             211,
+            ID_KEY_VISIBILITY,
             203,
             210,
             205,
@@ -312,9 +328,11 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
             ID_SOURCE_LANGUAGE,
             275,
             ID_TARGET_LANGUAGE,
+            ID_SWAP_LANGUAGES,
             ID_AUTO,
             ID_SELECTION_MODE,
             ID_COMPATIBILITY,
+            ID_PAUSE,
             218,
             ID_APPEARANCE,
             276,
@@ -332,7 +350,8 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
         (202, margin, 140, inner, 22),
         (ID_PROVIDER, margin, 164, inner, 180),
         (204, margin, 208, inner, 22),
-        (211, margin, 232, inner, 32),
+        (211, margin, 232, inner - 40, 32),
+        (ID_KEY_VISIBILITY, width - margin - 32, 232, 32, 32),
         (203, margin, 276, inner, 22),
         (210, margin, 300, inner, 32),
         (205, margin, 344, inner - 112, 22),
@@ -340,13 +359,21 @@ pub(super) unsafe fn layout_settings(app: &mut App) {
         (212, margin, 368, inner - 128, 32),
         (ID_TEST, width - margin - 120, 368, 32, 32),
         (213, width - margin - 80, 368, 80, 32),
-        (274, margin, 140, half, 22),
-        (275, margin + half + 16, 140, half, 22),
-        (ID_SOURCE_LANGUAGE, margin, 164, half, 200),
-        (ID_TARGET_LANGUAGE, margin + half + 16, 164, half, 200),
+        (274, margin, 140, language_width, 22),
+        (275, margin + language_width + 56, 140, language_width, 22),
+        (ID_SOURCE_LANGUAGE, margin, 164, language_width, 200),
+        (ID_SWAP_LANGUAGES, margin + language_width + 12, 164, 28, 30),
+        (
+            ID_TARGET_LANGUAGE,
+            margin + language_width + 56,
+            164,
+            language_width,
+            200,
+        ),
         (ID_AUTO, margin, 218, 166, 28),
         (ID_SELECTION_MODE, margin + 182, 214, inner - 182, 156),
-        (ID_COMPATIBILITY, margin, 258, inner, 28),
+        (ID_COMPATIBILITY, margin, 258, inner - 100, 28),
+        (ID_PAUSE, width - margin - 88, 256, 88, 30),
         (218, margin + 28, 294, inner - 28, 36),
         (ID_APPEARANCE, margin, 342, 104, 32),
         (276, margin + 120, 348, inner - 120, 24),
@@ -468,7 +495,8 @@ pub(super) unsafe fn layout_appearance(app: &mut App) {
 }
 
 pub(super) unsafe fn make_inline(parent: HWND) -> InlineUi {
-    child(parent, "STATIC", "英文 → 简体中文", SS_LEFT, 250);
+    let heading = child(parent, "STATIC", "英文 → 简体中文", SS_LEFT, 250);
+    tooltip(parent, heading, "拖动标题可移动译文框");
     let translated = child(
         parent,
         "EDIT",
@@ -476,13 +504,35 @@ pub(super) unsafe fn make_inline(parent: HWND) -> InlineUi {
         (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_VSCROLL | WS_TABSTOP,
         251,
     );
+    // Long streamed answers and retained exchanges can exceed the native EDIT
+    // default. This remains bounded by the transport's response limit.
+    SendMessageW(translated, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
     let status = child(parent, "STATIC", "正在翻译…", SS_LEFT, 254);
-    let copy = icon_button(parent, "复制译文", ID_COPY, "复制译文");
+    let action = icon_button(parent, "重新翻译", ID_RETRY, "重新调用翻译服务 / 停止翻译");
+    let pin = icon_button(
+        parent,
+        "保持窗口显示",
+        ID_PIN,
+        "切换软件时保持窗口显示；新划词仍更新译文",
+    );
+    let copy = icon_button(
+        parent,
+        "复制译文",
+        ID_COPY,
+        "复制译文；右键可复制选区或全部问答",
+    );
     icon_button(parent, "展开", ID_INLINE_EXPAND, "展开翻译窗口");
     icon_button(parent, "关闭", ID_INLINE_CLOSE, "关闭翻译窗口");
     let question = question_input(parent);
-    let send = icon_button(parent, "发送问题", ID_SEND, "发送问题 · Enter");
+    let send = icon_button(
+        parent,
+        "发送问题",
+        ID_SEND,
+        "发送问题 / 停止回答；Enter 发送",
+    );
     InlineUi {
+        action,
+        pin,
         question,
         send,
         translated,
@@ -500,7 +550,9 @@ pub(super) unsafe fn layout_inline(app: &mut App) {
     let width = rect.right * 96 / scale as i32;
     let height = rect.bottom * 96 / scale as i32;
     let positions = [
-        (250, 12, 12, width - 124, 24),
+        (250, 12, 12, width - 188, 24),
+        (ID_RETRY, width - 172, 8, 28, 28),
+        (ID_PIN, width - 140, 8, 28, 28),
         (ID_COPY, width - 108, 8, 28, 28),
         (ID_INLINE_EXPAND, width - 76, 8, 28, 28),
         (ID_INLINE_CLOSE, width - 44, 8, 28, 28),
@@ -533,12 +585,32 @@ pub(super) unsafe fn make_result(parent: HWND) -> ResultUi {
         (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_VSCROLL | WS_TABSTOP,
         224,
     );
+    SendMessageW(translated, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
     let status = child(parent, "STATIC", "", SS_LEFT, 225);
-    let copy = icon_button(parent, "复制译文", ID_COPY, "复制译文");
+    let action = icon_button(parent, "重新翻译", ID_RETRY, "重新调用翻译服务 / 停止翻译");
+    let pin = icon_button(
+        parent,
+        "保持窗口显示",
+        ID_PIN,
+        "切换软件时保持窗口显示；新划词仍更新译文",
+    );
+    let copy = icon_button(
+        parent,
+        "复制译文",
+        ID_COPY,
+        "复制译文；右键可复制选区或全部问答",
+    );
     icon_button(parent, "设置", ID_SETTINGS, "打开设置");
     let question = question_input(parent);
-    let send = icon_button(parent, "发送问题", ID_SEND, "发送问题 · Enter");
+    let send = icon_button(
+        parent,
+        "发送问题",
+        ID_SEND,
+        "发送问题 / 停止回答；Enter 发送",
+    );
     ResultUi {
+        action,
+        pin,
         question,
         send,
         original,
@@ -558,7 +630,9 @@ pub(super) unsafe fn layout_result(app: &mut App) {
     let height = rect.bottom * 96 / scale as i32;
     let inner = width - 40;
     let positions = [
-        (220, 20, 16, inner - 80, 28),
+        (220, 20, 16, inner - 160, 28),
+        (ID_RETRY, width - 160, 13, 32, 32),
+        (ID_PIN, width - 124, 13, 32, 32),
         (ID_COPY, width - 88, 13, 32, 32),
         (ID_SETTINGS, width - 52, 13, 32, 32),
         (221, 20, 58, inner, 20),

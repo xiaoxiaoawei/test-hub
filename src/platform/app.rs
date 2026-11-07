@@ -84,6 +84,13 @@ const ID_INLINE_EXPAND: u16 = 252;
 const ID_INLINE_CLOSE: u16 = 253;
 const ID_QUESTION: u16 = 260;
 const ID_SEND: u16 = 261;
+const ID_RETRY: u16 = 262;
+const ID_PIN: u16 = 263;
+const ID_PAUSE: u16 = 264;
+const ID_SWAP_LANGUAGES: u16 = 265;
+const ID_COPY_CONVERSATION: u16 = 266;
+const ID_KEY_VISIBILITY: u16 = 267;
+const ID_COPY_SELECTION: u16 = 268;
 const ID_SERVICE_TAB: u16 = 270;
 const ID_PREFERENCES_TAB: u16 = 271;
 const ID_SOURCE_LANGUAGE: u16 = 272;
@@ -105,6 +112,10 @@ enum SettingsPage {
 }
 
 thread_local! {
+    static TRANSLATION_STREAMING: Cell<bool> = const { Cell::new(false) };
+    static CONVERSATION_BUSY: Cell<bool> = const { Cell::new(false) };
+    static WINDOW_PINNED: Cell<bool> = const { Cell::new(false) };
+    static KEY_VISIBLE: Cell<bool> = const { Cell::new(false) };
     static SETTINGS_PAGE: Cell<SettingsPage> = const { Cell::new(SettingsPage::Service) };
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     // Painting must also work during synchronous callbacks while App is borrowed.
@@ -147,6 +158,7 @@ struct TranslationJob {
     settings: config::Settings,
     text: String,
     test: bool,
+    force_refresh: bool,
 }
 enum Event {
     Conversation(conversation_ui::Event),
@@ -201,6 +213,8 @@ struct SettingsUi {
     update_status: HWND,
 }
 struct ResultUi {
+    action: HWND,
+    pin: HWND,
     question: HWND,
     send: HWND,
     original: HWND,
@@ -217,6 +231,8 @@ struct AppearanceUi {
     status: HWND,
 }
 struct InlineUi {
+    action: HWND,
+    pin: HWND,
     question: HWND,
     send: HWND,
     translated: HWND,
@@ -232,6 +248,8 @@ struct App {
     inline_window: HWND,
     inline_ui: InlineUi,
     inline_active: bool,
+    window_pinned: bool,
+    selection_paused: bool,
     appearance_window: HWND,
     appearance_ui: AppearanceUi,
     icons: icons::IconSet,
@@ -512,7 +530,7 @@ unsafe fn run_inner() -> Result<(), String> {
                 if cancelled() {
                     continue;
                 }
-                let cached = if job.test {
+                let cached = if job.test || job.force_refresh {
                     None
                 } else {
                     worker_cache
@@ -597,6 +615,8 @@ unsafe fn run_inner() -> Result<(), String> {
         inline_window,
         inline_ui,
         inline_active: false,
+        window_pinned: false,
+        selection_paused: false,
         appearance_window,
         appearance_ui,
         icons: runtime_icons,
@@ -662,6 +682,7 @@ unsafe fn run_inner() -> Result<(), String> {
         layout_inline(app);
         layout_chip(app);
         fill_settings(app);
+        refresh_translation_actions(app);
         let mut problems = Vec::new();
         if let Some(error) = load_error {
             problems.push(error);
@@ -691,7 +712,11 @@ unsafe fn run_inner() -> Result<(), String> {
         {
             let root = GetAncestor(message.hwnd, GA_ROOT);
             if root == inline_window || root == result_window {
-                with_app(|app| conversation_ui::submit(app, root));
+                with_app(|app| {
+                    if !conversation_ui::is_busy(&app.conversation) {
+                        conversation_ui::submit(app, root);
+                    }
+                });
                 continue;
             }
         }
@@ -704,9 +729,14 @@ unsafe fn run_inner() -> Result<(), String> {
             {
                 if root == inline_window {
                     with_app(|app| close_inline(app));
+                } else if root == result_window {
+                    with_app(|app| close_translation(app));
                 } else if root == appearance_window {
                     with_app(|app| close_appearance(app));
                 } else {
+                    if root == settings_window {
+                        with_app(|app| mask_api_key(app));
+                    }
                     ShowWindow(root, SW_HIDE);
                 }
                 continue;
@@ -894,7 +924,35 @@ fn button_symbol(id: u32) -> Option<symbols::Symbol> {
         }
         ID_COPY => Symbol::Copy,
         ID_TEST => Symbol::Connection,
-        ID_SEND => Symbol::Send,
+        ID_SEND => {
+            if CONVERSATION_BUSY.get() {
+                Symbol::Stop
+            } else {
+                Symbol::Send
+            }
+        }
+        ID_RETRY => {
+            if TRANSLATION_STREAMING.get() {
+                Symbol::Stop
+            } else {
+                Symbol::Retry
+            }
+        }
+        ID_PIN => {
+            if WINDOW_PINNED.get() {
+                Symbol::PinActive
+            } else {
+                Symbol::Pin
+            }
+        }
+        ID_SWAP_LANGUAGES => Symbol::Swap,
+        ID_KEY_VISIBILITY => {
+            if KEY_VISIBLE.get() {
+                Symbol::EyeClosed
+            } else {
+                Symbol::Eye
+            }
+        }
         ID_INLINE_EXPAND => Symbol::Expand,
         ID_INLINE_CLOSE => Symbol::Close,
         ID_SETTINGS => Symbol::Settings,
@@ -924,7 +982,14 @@ unsafe fn update_language_labels(app: &App) {
     );
     set_text(
         GetDlgItem(app.settings_window, 201),
-        &format!("{pair}  ·  Ctrl + Alt + T"),
+        &format!(
+            "{pair}  ·  {}",
+            if app.selection_paused {
+                "已暂停划词"
+            } else {
+                "Ctrl + Alt + T"
+            }
+        ),
     );
     set_text(GetDlgItem(app.inline_window, 250), &pair);
     set_text(GetDlgItem(app.result_window, 220), &pair);
@@ -977,6 +1042,289 @@ unsafe fn position_over_owner(hwnd: HWND, owner: HWND, width: i32, height: i32) 
     SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_NOACTIVATE);
 }
 
+fn automatic_enabled(app: &App) -> bool {
+    app.settings.selection_button && !app.selection_paused
+}
+
+unsafe fn update_pause_ui(app: &App) {
+    let control = GetDlgItem(app.settings_window, ID_PAUSE as i32);
+    set_text(
+        control,
+        if app.selection_paused {
+            "恢复划词"
+        } else {
+            "暂停划词"
+        },
+    );
+    EnableWindow(control, app.settings.selection_button as i32);
+    update_language_labels(app);
+}
+
+unsafe fn toggle_selection_pause(app: &mut App) {
+    if !app.settings.selection_button {
+        return;
+    }
+    app.selection_paused = !app.selection_paused;
+    mouse::set_enabled(automatic_enabled(app));
+    cancel_automatic(app);
+    update_pause_ui(app);
+    set_text(
+        app.settings_ui.status,
+        if app.selection_paused {
+            "本次已暂停 · 快捷键与剪贴板翻译仍可用"
+        } else {
+            "自动划词已恢复"
+        },
+    );
+    copy_wide(
+        &mut app.tray.szTip,
+        if app.selection_paused {
+            "轻译 · 划词已暂停 · Ctrl+Alt+T"
+        } else {
+            "轻译 · Ctrl+Alt+T 翻译选区"
+        },
+    );
+    Shell_NotifyIconW(NIM_MODIFY, &app.tray);
+}
+
+unsafe fn update_swap_button(app: &App) {
+    let enabled = selected_language(app.settings_ui.source, config::SOURCE_LANGUAGES)
+        .is_ok_and(|language| language != config::Language::Auto);
+    EnableWindow(
+        GetDlgItem(app.settings_window, ID_SWAP_LANGUAGES as i32),
+        enabled as i32,
+    );
+}
+
+unsafe fn swap_languages(app: &App) {
+    let Ok(source) = selected_language(app.settings_ui.source, config::SOURCE_LANGUAGES) else {
+        return;
+    };
+    let Ok(target) = selected_language(app.settings_ui.target, config::TARGET_LANGUAGES) else {
+        return;
+    };
+    let Some(new_target) = config::TARGET_LANGUAGES
+        .iter()
+        .position(|language| *language == source)
+    else {
+        return;
+    };
+    let Some(new_source) = config::SOURCE_LANGUAGES
+        .iter()
+        .position(|language| *language == target)
+    else {
+        return;
+    };
+    SendMessageW(app.settings_ui.source, CB_SETCURSEL, new_source, 0);
+    SendMessageW(app.settings_ui.target, CB_SETCURSEL, new_target, 0);
+    update_swap_button(app);
+    set_text(app.settings_ui.status, "已交换语言 · 保存后生效");
+}
+
+unsafe fn set_api_key_visibility(app: &App, visible: bool) {
+    KEY_VISIBLE.set(visible);
+    SendMessageW(
+        app.settings_ui.key,
+        EM_SETPASSWORDCHAR,
+        if visible { 0 } else { 0x25cf },
+        0,
+    );
+    InvalidateRect(app.settings_ui.key, null(), 0);
+    let button = GetDlgItem(app.settings_window, ID_KEY_VISIBILITY as i32);
+    set_text(
+        button,
+        if visible {
+            "隐藏 API 密钥"
+        } else {
+            "显示 API 密钥"
+        },
+    );
+    InvalidateRect(button, null(), 0);
+}
+
+unsafe fn mask_api_key(app: &App) {
+    set_api_key_visibility(app, false);
+}
+
+unsafe fn refresh_translation_actions(app: &App) {
+    let changed = TRANSLATION_STREAMING.replace(app.streaming) != app.streaming;
+    let pin_changed = WINDOW_PINNED.replace(app.window_pinned) != app.window_pinned;
+    for button in [app.inline_ui.action, app.result_ui.action] {
+        EnableWindow(
+            button,
+            (!app.display_pending && !app.active_text.is_empty()) as i32,
+        );
+        if changed || text(button).is_empty() {
+            set_text(
+                button,
+                if app.streaming {
+                    "停止翻译"
+                } else {
+                    "重新翻译"
+                },
+            );
+            InvalidateRect(button, null(), 0);
+        }
+    }
+    if pin_changed {
+        for button in [app.inline_ui.pin, app.result_ui.pin] {
+            set_text(
+                button,
+                if app.window_pinned {
+                    "取消保持显示"
+                } else {
+                    "保持窗口显示"
+                },
+            );
+            InvalidateRect(button, null(), 0);
+        }
+    }
+}
+
+unsafe fn stop_translation(app: &mut App) {
+    app.generation += 1;
+    app.latest_translation
+        .store(app.generation, Ordering::Release);
+    app.streaming = false;
+    app.active_started = None;
+    app.display_pending = false;
+    conversation_ui::reset(app);
+    translation_copy_enabled(app, false);
+    if app.translated.is_empty() {
+        app.rendered_text.clear();
+        for editor in [app.result_ui.translated, app.inline_ui.translated] {
+            set_text(editor, "翻译已停止，可点击重新翻译再试。");
+        }
+    } else {
+        let partial = app.translated.clone();
+        render_translation(app, &partial);
+        EnableWindow(app.result_ui.copy, 1);
+        EnableWindow(app.inline_ui.copy, 1);
+    }
+    translation_status(app, "已停止 · 可重新翻译");
+    refresh_translation_actions(app);
+}
+
+unsafe fn is_translation_copy_target(app: &App, window: HWND) -> bool {
+    window == app.inline_ui.translated
+        || window == app.result_ui.translated
+        || window == app.inline_ui.copy
+        || window == app.result_ui.copy
+}
+
+unsafe fn copy_menu(app: &mut App, target: HWND, position: LPARAM) {
+    let editor = if GetAncestor(target, GA_ROOT) == app.inline_window {
+        app.inline_ui.translated
+    } else {
+        app.result_ui.translated
+    };
+    let mut start = 0u32;
+    let mut end = 0u32;
+    SendMessageW(
+        editor,
+        EM_GETSEL,
+        &mut start as *mut u32 as usize,
+        &mut end as *mut u32 as isize,
+    );
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return;
+    }
+    AppendMenuW(
+        menu,
+        MF_STRING | if start != end { 0 } else { MF_GRAYED },
+        ID_COPY_SELECTION as usize,
+        wide("复制选中文字").as_ptr(),
+    );
+    let available = !app.display_pending && !app.translated.is_empty();
+    let flags = MF_STRING | if available { 0 } else { MF_GRAYED };
+    AppendMenuW(menu, flags, ID_COPY as usize, wide("复制译文").as_ptr());
+    AppendMenuW(
+        menu,
+        flags
+            | if conversation_ui::has_content(&app.conversation) {
+                0
+            } else {
+                MF_GRAYED
+            },
+        ID_COPY_CONVERSATION as usize,
+        wide("复制译文与问答").as_ptr(),
+    );
+    let point = if position == -1 {
+        cursor()
+    } else {
+        POINT {
+            x: (position as u16 as i16) as i32,
+            y: ((position >> 16) as u16 as i16) as i32,
+        }
+    };
+    let chosen = TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        point.x,
+        point.y,
+        0,
+        GetAncestor(editor, GA_ROOT),
+        null(),
+    );
+    DestroyMenu(menu);
+    // Native menus pump messages while App is borrowed; drain any queued events
+    // whose original WM_WORK was deferred by that nested loop.
+    PostMessageW(app.main, WM_WORK, 0, 0);
+    if chosen == ID_COPY_SELECTION as i32 {
+        SendMessageW(editor, WM_COPY, 0, 0);
+    } else if chosen != 0 {
+        command(app, chosen as u16);
+    }
+}
+
+/// Preserve selection and reading position while a stream grows. Only follow
+/// new content when the user was already at the bottom without a text selection.
+unsafe fn render_editor(editor: HWND, previous: &str, current: &str, fresh: bool) {
+    let mut start = 0u32;
+    let mut end = 0u32;
+    SendMessageW(
+        editor,
+        EM_GETSEL,
+        &mut start as *mut u32 as usize,
+        &mut end as *mut u32 as isize,
+    );
+    let first_line = SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0);
+    let mut scroll: SCROLLINFO = zeroed();
+    scroll.cbSize = size_of::<SCROLLINFO>() as u32;
+    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    let at_bottom = GetScrollInfo(editor, SB_VERT, &mut scroll) == 0
+        || scroll.nPos as i64 + scroll.nPage as i64 >= scroll.nMax as i64;
+    let follow = fresh || (start == end && at_bottom);
+    let redraw = !follow && IsWindowVisible(editor) != 0;
+    if redraw {
+        SendMessageW(editor, WM_SETREDRAW, 0, 0);
+    }
+    if !previous.is_empty() && current.starts_with(previous) {
+        SendMessageW(editor, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
+        SendMessageW(
+            editor,
+            EM_REPLACESEL,
+            0,
+            wide(&current[previous.len()..]).as_ptr() as isize,
+        );
+    } else {
+        SetWindowTextW(editor, wide(current).as_ptr());
+    }
+    if follow {
+        SendMessageW(editor, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
+        SendMessageW(editor, EM_SCROLLCARET, 0, 0);
+    } else {
+        SendMessageW(editor, EM_SETSEL, start as usize, end as isize);
+        let now = SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0);
+        SendMessageW(editor, EM_LINESCROLL, 0, first_line - now);
+    }
+    if redraw {
+        SendMessageW(editor, WM_SETREDRAW, 1, 0);
+        InvalidateRect(editor, null(), 0);
+    }
+}
+
 fn provider_index(base_url: &str) -> usize {
     match config::parse_endpoint(base_url)
         .ok()
@@ -1000,6 +1348,7 @@ unsafe fn change_provider(app: &mut App) {
     set_text(app.settings_ui.model, &preset.model);
     set_text(app.settings_ui.timeout, &preset.timeout_seconds.to_string());
     set_text(app.settings_ui.key, "");
+    mask_api_key(app);
     // A result from testing the previous provider must not describe this draft.
     app.test_generation += 1;
     app.latest_test
@@ -1069,7 +1418,7 @@ unsafe extern "system" fn window_proc(
                     handled = true;
                     return;
                 }
-                if app.settings.selection_button && !app.picking_color {
+                if automatic_enabled(app) && !app.picking_color {
                     let foreground = GetForegroundWindow();
                     if !app.auto_pressed {
                         handled = true;
@@ -1092,6 +1441,10 @@ unsafe extern "system" fn window_proc(
                     app.auto_started = Some(Instant::now());
                     app.auto_attempt = 0;
                     if app.auto_strong {
+                        if app.window_pinned {
+                            conversation_ui::reset(app);
+                            app.display_pending = true;
+                        }
                         show_selection_pending(app);
                     }
                     SetTimer(app.main, TIMER_SELECTION, 60, None);
@@ -1112,7 +1465,7 @@ unsafe extern "system" fn window_proc(
                         warm_foreground(app, foreground as isize);
                     }
                 } else if wparam as u32 == selection_events::SELECTION
-                    && app.settings.selection_button
+                    && automatic_enabled(app)
                     && !app.picking_color
                     && !app.auto_pressed
                     && app
@@ -1131,7 +1484,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_TIMER if wparam == TIMER_SELECTION => {
                 KillTimer(app.main, TIMER_SELECTION);
-                if app.settings.selection_button
+                if automatic_enabled(app)
                     && app
                         .auto_started
                         .is_some_and(|time| time.elapsed() < Duration::from_secs(5))
@@ -1140,7 +1493,7 @@ unsafe extern "system" fn window_proc(
                 {
                     request_capture(app, CaptureKind::Auto, app.auto_point);
                 } else if app.auto_started.is_some() {
-                    if !app.settings.selection_button
+                    if !automatic_enabled(app)
                         || app.picking_color
                         || app.auto_foreground != GetForegroundWindow() as isize
                     {
@@ -1162,7 +1515,8 @@ unsafe extern "system" fn window_proc(
                     ShowWindow(app.chip, SW_HIDE);
                     app.chip_deadline = None;
                 }
-                if app.inline_active
+                if !app.window_pinned
+                    && app.inline_active
                     && IsWindowVisible(app.inline_window) != 0
                     && foreground as isize != app.chip_foreground
                     && GetAncestor(foreground, GA_ROOT) != app.inline_window
@@ -1172,6 +1526,10 @@ unsafe extern "system" fn window_proc(
                 if IsWindowVisible(app.chip) == 0 && IsWindowVisible(app.inline_window) == 0 {
                     KillTimer(app.main, TIMER_CHIP);
                 }
+                handled = true;
+            }
+            WM_CONTEXTMENU if is_translation_copy_target(app, wparam as HWND) => {
+                copy_menu(app, wparam as HWND, lparam);
                 handled = true;
             }
             WM_WORK => {
@@ -1184,6 +1542,7 @@ unsafe extern "system" fn window_proc(
                     conversation_ui::submit(app, hwnd);
                 } else if id == ID_SOURCE_LANGUAGE || id == ID_TARGET_LANGUAGE {
                     if (wparam >> 16) as u16 == CBN_SELCHANGE as u16 {
+                        update_swap_button(app);
                         set_text(app.settings_ui.status, "语言偏好将在保存后生效");
                     }
                 } else if id == ID_PROVIDER {
@@ -1211,6 +1570,11 @@ unsafe extern "system" fn window_proc(
             WM_CLOSE => {
                 if hwnd == app.inline_window {
                     close_inline(app);
+                } else if hwnd == app.result_window {
+                    close_translation(app);
+                } else if hwnd == app.settings_window {
+                    mask_api_key(app);
+                    ShowWindow(hwnd, SW_HIDE);
                 } else if hwnd == app.appearance_window {
                     close_appearance(app);
                 } else {
@@ -1291,10 +1655,30 @@ unsafe extern "system" fn window_proc(
                 }
                 handled = true;
             }
+            WM_NCHITTEST if hwnd == app.inline_window => {
+                let point = POINT {
+                    x: (lparam as u16 as i16) as i32,
+                    y: ((lparam >> 16) as u16 as i16) as i32,
+                };
+                let hit = WindowFromPoint(point);
+                let mut local = point;
+                ScreenToClient(hwnd, &mut local);
+                if local.y >= 0
+                    && local.y < scaled(40, dpi(hwnd))
+                    && (hit == hwnd || GetDlgCtrlID(hit) == 250)
+                {
+                    value = HTCAPTION as isize;
+                    handled = true;
+                }
+            }
             WM_MOUSEACTIVATE if hwnd == app.chip || hwnd == app.inline_window => {
                 let control = WindowFromPoint(cursor());
                 value = if hwnd == app.inline_window
-                    && (control == app.inline_ui.question || control == app.inline_ui.translated)
+                    && (control == app.inline_ui.question
+                        || control == app.inline_ui.translated
+                        || control == app.inline_ui.send
+                        || control == app.inline_ui.action
+                        || control == app.inline_ui.pin)
                 {
                     MA_ACTIVATE
                 } else {
@@ -1329,8 +1713,45 @@ unsafe fn command(app: &mut App, id: u16) {
             } else {
                 SettingsPage::Preferences
             });
+            if id == ID_PREFERENCES_TAB {
+                mask_api_key(app);
+            }
             app.settings_scroll = 0;
             layout_settings(app);
+        }
+        ID_RETRY => {
+            if app.streaming {
+                stop_translation(app);
+            } else if !app.active_text.is_empty() {
+                let text = app.active_text.clone();
+                let inline = app.inline_active;
+                start_translation_request(app, text, "重新翻译", app.auto_point, inline, true);
+            }
+        }
+        ID_PIN => {
+            app.window_pinned = !app.window_pinned;
+            refresh_translation_actions(app);
+            translation_status(
+                app,
+                if app.window_pinned {
+                    "已保持显示 · 新划词仍会更新译文"
+                } else {
+                    "已取消保持显示"
+                },
+            );
+        }
+        ID_PAUSE => toggle_selection_pause(app),
+        ID_SWAP_LANGUAGES => swap_languages(app),
+        ID_KEY_VISIBILITY => {
+            let visible = !KEY_VISIBLE.get();
+            set_api_key_visibility(app, visible);
+        }
+        ID_COPY_CONVERSATION => {
+            let value = conversation_ui::display_text(app);
+            match write_clipboard(app.result_window, &value) {
+                Ok(()) => translation_status(app, "译文与问答已复制"),
+                Err(error) => translation_status(app, &error),
+            }
         }
         ID_SETTINGS => show_settings(app),
         ID_THEME => toggle_theme(app),
@@ -1425,7 +1846,6 @@ unsafe fn command(app: &mut App, id: u16) {
                     app.latest_test
                         .store(app.test_generation, Ordering::Release);
                     EnableWindow(GetDlgItem(app.settings_window, ID_TEST as i32), 1);
-                    mouse::set_enabled(settings.selection_button);
                     if !settings.selection_button
                         || settings.selection_mode != app.settings.selection_mode
                         || settings.compatibility_capture != app.settings.compatibility_capture
@@ -1440,9 +1860,17 @@ unsafe fn command(app: &mut App, id: u16) {
                         }
                     }
                     app.settings = settings;
+                    if !app.settings.selection_button {
+                        app.selection_paused = false;
+                        copy_wide(&mut app.tray.szTip, "轻译 · Ctrl+Alt+T 翻译选区");
+                        Shell_NotifyIconW(NIM_MODIFY, &app.tray);
+                    }
+                    mouse::set_enabled(automatic_enabled(app));
+                    update_pause_ui(app);
                     update_language_labels(app);
                     conversation_ui::refresh(app);
                     update_mode_hint(app);
+                    refresh_translation_actions(app);
                     set_text(app.settings_ui.status, "设置已保存 · 已立即生效");
                     enqueue_notice(app, Notice::Saved);
                 }
@@ -1465,6 +1893,7 @@ unsafe fn command(app: &mut App, id: u16) {
                             settings,
                             text: "Hello, world.".into(),
                             test: true,
+                            force_refresh: false,
                         },
                     )
                     .is_err()
@@ -1480,15 +1909,37 @@ unsafe fn command(app: &mut App, id: u16) {
 }
 
 unsafe fn cancel_automatic(app: &mut App) {
+    let was_pending = app.display_pending;
     reset_automatic(app);
-    ShowWindow(app.inline_window, SW_HIDE);
+    if !app.window_pinned {
+        ShowWindow(app.inline_window, SW_HIDE);
+    } else if was_pending {
+        if !app.translated.is_empty() {
+            let original = app.translated.clone();
+            render_translation(app, &original);
+            translation_copy_enabled(app, app.translation_ready);
+            translation_status(
+                app,
+                if app.streaming {
+                    "正在翻译…"
+                } else {
+                    "已保留当前译文"
+                },
+            );
+        } else {
+            set_text(app.inline_ui.translated, "未读取到新选区，请重新划选。");
+            translation_status(app, "请重新划选");
+        }
+    }
 }
 
 unsafe fn reset_automatic(app: &mut App) {
     KillTimer(app.main, TIMER_SELECTION);
     KillTimer(app.main, TIMER_CHIP);
     ShowWindow(app.chip, SW_HIDE);
-    ShowWindow(app.result_window, SW_HIDE);
+    if !app.window_pinned {
+        ShowWindow(app.result_window, SW_HIDE);
+    }
     app.chip_deadline = None;
     app.chip_text.clear();
     app.capture_generation += 1;
@@ -1506,16 +1957,18 @@ unsafe fn reset_automatic(app: &mut App) {
     app.compatibility_attempted = false;
     // Keep the network model alive for cache/in-flight reuse. Detach its view
     // immediately so an older stream cannot paint over a new selection.
-    app.display_pending = true;
+    app.display_pending = !app.window_pinned;
     conversation_ui::refresh(app);
 }
 
 unsafe fn begin_automatic_press(app: &mut App, point: POINT) {
-    if !app.settings.selection_button || app.picking_color {
+    if !automatic_enabled(app) || app.picking_color {
         return;
     }
-    conversation_ui::reset(app);
-    let reuse = app.inline_active && IsWindowVisible(app.inline_window) != 0;
+    if !app.window_pinned {
+        conversation_ui::reset(app);
+    }
+    let reuse = !app.window_pinned && app.inline_active && IsWindowVisible(app.inline_window) != 0;
     reset_automatic(app);
     app.auto_origin = Some(point);
     app.auto_source_root = GetAncestor(WindowFromPoint(point), GA_ROOT) as isize;
@@ -1529,7 +1982,9 @@ unsafe fn begin_automatic_press(app: &mut App, point: POINT) {
 unsafe fn selection_pending_text(app: &mut App) {
     app.rendered_text.clear();
     set_text(app.inline_ui.translated, "正在读取选区…");
-    translation_copy_enabled(app, false);
+    EnableWindow(app.result_ui.copy, 0);
+    EnableWindow(app.inline_ui.copy, 0);
+    conversation_ui::refresh(app);
     EnableWindow(GetDlgItem(app.inline_window, ID_INLINE_EXPAND as i32), 0);
     translation_status(app, "正在读取新选区");
 }
@@ -1540,7 +1995,9 @@ unsafe fn show_selection_pending(app: &mut App) {
         selection_pending_text(app);
         present_translation(app, true, app.auto_point);
     } else {
-        ShowWindow(app.inline_window, SW_HIDE);
+        if !app.window_pinned {
+            ShowWindow(app.inline_window, SW_HIDE);
+        }
         let _ = show_chip(app, app.auto_point);
     }
 }
@@ -1573,7 +2030,7 @@ unsafe fn retry_automatic(app: &mut App) {
         .auto_started
         .is_some_and(|started| started.elapsed() < Duration::from_secs(5))
         && app.auto_attempt < attempts
-        && app.settings.selection_button
+        && automatic_enabled(app)
         && GetForegroundWindow() as isize == app.auto_foreground
         && !app.picking_color
     {
@@ -1597,7 +2054,7 @@ unsafe fn retry_automatic(app: &mut App) {
                 translation_status(app, "请重新划选");
                 translation_copy_enabled(app, false);
                 present_translation(app, true, app.auto_point);
-            } else {
+            } else if !app.window_pinned {
                 ShowWindow(app.inline_window, SW_HIDE);
             }
         }
@@ -1656,6 +2113,11 @@ unsafe fn present_translation(app: &mut App, inline: bool, point: POINT) {
 }
 
 unsafe fn close_inline(app: &mut App) {
+    close_translation(app);
+}
+
+unsafe fn close_translation(app: &mut App) {
+    app.window_pinned = false;
     conversation_ui::reset(app);
     ShowWindow(app.inline_window, SW_HIDE);
     app.inline_active = false;
@@ -1664,6 +2126,7 @@ unsafe fn close_inline(app: &mut App) {
     app.latest_translation
         .store(app.generation, Ordering::Release);
     cancel_automatic(app);
+    refresh_translation_actions(app);
 }
 
 unsafe fn begin_screen_pick(app: &mut App) {
@@ -1783,8 +2246,7 @@ unsafe fn drain_events(app: &mut App) {
                                 } else {
                                     show_error(app, "选区过长，请缩小选择范围后重试。", job.point);
                                 }
-                            } else if job.kind == CaptureKind::Auto && app.settings.selection_button
-                            {
+                            } else if job.kind == CaptureKind::Auto && automatic_enabled(app) {
                                 KillTimer(app.main, TIMER_SELECTION);
                                 app.chip_foreground = job.foreground;
                                 // Notification/probe duplicates within one gesture
@@ -1804,7 +2266,9 @@ unsafe fn drain_events(app: &mut App) {
                                         );
                                     } else {
                                         app.chip_text = captured.text;
-                                        ShowWindow(app.inline_window, SW_HIDE);
+                                        if !app.window_pinned {
+                                            ShowWindow(app.inline_window, SW_HIDE);
+                                        }
                                         let _ = show_chip(app, job.point);
                                     }
                                 }
@@ -1960,10 +2424,25 @@ unsafe fn start_translation_in(
     point: POINT,
     inline: bool,
 ) {
+    start_translation_request(app, text, source, point, inline, false);
+}
+
+unsafe fn start_translation_request(
+    app: &mut App,
+    text: String,
+    source: &str,
+    point: POINT,
+    inline: bool,
+    force_refresh: bool,
+) {
     conversation_ui::reset(app);
     app.display_pending = false;
     EnableWindow(GetDlgItem(app.inline_window, ID_INLINE_EXPAND as i32), 1);
-    if app.streaming && app.active_epoch == app.settings_epoch && app.active_text == text.trim() {
+    if !force_refresh
+        && app.streaming
+        && app.active_epoch == app.settings_epoch
+        && app.active_text == text.trim()
+    {
         if app.translated.is_empty() {
             app.rendered_text.clear();
             set_text(app.result_ui.translated, "正在翻译…");
@@ -1993,11 +2472,14 @@ unsafe fn start_translation_in(
     set_text(app.inline_ui.translated, "正在翻译…");
     translation_status(app, &format!("{source} · 正在翻译"));
     present_translation(app, inline, point);
-    let cached = app
-        .cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&app.settings, &text);
+    let cached = if force_refresh {
+        None
+    } else {
+        app.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&app.settings, &text)
+    };
     if let Some(cached) = cached {
         app.streaming = false;
         render_translation(app, &cached);
@@ -2022,6 +2504,7 @@ unsafe fn start_translation_in(
                 settings: app.settings.clone(),
                 text,
                 test: false,
+                force_refresh,
             },
         )
         .is_err()
@@ -2031,6 +2514,8 @@ unsafe fn start_translation_in(
 }
 
 unsafe fn show_error(app: &mut App, error: &str, point: POINT) {
+    app.active_text.clear();
+    conversation_ui::reset(app);
     app.display_pending = false;
     app.streaming = false;
     app.generation += 1;
@@ -2055,27 +2540,20 @@ unsafe fn render_translation(app: &mut App, text: &str) {
     let display = conversation_ui::display_text(app);
     let previous = native_text(&app.rendered_text);
     let current = native_text(&display);
-    for editor in [app.result_ui.translated, app.inline_ui.translated] {
-        if !previous.is_empty() && current.starts_with(&previous) {
-            let suffix = wide(&current[previous.len()..]);
-            SendMessageW(editor, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
-            SendMessageW(editor, EM_REPLACESEL, 0, suffix.as_ptr() as isize);
-            SendMessageW(editor, EM_SCROLLCARET, 0, 0);
-        } else {
-            SetWindowTextW(editor, wide(&current).as_ptr());
-            if conversation_ui::has_content(&app.conversation) {
-                SendMessageW(editor, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
-                SendMessageW(editor, EM_SCROLLCARET, 0, 0);
-            }
+    if current != previous {
+        for editor in [app.result_ui.translated, app.inline_ui.translated] {
+            render_editor(editor, &previous, &current, previous.is_empty());
         }
     }
     app.rendered_text = display;
     conversation_ui::refresh(app);
+    refresh_translation_actions(app);
 }
 
 unsafe fn translation_status(app: &App, message: &str) {
     set_text(app.result_ui.status, message);
     set_text(app.inline_ui.status, message);
+    refresh_translation_actions(app);
 }
 
 unsafe fn translation_copy_enabled(app: &mut App, enabled: bool) {
@@ -2083,6 +2561,7 @@ unsafe fn translation_copy_enabled(app: &mut App, enabled: bool) {
     EnableWindow(app.result_ui.copy, enabled as i32);
     EnableWindow(app.inline_ui.copy, enabled as i32);
     conversation_ui::refresh(app);
+    refresh_translation_actions(app);
 }
 
 unsafe fn show_settings(app: &mut App) {
@@ -2354,6 +2833,8 @@ unsafe fn pick_icon_color(owner: HWND, rgb: u32) -> Option<u32> {
 }
 
 unsafe fn fill_settings(app: &App) {
+    mask_api_key(app);
+    update_pause_ui(app);
     for (control, languages, value) in [
         (
             app.settings_ui.source,
@@ -2374,6 +2855,7 @@ unsafe fn fill_settings(app: &App) {
     }
     update_language_labels(app);
     update_appearance_summary(app);
+    update_swap_button(app);
     set_text(
         GetDlgItem(app.settings_window, ID_THEME as i32),
         if app.settings.theme_mode == config::ThemeMode::Dark {
@@ -2446,6 +2928,23 @@ unsafe fn tray_menu(app: &App) -> u16 {
         wide("设置…").as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(
+        menu,
+        MF_STRING
+            | if app.settings.selection_button {
+                0
+            } else {
+                MF_GRAYED
+            },
+        ID_PAUSE as usize,
+        wide(if app.selection_paused {
+            "恢复自动划词"
+        } else {
+            "暂停自动划词"
+        })
+        .as_ptr(),
+    );
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_EXIT as usize, wide("退出轻译").as_ptr());
     let point = cursor();
     SetForegroundWindow(app.main);
@@ -2459,6 +2958,7 @@ unsafe fn tray_menu(app: &App) -> u16 {
         null(),
     );
     PostMessageW(app.main, WM_NULL, 0, 0);
+    PostMessageW(app.main, WM_WORK, 0, 0);
     DestroyMenu(menu);
     chosen as u16
 }

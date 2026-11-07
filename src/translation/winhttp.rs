@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Networking::WinHttp::*;
 
+#[path = "winhttp/asynchronous.rs"]
+mod asynchronous;
+use asynchronous::Request;
+
 struct HttpHandle(*mut c_void);
 
 impl HttpHandle {
@@ -39,6 +43,7 @@ pub(super) struct HttpClient {
     connection: Option<Connection>,
     local_session: Option<HttpHandle>,
     remote_session: Option<HttpHandle>,
+    request_slots: std::sync::Arc<asynchronous::Slots>,
 }
 
 impl HttpClient {
@@ -71,7 +76,7 @@ impl HttpClient {
                     },
                     null(),
                     null(),
-                    0,
+                    WINHTTP_FLAG_ASYNC,
                 )
             })?);
         }
@@ -105,7 +110,7 @@ impl HttpClient {
     pub(super) fn post<F: FnMut(&str), C: Fn() -> bool>(
         &mut self,
         settings: &Settings,
-        body: &[u8],
+        body: Vec<u8>,
         streaming: bool,
         should_cancel: &C,
         mut on_progress: F,
@@ -161,38 +166,14 @@ impl HttpClient {
             headers.push_str(&settings.api_key);
             headers.push_str("\r\n");
         }
-        let headers = wide(&headers);
-        let body_length = u32::try_from(body.len()).map_err(|_| "请求内容过长。".to_owned())?;
-        check_cancel(should_cancel)?;
-        set_timeouts(&request, remaining_ms(deadline)?)?;
-        let sent = unsafe {
-            WinHttpSendRequest(
-                request.0,
-                headers.as_ptr(),
-                (headers.len() - 1) as u32,
-                body.as_ptr().cast(),
-                body_length,
-                body_length,
-                0,
-            )
-        };
-        let send_error = (sent == 0).then(network_error);
-        check_cancel(should_cancel)?;
-        if let Some(error) = send_error {
-            return Err(error);
-        }
-        set_timeouts(&request, remaining_ms(deadline)?)?;
-        let received = unsafe { WinHttpReceiveResponse(request.0, null_mut()) };
-        let receive_error = (received == 0).then(network_error);
-        check_cancel(should_cancel)?;
-        if let Some(error) = receive_error {
-            return Err(error);
-        }
+        let request = Request::new(request, wide(&headers), body, self.request_slots.clone())?;
+        request.send(deadline, should_cancel)?;
+        request.receive(deadline, should_cancel)?;
         let mut status = 0_u32;
         let mut status_size = std::mem::size_of::<u32>() as u32;
         let queried = unsafe {
             WinHttpQueryHeaders(
-                request.0,
+                request.raw(),
                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                 null(),
                 (&mut status as *mut u32).cast(),
@@ -210,42 +191,15 @@ impl HttpClient {
             return Err(http_error(status));
         }
         let mut decoder = ResponseDecoder::new(streaming);
-        let mut chunk = [0_u8; 8192];
         loop {
-            check_cancel(should_cancel)?;
-            set_timeouts(&request, remaining_ms(deadline)?)?;
-            // A large synchronous ReadData can wait to fill its requested size.
-            // Query first so each available SSE fragment reaches the UI promptly.
-            let mut available = 0_u32;
-            let queried = unsafe { WinHttpQueryDataAvailable(request.0, &mut available) };
-            let query_error = (queried == 0).then(network_error);
-            check_cancel(should_cancel)?;
-            if let Some(error) = query_error {
-                return Err(error);
-            }
+            let available = request.available(deadline, should_cancel)?;
             if available == 0 {
                 break;
             }
-            set_timeouts(&request, remaining_ms(deadline)?)?;
-            let mut received = 0_u32;
-            let read = unsafe {
-                WinHttpReadData(
-                    request.0,
-                    chunk.as_mut_ptr().cast(),
-                    available.min(chunk.len() as u32),
-                    &mut received,
-                )
-            };
-            let read_error = (read == 0).then(network_error);
-            check_cancel(should_cancel)?;
-            if let Some(error) = read_error {
-                return Err(error);
-            }
-            if received == 0 {
-                break;
-            }
-            decoder.push(&chunk[..received as usize], should_cancel, &mut on_progress)?;
-            if decoder.is_complete() {
+            let received = request.read(available, deadline, should_cancel, |bytes| {
+                decoder.push(bytes, should_cancel, &mut on_progress)
+            })?;
+            if received == 0 || decoder.is_complete() {
                 break;
             }
         }
@@ -259,7 +213,10 @@ fn wide(value: &str) -> Vec<u16> {
 
 fn network_error() -> String {
     // GetLastError is read immediately after its failing WinHTTP call.
-    let code = unsafe { GetLastError() };
+    network_error_code(unsafe { GetLastError() })
+}
+
+fn network_error_code(code: u32) -> String {
     let message = match code {
         ERROR_WINHTTP_TIMEOUT => "网络请求超时，请检查连接或增加超时。",
         ERROR_WINHTTP_NAME_NOT_RESOLVED => "无法解析服务域名，请检查服务地址和网络。",
@@ -488,6 +445,184 @@ mod tests {
             );
         }
         service.join().unwrap();
+    }
+
+    #[test]
+    fn winhttp_cancels_a_request_waiting_for_headers_and_reuses_the_client() {
+        assert_blocked_request_is_cancelled(false);
+    }
+
+    #[test]
+    fn winhttp_cancels_a_stalled_sse_body_and_reuses_the_client() {
+        assert_blocked_request_is_cancelled(true);
+    }
+
+    fn assert_blocked_request_is_cancelled(stalled_body: bool) {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (old_tx, old_rx) = mpsc::channel();
+        let (next_tx, next_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let (slots_tx, slots_rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let service = std::thread::spawn(move || {
+            let mut old = accept(&listener);
+            assert_eq!(
+                read_request(&mut old)["messages"][1]["content"],
+                "old passage"
+            );
+            if stalled_body {
+                old.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n").unwrap();
+                let first = format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"delta":{"content":"old partial"}}]})
+                );
+                chunk(&mut old, first.as_bytes());
+                chunk(&mut old, b": heartbeat\n\n");
+            }
+            started_tx.send(()).unwrap();
+            let blocked = std::thread::spawn(move || {
+                // Deliberately do not finish the old response or close its TCP
+                // socket until both cancellation and the next request returned.
+                let _ = release_rx.recv_timeout(Duration::from_secs(8));
+                drop(old);
+            });
+            let mut next = accept(&listener);
+            assert_eq!(
+                read_request(&mut next)["messages"][1]["content"],
+                "new passage"
+            );
+            let response = serde_json::to_vec(
+                &json!({"choices":[{"message":{"content":"new translation"},"finish_reason":"stop"}]}),
+            )
+            .unwrap();
+            write!(next, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            next.write_all(&response).unwrap();
+            next.flush().unwrap();
+            blocked.join().unwrap();
+        });
+        let worker = std::thread::spawn(move || {
+            let settings = Settings {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                timeout_seconds: 10,
+                ..Settings::default()
+            };
+            let mut client = TranslationClient::new();
+            let old = client.translate_streaming(
+                &settings,
+                "old passage",
+                || worker_cancelled.load(Ordering::Acquire),
+                |text| {
+                    let _ = progress_tx.send(text.to_owned());
+                },
+            );
+            let _ = old_tx.send(old);
+            let next = client.translate_streaming(&settings, "new passage", || false, |_| {});
+            let _ = next_tx.send(next);
+            let _ = finish_rx.recv_timeout(Duration::from_secs(5));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while client.http.request_slots.live() != 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = slots_tx.send(client.http.request_slots.live());
+        });
+        started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        if stalled_body {
+            assert_eq!(
+                progress_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                "old partial"
+            );
+        }
+        // Ensure the worker has actually reached the absent headers/body wait.
+        std::thread::sleep(Duration::from_millis(80));
+        let started = Instant::now();
+        cancelled.store(true, Ordering::Release);
+        let old = old_rx.recv_timeout(Duration::from_secs(2));
+        let cancel_elapsed = started.elapsed();
+        let next = next_rx.recv_timeout(Duration::from_secs(2));
+        // Opening the gate only here means a passing test cannot depend on the
+        // abandoned server becoming responsive or its configured ten-second timeout.
+        let _ = release_tx.send(());
+        service.join().unwrap();
+        let _ = finish_tx.send(());
+        worker.join().unwrap();
+        assert_eq!(slots_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        let error = old
+            .expect("blocked request did not cancel promptly")
+            .unwrap_err();
+        assert!(crate::translation::is_cancelled_error(&error), "{error}");
+        assert!(
+            cancel_elapsed < Duration::from_secs(2),
+            "{cancel_elapsed:?}"
+        );
+        assert_eq!(next.unwrap().unwrap(), "new translation");
+        eprintln!("cancelled stalled_body={stalled_body} in {cancel_elapsed:?}; subsequent translation completed while the old server was held");
+    }
+
+    #[test]
+    fn winhttp_enforces_the_whole_request_deadline_while_server_is_held() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = mpsc::channel();
+        let service = std::thread::spawn(move || {
+            let mut socket = accept(&listener);
+            read_request(&mut socket);
+            // Never send even the response headers until the client has returned.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(socket);
+        });
+        let settings = Settings {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            timeout_seconds: 1,
+            ..Settings::default()
+        };
+        let started = Instant::now();
+        let result =
+            TranslationClient::new().translate_streaming(&settings, "a passage", || false, |_| {});
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        service.join().unwrap();
+        assert!(result.unwrap_err().contains("超时"));
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[test]
+    fn winhttp_async_error_and_http_errors_close_requests_without_echoing_bodies() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = std::thread::spawn(move || {
+            let mut socket = accept(&listener);
+            read_request(&mut socket);
+            let body = "fixed-reflected-secret-placeholder";
+            write!(socket, "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            socket.flush().unwrap();
+        });
+        let settings = Settings {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            timeout_seconds: 2,
+            ..Settings::default()
+        };
+        let error = TranslationClient::new()
+            .translate_streaming(&settings, "a passage", || false, |_| {})
+            .unwrap_err();
+        service.join().unwrap();
+        assert!(error.contains("401"));
+        assert!(!error.contains("fixed-reflected-secret-placeholder"));
+
+        // The listener is gone, so SendRequest completes asynchronously with a
+        // connection error. That failure must still close and quiesce callbacks.
+        let error = TranslationClient::new()
+            .translate_streaming(&settings, "a passage", || false, |_| {})
+            .unwrap_err();
+        assert!(error.contains("WinHTTP") || error.contains("超时"));
     }
 
     #[test]

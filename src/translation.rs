@@ -35,8 +35,9 @@ pub struct ConversationContext<'a> {
 }
 
 /// A worker-owned client. Its WinHTTP session and connection survive requests.
-/// Cancellation is checked around blocking calls; it cannot interrupt a call
-/// already waiting in synchronous WinHTTP. No handle is closed from another thread.
+/// Asynchronous WinHTTP operations are awaited on the worker with bounded
+/// cancellation checks. Only the worker closes its request; a callback-owned
+/// reference retains buffers through WinHTTP's final HANDLE_CLOSING notification.
 #[derive(Default)]
 pub struct TranslationClient {
     #[cfg(windows)]
@@ -67,7 +68,7 @@ impl TranslationClient {
         #[cfg(windows)]
         {
             self.http
-                .post(settings, &body, true, &should_cancel, on_progress)
+                .post(settings, body, true, &should_cancel, on_progress)
         }
         #[cfg(not(windows))]
         {
@@ -98,7 +99,7 @@ impl TranslationClient {
         #[cfg(windows)]
         {
             self.http
-                .post(settings, &body, true, &should_cancel, on_progress)
+                .post(settings, body, true, &should_cancel, on_progress)
         }
         #[cfg(not(windows))]
         {
@@ -113,7 +114,7 @@ impl TranslationClient {
         let body = build_request(settings, text, false)?;
         #[cfg(windows)]
         {
-            self.http.post(settings, &body, false, &|| false, |_| {})
+            self.http.post(settings, body, false, &|| false, |_| {})
         }
         #[cfg(not(windows))]
         {

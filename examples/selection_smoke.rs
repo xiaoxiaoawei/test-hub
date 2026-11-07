@@ -46,8 +46,8 @@ mod windows {
         },
         UI::{
             Input::KeyboardAndMouse::{
-                IsWindowEnabled, SendInput, SetFocus, INPUT, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
-                MOUSEEVENTF_LEFTUP,
+                IsWindowEnabled, SendInput, SetFocus, INPUT, INPUT_KEYBOARD, INPUT_MOUSE,
+                KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_ESCAPE,
             },
             WindowsAndMessaging::*,
         },
@@ -61,9 +61,18 @@ mod windows {
     const EM_SETSEL: u32 = 0xB1;
     const EM_POSFROMCHAR: u32 = 0xD6;
     const SELECTION: u32 = WM_APP + 3;
-    const SOURCE_TEXT: &str = "warm light.\r\nwarm light. calm.";
+    const SOURCE_TEXT: &str = "warm light.\r\nwarm light. calm. scroll wait retry manual.";
     const QUESTION: i32 = 260;
     const ASK: i32 = 261;
+    const ACTION: i32 = 262;
+    const PIN: i32 = 263;
+    const PAUSE: usize = 264;
+    const EM_GETFIRSTVISIBLELINE: u32 = 0xCE;
+    const EM_LINESCROLL: u32 = 0xB6;
+
+    mod question_actions {
+        include!("support/selection_questions_070.rs");
+    }
     const QUESTION_ONE: &str = "What does this word mean?";
     const QUESTION_TWO: &str = "Give a short example.";
     const QUESTION_OLD: &str = "Hold this old answer.";
@@ -150,7 +159,7 @@ mod windows {
         require_same_inline(&app, inline)?;
         require_visible(inline)?;
         require_pending(inline)?;
-        mock.finish_warm.store(true, Ordering::Release);
+        let switch_started = Instant::now();
         // Warm deliberately sends another fragment after light has been selected.
         // No subsequent snapshot may display that superseded translation.
         wait_for("the second streamed selection", || {
@@ -163,6 +172,17 @@ mod windows {
             }
             Ok(translated == "新")
         })?;
+        if switch_started.elapsed() >= Duration::from_secs(3) {
+            return Err(
+                "The next selection waited too long for a blocked old HTTP response.".into(),
+            );
+        }
+        // The server has not released the old body: progressing light first
+        // proves transport cancellation, rather than just hiding old output.
+        if mock.finish_warm.load(Ordering::Acquire) {
+            return Err("The blocked previous translation was released too early.".into());
+        }
+        mock.finish_warm.store(true, Ordering::Release);
         if bounds(inline)? == first {
             return Err("The compact window did not follow the new selection position.".into());
         }
@@ -196,18 +216,22 @@ mod windows {
         mock.require_requests(&["warm", "light"])?;
 
         check_questions(&source, &app, background, inline, &mock)?;
+        question_actions::check(inline, &mock)?;
+        check_controls(&source, &app, background, inline, &mock)?;
+        let expected = all_requests();
 
         // Both an empty selection and a password selection must remain local.
         source.gesture(background, false, 4, 4)?;
         thread::sleep(Duration::from_millis(2400));
-        mock.require_requests(ALL_REQUESTS)?;
+        mock.require_requests(&expected)?;
         source.gesture(background, true, 0, 5)?;
         thread::sleep(Duration::from_millis(2400));
-        mock.require_requests(ALL_REQUESTS)?;
+        mock.require_requests(&expected)?;
         app.stop()?;
         println!("Selection controller passed: one compact HWND, updated positions, stale-progress isolation, in-flight/cache deduplication, and no requests for empty/password selections.");
         println!("Questions passed: current source/translation reference data, two-turn history, independent translation while an old answer is blocked, and a fresh conversation after reselection.");
-        println!("Seven local mock POSTs (three translations and four questions); no real API credential or remote service was used. Mouse-hook and keyboard behavior require separate actual-input checks.");
+        println!("Controls passed: blocked-request cancellation, forced retranslation, failure retry, pin across foreground changes, session pause with manual capture, and preserving text selection/scroll during streaming.");
+        println!("{} local mock POSTs; no real API credential or remote service was used. Mouse-hook and keyboard behavior require separate actual-input checks.", expected.len());
         Ok(())
     }
 
@@ -254,7 +278,6 @@ mod windows {
             return Err("Reselection did not clear the question input.".into());
         }
 
-        mock.finish_answer.store(true, Ordering::Release);
         let observe = Instant::now();
         while observe.elapsed() < Duration::from_millis(350) {
             if text(inline, 251)? != "静译文" {
@@ -262,6 +285,7 @@ mod windows {
             }
             thread::sleep(Duration::from_millis(10));
         }
+        let restarted = Instant::now();
         ask(inline, QUESTION_NEW)?;
         let fresh = format!("静译文\n\n你：{QUESTION_NEW}\n轻译：{ANSWER_NEW}");
         wait_for(
@@ -279,6 +303,12 @@ mod windows {
             },
         )
         .map_err(|error| question_failure(error, mock, inline))?;
+        if restarted.elapsed() >= Duration::from_secs(3)
+            || mock.finish_answer.load(Ordering::Acquire)
+        {
+            return Err("A fresh question waited for the cancelled previous HTTP body.".into());
+        }
+        mock.finish_answer.store(true, Ordering::Release);
         mock.require_requests(ALL_REQUESTS)
     }
 
@@ -294,6 +324,218 @@ mod windows {
             text(inline, 251),
             text(inline, 254),
         )
+    }
+
+    const CONTROL_REQUESTS: &[&str] = &[
+        "wait:blocked",
+        "wait:retry",
+        "wait:retry",
+        "retry:failed",
+        "retry:success",
+        "manual",
+        "scroll",
+    ];
+
+    fn all_requests() -> Vec<&'static str> {
+        ALL_REQUESTS
+            .iter()
+            .chain(question_actions::REQUESTS.iter())
+            .chain(CONTROL_REQUESTS.iter())
+            .copied()
+            .collect()
+    }
+
+    fn select_word(source: &Source, background: HWND, word: &str) -> Result<(), String> {
+        let start = SOURCE_TEXT
+            .find(word)
+            .ok_or("The public test word is missing.")?;
+        source.gesture(background, false, start, start + word.len())
+    }
+
+    // Queue the same notification as a native click, so this controller check
+    // cannot synchronously reenter a still-running WM_WORK paint callback.
+    fn press_button(parent: HWND, id: i32) -> Result<(), String> {
+        let button = unsafe { GetDlgItem(parent, id) };
+        if button.is_null()
+            || unsafe { IsWindowVisible(button) } == 0
+            || unsafe { IsWindowEnabled(button) } == 0
+        {
+            return Err(format!("The action button {id} is not available."));
+        }
+        if unsafe { PostMessageW(parent, WM_COMMAND, id as usize, button as isize) } == 0 {
+            return Err("Cannot queue an owned native button action.".into());
+        }
+        Ok(())
+    }
+
+    fn check_controls(
+        source: &Source,
+        app: &Application,
+        background: HWND,
+        inline: HWND,
+        mock: &Mock,
+    ) -> Result<(), String> {
+        select_word(source, background, "wait")?;
+        wait_for("a blocked translation with a partial response", || {
+            Ok(text(inline, 251)? == "等待")
+        })?;
+        press_button(inline, ACTION)?;
+        wait_for("stopping the current translation", || {
+            Ok(text(inline, 254)?.contains("停止") && !text(inline, ACTION)?.contains("停止"))
+        })?;
+        if !text(inline, 251)?.contains("等待") {
+            return Err("Stopping translation discarded its visible partial text.".into());
+        }
+        let retry_started = Instant::now();
+        press_button(inline, ACTION)?;
+        wait_for("retry after cancelling a blocked response", || {
+            Ok(text(inline, 251)? == "重新完成" && text(inline, 254)?.contains("完成"))
+        })?;
+        if retry_started.elapsed() >= Duration::from_secs(3)
+            || mock.finish_control.load(Ordering::Acquire)
+        {
+            return Err("Retry waited for a cancelled body to finish.".into());
+        }
+        let before = mock.request_count()?;
+        press_button(inline, ACTION)?;
+        wait_for(
+            "explicit retranslation bypassing a successful cached value",
+            || {
+                Ok(mock.request_count()? == before + 1
+                    && text(inline, 251)? == "重新完成"
+                    && text(inline, 254)?.contains("完成"))
+            },
+        )?;
+
+        // Pin only keeps the bubble visible. It must not freeze its text or
+        // prevent the next genuine selection from moving/updating the same HWND.
+        let before_pin = bounds(inline)?;
+        let pin_label = text(inline, PIN)?;
+        press_button(inline, PIN)?;
+        wait_for("the pinned window action", || {
+            Ok(text(inline, PIN)? != pin_label)
+        })?;
+        let other = Source::start()?;
+        other.focus(false)?;
+        thread::sleep(Duration::from_millis(500));
+        require_visible(inline)?;
+        if text(inline, 251)? != "重新完成" {
+            return Err(
+                "Pinning did not preserve the current translation on foreground change.".into(),
+            );
+        }
+        select_word(source, background, "retry")?;
+        wait_for("an HTTP failure on the new pinned selection", || {
+            Ok(text(inline, 254)?.contains("失败"))
+        })?;
+        require_same_inline(app, inline)?;
+        require_visible(inline)?;
+        if bounds(inline)? == before_pin {
+            return Err("Pinning incorrectly froze the next selection's position.".into());
+        }
+        press_button(inline, ACTION)?;
+        wait_for("retrying an HTTP failure", || {
+            Ok(text(inline, 251)? == "重试成功" && text(inline, 254)?.contains("完成"))
+        })?;
+
+        let before_pause = mock.request_count()?;
+        send(background, WM_COMMAND, PAUSE, 0)?;
+        select_word(source, background, "manual")?;
+        thread::sleep(Duration::from_millis(650));
+        if mock.request_count()? != before_pause || text(inline, 251)? != "重试成功" {
+            return Err(
+                "A paused automatic gesture sent text or replaced the pinned translation.".into(),
+            );
+        }
+        // An explicit clipboard action remains available during session pause.
+        // The source and clipboard contain fixed public fixture text only.
+        send(source.edit as HWND, WM_COPY, 0, 0)?;
+        send(background, WM_COMMAND, 101, 0)?;
+        let detail = app.window("轻译 · 翻译与提问")?;
+        wait_for(
+            "manual clipboard translation while automatic capture is paused",
+            || Ok(text(detail, 224)? == "手动译文" && text(detail, 225)?.contains("完成")),
+        )?;
+        if mock.request_count()? != before_pause + 1 {
+            return Err("Manual capture during pause did not send exactly one request.".into());
+        }
+        send(background, WM_COMMAND, PAUSE, 0)?;
+
+        select_word(source, background, "scroll")?;
+        wait_for("a long partial translation", || {
+            Ok(text(inline, 251)?.contains("line-079"))
+        })?;
+        let editor = unsafe { GetDlgItem(inline, 251) };
+        if send(editor, EM_GETFIRSTVISIBLELINE, 0, 0)? == 0 {
+            return Err("A fresh long stream did not initially follow its latest output.".into());
+        }
+        focus_question(inline)?;
+        send(editor, EM_SETSEL, 0, 6)?;
+        send(editor, EM_LINESCROLL, 0, -10_000)?;
+        if send(editor, EM_GETFIRSTVISIBLELINE, 0, 0)? != 0 {
+            return Err("Cannot scroll the owned long translation to its start.".into());
+        }
+        // Complete the stream while the native menu is pumping messages. Closing
+        // the menu must drain the queued event, even if its first WM_WORK was
+        // delivered during App's mutable menu borrow.
+        if unsafe { PostMessageW(inline, WM_CONTEXTMENU, editor as usize, -1) } == 0 {
+            return Err("Cannot request the owned translation context menu.".into());
+        }
+        wait_for("the native translation context menu", || {
+            Ok(owned_menu_visible(app.child.id()))
+        })?;
+        mock.finish_control.store(true, Ordering::Release);
+        thread::sleep(Duration::from_millis(250));
+        let mut keys: [INPUT; 2] = unsafe { zeroed() };
+        for (index, key) in keys.iter_mut().enumerate() {
+            key.r#type = INPUT_KEYBOARD;
+            key.Anonymous.ki.wVk = VK_ESCAPE;
+            key.Anonymous.ki.dwFlags = if index == 0 { 0 } else { KEYEVENTF_KEYUP };
+        }
+        if unsafe { SendInput(2, keys.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
+            return Err("Cannot close the owned context menu with Escape.".into());
+        }
+        wait_for("closing the native translation menu", || {
+            Ok(!owned_menu_visible(app.child.id()))
+        })?;
+        wait_for(
+            "completion without stealing the user's scroll position",
+            || Ok(text(inline, 251)?.ends_with("尾行结束") && text(inline, 254)?.contains("完成")),
+        )?;
+        let selected = send(editor, EM_GETSEL, 0, 0)?;
+        if selected & 0xffff != 0
+            || (selected >> 16) & 0xffff != 6
+            || send(editor, EM_GETFIRSTVISIBLELINE, 0, 0)? != 0
+        {
+            return Err(
+                "Streaming output moved the user's text selection or scroll position.".into(),
+            );
+        }
+        if text(inline, 251)?.contains("过时片段")
+            || text(inline, 251)?.contains(question_actions::LATE_ANSWER)
+        {
+            return Err("A cancelled response became visible after its server gate opened.".into());
+        }
+        mock.require_requests(&all_requests())
+    }
+
+    fn owned_menu_visible(pid: u32) -> bool {
+        unsafe {
+            let mut window = GetTopWindow(null_mut());
+            while !window.is_null() {
+                let mut owner = 0;
+                GetWindowThreadProcessId(window, &mut owner);
+                if owner == pid && IsWindowVisible(window) != 0 {
+                    let mut class = [0_u16; 64];
+                    let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32);
+                    if String::from_utf16_lossy(&class[..length.max(0) as usize]) == "#32768" {
+                        return true;
+                    }
+                }
+                window = GetWindow(window, GW_HWNDNEXT);
+            }
+        }
+        false
     }
 
     fn ask(parent: HWND, question: &str) -> Result<(), String> {
@@ -317,6 +559,21 @@ mod windows {
                 text(parent, 254),
             )
         })?;
+        focus_question(parent)?;
+        let question = wide(question);
+        send(input, WM_SETTEXT, 0, question.as_ptr() as isize)?;
+        send(submit, BM_CLICK, 0, 0)?;
+        if !text(parent, QUESTION)?.is_empty() {
+            return Err("Submitting a question did not clear the input.".into());
+        }
+        Ok(())
+    }
+
+    fn focus_question(parent: HWND) -> Result<(), String> {
+        let input = unsafe { GetDlgItem(parent, QUESTION) };
+        if input.is_null() {
+            return Err("The owned question editor is missing.".into());
+        }
         // A compact translation first appears without activation. A real user
         // clicks its editor before typing; merely BM_CLICK-ing an inactive
         // button bypasses WM_MOUSEACTIVATE and is not that interaction.
@@ -347,12 +604,6 @@ mod windows {
                 } != 0
                 && info.hwndFocus == input)
         })?;
-        let question = wide(question);
-        send(input, WM_SETTEXT, 0, question.as_ptr() as isize)?;
-        send(submit, BM_CLICK, 0, 0)?;
-        if !text(parent, QUESTION)?.is_empty() {
-            return Err("Submitting a question did not clear the input.".into());
-        }
         Ok(())
     }
 
@@ -488,20 +739,7 @@ mod windows {
             end: usize,
         ) -> Result<(), String> {
             let edit = if password { self.password } else { self.edit } as HWND;
-            let mut queue: MSG = unsafe { zeroed() };
-            unsafe { PeekMessageW(&mut queue, null_mut(), 0, 0, PM_NOREMOVE) };
-            let caller = unsafe { GetCurrentThreadId() };
-            if unsafe { AttachThreadInput(caller, self.thread, 1) } == 0 {
-                return Err("Cannot attach to the owned source input queue.".into());
-            }
-            unsafe {
-                SetForegroundWindow(self.window as HWND);
-                SetFocus(edit);
-                AttachThreadInput(caller, self.thread, 0);
-            }
-            if unsafe { GetForegroundWindow() } != self.window as HWND {
-                return Err("Cannot foreground the owned selection source.".into());
-            }
+            self.focus(password)?;
             send(edit, EM_SETSEL, start, end as isize)?;
             let mut selected_start = 0_u32;
             let mut selected_end = 0_u32;
@@ -522,6 +760,24 @@ mod windows {
             send(app, SELECTION, packed_down as usize, isize::MIN)?;
             let packed_up = u64::from(up.x as u32) | (u64::from(end > start) << 32);
             send(app, SELECTION, packed_up as usize, up.y as isize)?;
+            Ok(())
+        }
+        fn focus(&self, password: bool) -> Result<(), String> {
+            let edit = if password { self.password } else { self.edit } as HWND;
+            let mut queue: MSG = unsafe { zeroed() };
+            unsafe { PeekMessageW(&mut queue, null_mut(), 0, 0, PM_NOREMOVE) };
+            let caller = unsafe { GetCurrentThreadId() };
+            if unsafe { AttachThreadInput(caller, self.thread, 1) } == 0 {
+                return Err("Cannot attach to the owned source input queue.".into());
+            }
+            unsafe {
+                SetForegroundWindow(self.window as HWND);
+                SetFocus(edit);
+                AttachThreadInput(caller, self.thread, 0);
+            }
+            if unsafe { GetForegroundWindow() } != self.window as HWND {
+                return Err("Cannot foreground the owned selection source.".into());
+            }
             Ok(())
         }
         fn diagnostics(&self) -> String {
@@ -563,7 +819,10 @@ mod windows {
             lpszClassName: name.as_ptr(),
             ..zeroed()
         };
-        if RegisterClassW(&class) == 0 {
+        if RegisterClassW(&class) == 0
+            && windows_sys::Win32::Foundation::GetLastError()
+                != windows_sys::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS
+        {
             return Err(());
         }
         let window = CreateWindowExW(
@@ -658,6 +917,7 @@ mod windows {
         finish_warm: Arc<AtomicBool>,
         finish_light: Arc<AtomicBool>,
         finish_answer: Arc<AtomicBool>,
+        finish_control: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
     }
@@ -677,6 +937,7 @@ mod windows {
             let finish_warm = Arc::new(AtomicBool::new(false));
             let finish_light = Arc::new(AtomicBool::new(false));
             let finish_answer = Arc::new(AtomicBool::new(false));
+            let finish_control = Arc::new(AtomicBool::new(false));
             let stop = Arc::new(AtomicBool::new(false));
             let state = (
                 requests.clone(),
@@ -684,10 +945,19 @@ mod windows {
                 finish_warm.clone(),
                 finish_light.clone(),
                 finish_answer.clone(),
+                finish_control.clone(),
                 stop.clone(),
             );
             let worker = thread::spawn(move || {
-                let (requests, error, finish_warm, finish_light, finish_answer, stop) = state;
+                let (
+                    requests,
+                    error,
+                    finish_warm,
+                    finish_light,
+                    finish_answer,
+                    finish_control,
+                    stop,
+                ) = state;
                 let mut handlers = Vec::new();
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -698,12 +968,14 @@ mod windows {
                                 finish_warm.clone(),
                                 finish_light.clone(),
                                 finish_answer.clone(),
+                                finish_control.clone(),
                                 stop.clone(),
                             );
                             handlers.push(thread::spawn(move || {
-                                if let Err(problem) =
-                                    serve(stream, &state.0, &state.2, &state.3, &state.4, &state.5)
-                                {
+                                if let Err(problem) = serve(
+                                    stream, &state.0, &state.2, &state.3, &state.4, &state.5,
+                                    &state.6,
+                                ) {
                                     *state.1.lock().unwrap_or_else(|poison| poison.into_inner()) =
                                         Some(problem);
                                 }
@@ -726,6 +998,7 @@ mod windows {
                 finish_warm,
                 finish_light,
                 finish_answer,
+                finish_control,
                 stop,
                 worker: Some(worker),
             })
@@ -752,6 +1025,21 @@ mod windows {
             }
             Ok(())
         }
+        fn request_count(&self) -> Result<usize, String> {
+            if self
+                .error
+                .lock()
+                .map_err(|_| "Mock error lock failed.")?
+                .is_some()
+            {
+                return Err(self.diagnostics());
+            }
+            Ok(self
+                .requests
+                .lock()
+                .map_err(|_| "Mock request lock failed.")?
+                .len())
+        }
         fn diagnostics(&self) -> String {
             let requests = self
                 .requests
@@ -770,6 +1058,7 @@ mod windows {
             self.finish_warm.store(true, Ordering::Release);
             self.finish_light.store(true, Ordering::Release);
             self.finish_answer.store(true, Ordering::Release);
+            self.finish_control.store(true, Ordering::Release);
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
@@ -781,6 +1070,7 @@ mod windows {
         warm: &AtomicBool,
         light: &AtomicBool,
         answer: &AtomicBool,
+        control: &AtomicBool,
         stop: &AtomicBool,
     ) -> Result<(), String> {
         stream
@@ -838,6 +1128,21 @@ mod windows {
         if body["model"] != "selection-smoke-model" || body["stream"] != true {
             return Err("Unexpected local selection request.".into());
         }
+        if question_actions::try_serve(&body, &mut stream, requests, control, stop)? {
+            return Ok(());
+        }
+        if matches!(source, "wait" | "retry" | "manual" | "scroll") {
+            if body["messages"].as_array().map(Vec::len) != Some(2)
+                || body["messages"][0]["role"] != "system"
+                || body["messages"][1]["role"] != "user"
+                || !body["messages"][0]["content"].as_str().is_some_and(|system| {
+                    system.starts_with("Detect the source language and translate the user message to Japanese.")
+                })
+            {
+                return Err("Unexpected controller-test translation request.".into());
+            }
+            return serve_control(&mut stream, source, requests, control, stop);
+        }
         let (label, first, last, gate) = match source {
             "warm" => ("warm", "旧", "译文", Some(warm)),
             "light" => ("light", "新", "译文", Some(light)),
@@ -884,6 +1189,73 @@ mod windows {
         // Disconnects are expected when the controller cancels an old generation.
         let _ =
             write_chunk(&mut stream, tail.as_bytes()).and_then(|_| stream.write_all(b"0\r\n\r\n"));
+        Ok(())
+    }
+
+    fn serve_control(
+        stream: &mut TcpStream,
+        source: &str,
+        requests: &Mutex<Vec<String>>,
+        control: &AtomicBool,
+        stop: &AtomicBool,
+    ) -> Result<(), String> {
+        let (label, first, last, blocked, failure) = {
+            let requests = requests.lock().map_err(|_| "Mock request lock failed.")?;
+            match source {
+                "wait" if !requests.iter().any(|request| request.starts_with("wait:")) => {
+                    ("wait:blocked", "等待".into(), "过时片段", true, false)
+                }
+                "wait" => ("wait:retry", "重新".into(), "完成", false, false),
+                "retry" if !requests.iter().any(|request| request.starts_with("retry:")) => {
+                    ("retry:failed", String::new(), "", false, true)
+                }
+                "retry" => ("retry:success", "重试".into(), "成功", false, false),
+                "manual" => ("manual", "手动".into(), "译文", false, false),
+                "scroll" => (
+                    "scroll",
+                    (0..80)
+                        .map(|line| format!("line-{line:03}: public test text\n"))
+                        .collect(),
+                    "尾行结束",
+                    true,
+                    false,
+                ),
+                _ => return Err("Unexpected controller fixture source.".into()),
+            }
+        };
+        requests
+            .lock()
+            .map_err(|_| "Mock request lock failed.")?
+            .push(label.into());
+        if failure {
+            return stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .map_err(|_| "Cannot write the fixture's HTTP failure.".into());
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            .map_err(|_| "Cannot write controller fixture headers.".to_string())?;
+        let event = format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":first}}]})
+        );
+        if write_chunk(stream, event.as_bytes())
+            .and_then(|_| write_chunk(stream, b": heartbeat\n\n"))
+            .is_err()
+        {
+            return Ok(());
+        }
+        let started = Instant::now();
+        while blocked
+            && !control.load(Ordering::Acquire)
+            && !stop.load(Ordering::Acquire)
+            && started.elapsed() < Duration::from_secs(20)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let event = format!("data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"content":last}}]}));
+        // A cancelled client is expected to close its socket before this tail.
+        let _ = write_chunk(stream, event.as_bytes()).and_then(|_| stream.write_all(b"0\r\n\r\n"));
         Ok(())
     }
 

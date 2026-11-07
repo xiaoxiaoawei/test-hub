@@ -68,10 +68,10 @@ impl Release {
     fn validate(&self) -> Result<Version, String> {
         let version = Version::parse(&self.version)?;
         validate_digest_and_size(&self.sha256, self.size)?;
-        if self.download_url
-            != format!(
-                "{REPOSITORY}/releases/download/v{version}/lingoleaf-{version}-windows-x64.exe"
-            )
+        let release_path = format!("{REPOSITORY}/releases/download/v{version}");
+        let legacy_asset = format!("{release_path}/lingoleaf-{version}-windows-x64.exe");
+        let stable_asset = format!("{release_path}/lingoleaf.exe");
+        if (self.download_url != legacy_asset && self.download_url != stable_asset)
             || self.notes_url != format!("{REPOSITORY}/releases/tag/v{version}")
         {
             return Err(invalid_manifest());
@@ -327,6 +327,38 @@ mod tests {
         }
         assert!(parse_manifest(&vec![b' '; MAX_MANIFEST_BYTES + 1], "0.4.2").is_err());
         assert!(parse_manifest(br#"{"schema_version":1,"schema_version":1}"#, "0.4.2").is_err());
+    }
+
+    #[test]
+    fn stable_and_legacy_asset_names_are_bound_to_the_exact_repository_and_version() {
+        let mut body = manifest("0.7.0");
+        let stable = format!("{REPOSITORY}/releases/download/v0.7.0/lingoleaf.exe");
+        body["download_url"] = serde_json::json!(stable);
+        assert!(matches!(
+            parse_manifest(&serde_json::to_vec(&body).unwrap(), "0.6.0"),
+            Ok(CheckResult::Available(_))
+        ));
+        for url in [
+            stable.replace("v0.7.0/", "v0.7.1/"),
+            format!("{stable}?download=1"),
+            format!("{stable}#fragment"),
+            stable.replace("lingoleaf.exe", "LingoLeaf.exe"),
+            stable.replace("lingoleaf.exe", "../lingoleaf.exe"),
+            stable.replace("lingoleaf.exe", "%6cingoleaf.exe"),
+            stable.replace("github.com/", "github.com.evil.invalid/"),
+            stable.replace("/test-hub/", "/other/"),
+        ] {
+            body["download_url"] = serde_json::json!(url);
+            assert!(
+                parse_manifest(&serde_json::to_vec(&body).unwrap(), "0.6.0").is_err(),
+                "{url}"
+            );
+        }
+        let legacy = manifest("0.7.0");
+        assert!(matches!(
+            parse_manifest(&serde_json::to_vec(&legacy).unwrap(), "0.6.0"),
+            Ok(CheckResult::Available(_))
+        ));
     }
 
     #[test]

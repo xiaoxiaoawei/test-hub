@@ -41,7 +41,17 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
       - name: Run native selection diagnostics
-        run: cargo run --locked --example diagnostics_smoke -- target/release/lingoleaf.exe
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $diagnosticOutput = (& cargo run --locked --example diagnostics_smoke -- target/release/lingoleaf.exe 2>&1 | Out-String)
+          $diagnosticExit = $LASTEXITCODE
+          Write-Output $diagnosticOutput
+          if ($diagnosticExit -ne 0) {
+            $annotation = $diagnosticOutput.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Native selection diagnostic failure::$annotation"
+            throw "Native selection diagnostics failed with exit $diagnosticExit"
+          }
       - name: Verify embedded executable version
         shell: pwsh
         run: |

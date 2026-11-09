@@ -570,6 +570,12 @@ unsafe fn run_inner() -> Result<(), String> {
                 } else if GetForegroundWindow() as isize != job.foreground {
                     Err("前台窗口已改变，请重新选择文字。".into())
                 } else if job.kind == CaptureKind::Auto {
+                    if !job.compatibility {
+                        diagnostics::record(
+                            DiagStage::CompatibilityEligibility,
+                            DiagOutcome::Skipped,
+                        );
+                    }
                     let result = selection::capture_selection_for_gesture(job.origin, job.point);
                     if job.compatibility
                         && !cancelled()
@@ -1760,6 +1766,14 @@ unsafe extern "system" fn window_proc(
                     };
                     app.auto_pressed = false;
                     app.auto_strong = mouse::is_selection_gesture(wparam);
+                    diagnostics::record(
+                        DiagStage::AppUp,
+                        if app.auto_strong {
+                            DiagOutcome::StrongGesture
+                        } else {
+                            DiagOutcome::PlainClick
+                        },
+                    );
                     app.auto_foreground = foreground as isize;
                     app.auto_started = Some(Instant::now());
                     app.auto_attempt = 0;

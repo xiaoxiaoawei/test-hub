@@ -372,10 +372,19 @@ impl Drop for HookHandle {
     }
 }
 
-unsafe fn current_mouse() -> Option<MouseState> {
+unsafe fn current_mouse(cursor_unavailable: &mut bool) -> Option<MouseState> {
     let mut point = zeroed();
     if unsafe { GetCursorPos(&mut point) } == 0 {
+        let error = unsafe { GetLastError() };
+        if !*cursor_unavailable {
+            diagnostics::record_error(Stage::HookHealth, Outcome::Unavailable, error);
+        }
+        *cursor_unavailable = true;
         return None;
+    }
+    if *cursor_unavailable {
+        diagnostics::record(Stage::HookHealth, Outcome::Succeeded);
+        *cursor_unavailable = false;
     }
     Some(MouseState {
         point: (point.x, point.y),
@@ -402,7 +411,8 @@ fn run_hook(
         if control.closed.load(Ordering::Acquire) {
             return;
         }
-        let initial = current_mouse().unwrap_or(MouseState {
+        let mut cursor_unavailable = false;
+        let initial = current_mouse(&mut cursor_unavailable).unwrap_or(MouseState {
             point: (0, 0),
             button_down: false,
         });
@@ -447,7 +457,7 @@ fn run_hook(
                     #[cfg(test)]
                     control.timer_ticks.fetch_add(1, Ordering::Release);
                     let now = Instant::now();
-                    if let Some(actual) = current_mouse() {
+                    if let Some(actual) = current_mouse(&mut cursor_unavailable) {
                         let rebind = CONTEXT.with(|slot| {
                             let mut slot = slot.borrow_mut();
                             let Some(context) = slot.as_mut() else {

@@ -68,6 +68,7 @@ mod windows {
     const REPORT: i32 = 321;
 
     pub(super) fn run() -> Result<(), String> {
+        checkpoint("Bootstrap");
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         let executable = std::env::args_os()
             .nth(1)
@@ -111,148 +112,184 @@ mod windows {
             icon_color: 0xC05A96,
             ..Settings::default()
         })?;
+        checkpoint("Source.Create");
         let source = Source::start()?;
+        checkpoint("Source.ClipboardSeed");
         source.clipboard_seed()?;
+        checkpoint("App.Launch");
         let mut app = Application::start(&executable, &directory)?;
-        let background = app.window(BACKGROUND)?;
-        let settings = app.window("轻译 · 设置")?;
-        wait_for("startup settings", || {
-            Ok(unsafe { IsWindowVisible(settings) } != 0)
-        })?;
-        send(settings, WM_CLOSE, 0, 0)?;
-        let diagnostic = app.window(DIAGNOSTICS)?;
-        if unsafe { IsWindowVisible(diagnostic) } != 0 {
-            return Err("The diagnostic window opened without an explicit command.".into());
-        }
-        send(background, WM_COMMAND, 320, 0)?;
-        visible(diagnostic)?;
-        let initial = report(diagnostic)?;
-        states(&initial, false, false, false)?;
-        privacy(&initial, &base)?;
-        if clipboard()? != CLIPBOARD_SEED {
-            return Err("Opening diagnostics changed the clipboard.".into());
-        }
-        click(diagnostic, 322)?;
-        states(&report(diagnostic)?, false, false, false)?;
-        if clipboard()? != CLIPBOARD_SEED {
-            return Err("Refreshing diagnostics changed the clipboard.".into());
-        }
-        copy_report(diagnostic, &base)?;
-        check_display(&app, diagnostic, &mock)?;
-        states(&report(diagnostic)?, false, false, false)?;
-        // This is the sole action allowed to change disabled automatic state.
-        click(diagnostic, 325)?;
-        wait_for("first explicit resume hook reinstall", || {
-            let value = report(diagnostic)?;
-            Ok(value.contains("自动划词：是")
-                && value.contains("监听开关：是")
-                && counter(&value, "HookInstallSuccess")?
-                    > counter(&initial, "HookInstallSuccess")?)
-        })?;
-        if !config::load()?.selection_button {
-            return Err("Resume did not persist the automatic switch.".into());
-        }
-
-        send(background, WM_COMMAND, 264, 0)?;
-        send(background, WM_COMMAND, 315, 0)?;
-        let detail = app.window("轻译 · 翻译与提问")?;
-        let draft = wide(DRAFT);
-        send(
-            unsafe { GetDlgItem(detail, 222) },
-            WM_SETTEXT,
-            0,
-            draft.as_ptr() as isize,
-        )?;
-        send(background, WM_COMMAND, 320, 0)?;
-        let paused = report(diagnostic)?;
-        states(&paused, true, true, true)?;
-        click(diagnostic, 322)?;
-        copy_report(diagnostic, &base)?;
-        states(&report(diagnostic)?, true, true, true)?;
-        check_display(&app, diagnostic, &mock)?;
-        states(&report(diagnostic)?, true, true, true)?;
-        if text(detail, 222)? != DRAFT {
-            return Err("Diagnostics replaced the manual draft.".into());
-        }
-        click(diagnostic, 325)?;
-        wait_for(
-            "explicit resume clearing pause/manual and reinstalling hook",
-            || {
+        let mut phase = "App.StartWindows";
+        let result = (|| -> Result<(), String> {
+            checkpoint(phase);
+            let background = app.window(BACKGROUND)?;
+            let settings = app.window("轻译 · 设置")?;
+            wait_for("startup settings", || {
+                Ok(unsafe { IsWindowVisible(settings) } != 0)
+            })?;
+            window_facts("startup settings", settings);
+            send(settings, WM_CLOSE, 0, 0)?;
+            phase = "Diagnostics.InitialOpen";
+            checkpoint(phase);
+            let diagnostic = app.window(DIAGNOSTICS)?;
+            if unsafe { IsWindowVisible(diagnostic) } != 0 {
+                return Err("The diagnostic window opened without an explicit command.".into());
+            }
+            send(background, WM_COMMAND, 320, 0)?;
+            visible(diagnostic)?;
+            window_facts("diagnostic window", diagnostic);
+            let initial = report(diagnostic)?;
+            states(&initial, false, false, false)?;
+            privacy(&initial, &base)?;
+            if clipboard()? != CLIPBOARD_SEED {
+                return Err("Opening diagnostics changed the clipboard.".into());
+            }
+            phase = "Diagnostics.InitialRefreshCopy";
+            checkpoint(phase);
+            click(diagnostic, 322)?;
+            states(&report(diagnostic)?, false, false, false)?;
+            if clipboard()? != CLIPBOARD_SEED {
+                return Err("Refreshing diagnostics changed the clipboard.".into());
+            }
+            copy_report(diagnostic, &base)?;
+            phase = "DisplayTest.Disabled";
+            checkpoint(phase);
+            check_display(&app, diagnostic, &mock)?;
+            states(&report(diagnostic)?, false, false, false)?;
+            phase = "Resume.Disabled";
+            checkpoint(phase);
+            // This is the sole action allowed to change disabled automatic state.
+            click(diagnostic, 325)?;
+            wait_for("first explicit resume hook reinstall", || {
                 let value = report(diagnostic)?;
-                Ok(value.contains("本次暂停：否")
-                    && value.contains("手动编辑保护：否")
+                Ok(value.contains("自动划词：是")
                     && value.contains("监听开关：是")
                     && counter(&value, "HookInstallSuccess")?
-                        > counter(&paused, "HookInstallSuccess")?)
-            },
-        )?;
-        send(background, WM_COMMAND, 315, 0)?;
-        if text(detail, 222)? != DRAFT {
-            return Err("Resume lost the preserved manual draft.".into());
-        }
-        send(detail, WM_CLOSE, 0, 0)?;
-        click(diagnostic, 326)?;
-        if unsafe { IsWindowVisible(diagnostic) } != 0 {
-            return Err("The Close button did not hide diagnostics.".into());
-        }
-        let before = report(diagnostic)?;
-        source.drag()?;
-        wait_for("real native drag capture and popup rendering", || {
-            let value = report(diagnostic)?;
-            Ok(
-                counter(&value, "CaptureQueued")? > counter(&before, "CaptureQueued")?
-                    && counter(&value, "CaptureSuccess")? > counter(&before, "CaptureSuccess")?
-                    && counter(&value, "RenderSuccess")? > counter(&before, "RenderSuccess")?,
-            )
-        })
-        .map_err(|error| {
-            format!(
-                "{error} Report:\n{}",
-                report(diagnostic).unwrap_or_default()
-            )
-        })?;
-        let actual_chip = app.window("轻译")?;
-        visible(actual_chip)?;
-        require_chip_size(actual_chip, 48)?;
-        send(background, WM_COMMAND, 320, 0)?;
-        let after = report(diagnostic)?;
-        privacy(&after, &base)?;
-        for name in ["HookDown", "HookUp", "ExternalDown", "NotifyPosted"] {
-            if counter(&after, name)? <= counter(&before, name)? {
-                return Err(format!(
-                    "Real native EDIT drag did not increment {name}. Report:\n{after}"
-                ));
+                        > counter(&initial, "HookInstallSuccess")?)
+            })?;
+            if !config::load()?.selection_button {
+                return Err("Resume did not persist the automatic switch.".into());
             }
+
+            phase = "Manual.PauseDraft";
+            checkpoint(phase);
+            send(background, WM_COMMAND, 264, 0)?;
+            send(background, WM_COMMAND, 315, 0)?;
+            let detail = app.window("轻译 · 翻译与提问")?;
+            let draft = wide(DRAFT);
+            send(
+                unsafe { GetDlgItem(detail, 222) },
+                WM_SETTEXT,
+                0,
+                draft.as_ptr() as isize,
+            )?;
+            send(background, WM_COMMAND, 320, 0)?;
+            phase = "Diagnostics.PausedRefreshCopy";
+            checkpoint(phase);
+            let paused = report(diagnostic)?;
+            states(&paused, true, true, true)?;
+            click(diagnostic, 322)?;
+            copy_report(diagnostic, &base)?;
+            states(&report(diagnostic)?, true, true, true)?;
+            phase = "DisplayTest.Paused";
+            checkpoint(phase);
+            check_display(&app, diagnostic, &mock)?;
+            states(&report(diagnostic)?, true, true, true)?;
+            if text(detail, 222)? != DRAFT {
+                return Err("Diagnostics replaced the manual draft.".into());
+            }
+            phase = "Resume.PausedManual";
+            checkpoint(phase);
+            click(diagnostic, 325)?;
+            wait_for(
+                "explicit resume clearing pause/manual and reinstalling hook",
+                || {
+                    let value = report(diagnostic)?;
+                    Ok(value.contains("本次暂停：否")
+                        && value.contains("手动编辑保护：否")
+                        && value.contains("监听开关：是")
+                        && counter(&value, "HookInstallSuccess")?
+                            > counter(&paused, "HookInstallSuccess")?)
+                },
+            )?;
+            phase = "Manual.VerifyPreservedDraft";
+            checkpoint(phase);
+            send(background, WM_COMMAND, 315, 0)?;
+            if text(detail, 222)? != DRAFT {
+                return Err("Resume lost the preserved manual draft.".into());
+            }
+            phase = "Diagnostics.Close";
+            checkpoint(phase);
+            send(detail, WM_CLOSE, 0, 0)?;
+            click(diagnostic, 326)?;
+            if unsafe { IsWindowVisible(diagnostic) } != 0 {
+                return Err("The Close button did not hide diagnostics.".into());
+            }
+            let before = report(diagnostic)?;
+            phase = "Source.RealDrag";
+            checkpoint(phase);
+            source.drag()?;
+            phase = "Source.CaptureRender";
+            checkpoint(phase);
+            wait_for("real native drag capture and popup rendering", || {
+                let value = report(diagnostic)?;
+                Ok(
+                    counter(&value, "CaptureQueued")? > counter(&before, "CaptureQueued")?
+                        && counter(&value, "CaptureSuccess")? > counter(&before, "CaptureSuccess")?
+                        && counter(&value, "RenderSuccess")? > counter(&before, "RenderSuccess")?,
+                )
+            })?;
+            let actual_chip = app.window("轻译")?;
+            visible(actual_chip)?;
+            require_chip_size(actual_chip, 48)?;
+            phase = "Diagnostics.FinalPrivacyCopy";
+            checkpoint(phase);
+            send(background, WM_COMMAND, 320, 0)?;
+            let after = report(diagnostic)?;
+            privacy(&after, &base)?;
+            for name in ["HookDown", "HookUp", "ExternalDown", "NotifyPosted"] {
+                if counter(&after, name)? <= counter(&before, name)? {
+                    return Err(format!("Real native EDIT drag did not increment {name}."));
+                }
+            }
+            if counter(&after, "AppDownAccepted")? <= counter(&before, "AppDownAccepted")?
+                || counter(&after, "AppUpAccepted")? <= counter(&before, "AppUpAccepted")?
+            {
+                return Err("Real hook notifications were not accepted by the controller.".into());
+            }
+            if counter(&after, "CaptureQueued")? <= counter(&before, "CaptureQueued")? {
+                return Err("Real accepted EDIT drag did not reach capture.".into());
+            }
+            if counter(&after, "HookRebind")? == 0 {
+                return Err("Explicit Resume did not record a hook rebind.".into());
+            }
+            copy_report(diagnostic, &base)?;
+            mock.require_zero()?;
+            println!("Native diagnostics UI passed: explicit open/refresh/copy/close, fixed 32px display fixture and leaf click without capture or HTTP, disabled/pause/manual state preservation, explicit Resume enabling automatic mode, preserving draft and reinstalling the hook.");
+            println!("Observed real SendInput EDIT drag through hook, controller, successful native capture and popup rendering with restored custom appearance; no private selection candidate messages were fabricated. This does not establish another application's UIA support. The actual stage counters follow.");
+            println!("{after}");
+            phase = "App.Shutdown";
+            checkpoint(phase);
+            app.stop()?;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            // This runs before Application::drop, so a failed native input
+            // assertion retains its fixed report rather than losing the app.
+            eprintln!("Diagnostics failed during phase {phase}: {error}");
+            source.facts("source at failure");
+            app.failure_report(&base);
         }
-        if counter(&after, "AppDownAccepted")? <= counter(&before, "AppDownAccepted")?
-            || counter(&after, "AppUpAccepted")? <= counter(&before, "AppUpAccepted")?
-        {
-            return Err(format!(
-                "Real hook notifications were not accepted by the controller. Report:\n{after}"
-            ));
-        }
-        if counter(&after, "CaptureQueued")? <= counter(&before, "CaptureQueued")? {
-            return Err(format!(
-                "Real accepted EDIT drag did not reach capture. Report:\n{after}"
-            ));
-        }
-        if counter(&after, "HookRebind")? == 0 {
-            return Err("Explicit Resume did not record a hook rebind.".into());
-        }
-        copy_report(diagnostic, &base)?;
-        mock.require_zero()?;
-        println!("Native diagnostics UI passed: explicit open/refresh/copy/close, fixed 32px display fixture and leaf click without capture or HTTP, disabled/pause/manual state preservation, explicit Resume enabling automatic mode, preserving draft and reinstalling the hook.");
-        println!("Observed real SendInput EDIT drag through hook, controller, successful native capture and popup rendering with restored custom appearance; no private selection candidate messages were fabricated. This does not establish another application's UIA support. The actual stage counters follow.");
-        println!("{after}");
-        app.stop()?;
-        Ok(())
+        result
     }
 
     fn check_display(app: &Application, diagnostic: HWND, mock: &Mock) -> Result<(), String> {
+        checkpoint("DisplayTest.Show");
         let before = report(diagnostic)?;
         click(diagnostic, 324)?;
         let chip = app.window("轻译")?;
         visible(chip)?;
+        checkpoint("DisplayTest.Visible");
+        window_facts("display test leaf", chip);
         require_chip_size(chip, 32)?;
         let mut rect: RECT = unsafe { zeroed() };
         if unsafe { GetWindowRect(chip, &mut rect) } == 0 {
@@ -263,11 +300,21 @@ mod windows {
         {
             return Err("Cannot point at the display-test leaf.".into());
         }
+        checkpoint("DisplayTest.RealClick");
+        let mut point: POINT = unsafe { zeroed() };
+        unsafe { GetCursorPos(&mut point) };
+        let hit = unsafe { WindowFromPoint(point) };
+        println!(
+            "Display click facts: cursor={},{} hit={hit:?} expected_leaf={chip:?}",
+            point.x, point.y
+        );
         mouse(MOUSEEVENTF_LEFTDOWN)?;
         mouse(MOUSEEVENTF_LEFTUP)?;
+        window_facts("display test leaf after click", chip);
         wait_for("the test leaf click to dismiss it", || {
             Ok(unsafe { IsWindowVisible(chip) } == 0)
         })?;
+        checkpoint("DisplayTest.Dismissed");
         thread::sleep(Duration::from_millis(250));
         let after = report(diagnostic)?;
         for name in [
@@ -319,9 +366,7 @@ mod windows {
         ] {
             let expected = format!("{label}：{}", if enabled { "是" } else { "否" });
             if !report.contains(&expected) {
-                return Err(format!(
-                    "Diagnostic state missing {expected}. Report:\n{report}"
-                ));
+                return Err(format!("Diagnostic state missing {expected}."));
             }
         }
         Ok(())
@@ -417,8 +462,12 @@ mod windows {
         let mut input: INPUT = unsafe { zeroed() };
         input.r#type = INPUT_MOUSE;
         input.Anonymous.mi.dwFlags = flags;
-        if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } != 1 {
-            return Err("Cannot inject the owned mouse input.".into());
+        let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+        if sent != 1 {
+            return Err(format!(
+                "Cannot inject the owned mouse input: sent={sent} system_error={}",
+                unsafe { windows_sys::Win32::Foundation::GetLastError() }
+            ));
         }
         thread::sleep(Duration::from_millis(30));
         Ok(())
@@ -438,6 +487,24 @@ mod windows {
     }
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(Some(0)).collect()
+    }
+
+    fn checkpoint(phase: &str) {
+        println!("Diagnostics phase: {phase}");
+    }
+
+    fn window_facts(label: &str, window: HWND) {
+        let mut pid = 0;
+        let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut foreground_pid = 0;
+        unsafe { GetWindowThreadProcessId(foreground, &mut foreground_pid) };
+        let mut rect: RECT = unsafe { zeroed() };
+        let rect_ok = unsafe { GetWindowRect(window, &mut rect) };
+        let mut info: GUITHREADINFO = unsafe { zeroed() };
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        let focus_ok = unsafe { GetGUIThreadInfo(thread, &mut info) };
+        println!("Native facts {label}: hwnd={window:?} pid={pid} thread={thread} visible={} enabled={} foreground={foreground:?} foreground_pid={foreground_pid} rect_ok={rect_ok} rect={},{},{},{} dpi={} focus_ok={focus_ok} focus={:?}", unsafe { IsWindowVisible(window) }, unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(window) }, rect.left, rect.top, rect.right, rect.bottom, unsafe { GetDpiForWindow(window) }, info.hwndFocus);
     }
 
     struct Isolation {
@@ -485,6 +552,40 @@ mod windows {
             })?;
             Ok(window)
         }
+        fn failure_report(&mut self, base: &str) {
+            eprintln!(
+                "Owned application status before cleanup: {:?}",
+                self.child.try_wait()
+            );
+            for (label, title) in [
+                ("background", BACKGROUND),
+                ("settings", "轻译 · 设置"),
+                ("diagnostics", DIAGNOSTICS),
+                ("leaf", "轻译"),
+            ] {
+                let window = unsafe { FindWindowW(wide(CLASS).as_ptr(), wide(title).as_ptr()) };
+                let mut pid = 0;
+                unsafe { GetWindowThreadProcessId(window, &mut pid) };
+                if window.is_null() || pid != self.child.id() {
+                    eprintln!("Owned window {label}: unavailable");
+                    continue;
+                }
+                window_facts(label, window);
+                if title == DIAGNOSTICS {
+                    match report(window) {
+                        Ok(value) if privacy(&value, base).is_ok() => {
+                            eprintln!("Diagnostic report before cleanup:\n{value}")
+                        }
+                        Ok(_) => {
+                            eprintln!("Diagnostic report withheld: privacy fixture check failed.")
+                        }
+                        Err(error) => {
+                            eprintln!("Cannot read diagnostic report before cleanup: {error}")
+                        }
+                    }
+                }
+            }
+        }
         fn stop(&mut self) -> Result<(), String> {
             if self.stopped {
                 return Ok(());
@@ -524,6 +625,10 @@ mod windows {
         worker: Option<JoinHandle<()>>,
     }
     impl Source {
+        fn facts(&self, label: &str) {
+            window_facts(label, self.window as HWND);
+            window_facts("owned EDIT", self.edit as HWND);
+        }
         fn start() -> Result<Self, String> {
             let (sender, receiver) = mpsc::sync_channel(1);
             let worker = thread::spawn(move || unsafe {
@@ -586,7 +691,11 @@ mod windows {
             Ok(())
         }
         fn drag(&self) -> Result<(), String> {
+            checkpoint("Source.FocusStart");
+            self.facts("source before focus");
             self.focus()?;
+            checkpoint("Source.Focused");
+            self.facts("source after focus");
             let point = |offset: usize| -> Result<POINT, String> {
                 let value = send(self.edit as HWND, 0xD6, offset, 0)?;
                 let mut point = POINT {
@@ -601,6 +710,10 @@ mod windows {
             let start = point(0)?;
             let end = point(38)?;
             let root = unsafe { GetAncestor(WindowFromPoint(start), GA_ROOT) };
+            println!(
+                "Native drag facts: start={},{} end={},{} hit_root={root:?} expected_root={:?}",
+                start.x, start.y, end.x, end.y, self.window as HWND
+            );
             if root != self.window as HWND {
                 return Err("The real gesture source is occluded.".into());
             }
@@ -611,6 +724,8 @@ mod windows {
                 thread::sleep(Duration::from_millis(25));
             }
             mouse(MOUSEEVENTF_LEFTUP)?;
+            checkpoint("Source.RealInputReleased");
+            self.facts("source after drag");
             let mut first = 0u32;
             let mut last = 0u32;
             send(
@@ -622,6 +737,10 @@ mod windows {
             if first == last {
                 return Err("Real SendInput drag did not select native EDIT text.".into());
             }
+            println!(
+                "Native drag selected range length={}",
+                last.saturating_sub(first)
+            );
             Ok(())
         }
     }

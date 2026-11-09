@@ -108,9 +108,11 @@ pub fn capture_selection_for_gesture(
 /// selection gesture, and an unchanged foreground/clipboard before simulating C.
 pub fn can_copy_gesture(origin: Option<POINT>, point: POINT) -> bool {
     let Ok(target) = Target::foreground() else {
+        diagnostics::record(Stage::CompatibilityEligibility, Outcome::Ineligible);
         return false;
     };
     let Some(anchor) = source_hit_point(&target, Some(point), origin) else {
+        diagnostics::record(Stage::CompatibilityEligibility, Outcome::Ineligible);
         return false;
     };
     let root_class = native_class(target.root);
@@ -120,6 +122,7 @@ pub fn can_copy_gesture(origin: Option<POINT>, point: POINT) -> bool {
             "SUMATRA_PDF_FRAME" | "AcrobatSDIWindow"
         )
     {
+        diagnostics::record(Stage::CompatibilityEligibility, Outcome::Ineligible);
         return false;
     }
     // A PDF drag must not copy a toolbar EDIT's retained selection. Ignore an
@@ -130,6 +133,7 @@ pub fn can_copy_gesture(origin: Option<POINT>, point: POINT) -> bool {
         .map(|point| unsafe { WindowFromPoint(point) })
     {
         if target.owns_window(hit) && native_edit_class(&native_class(hit)) {
+            diagnostics::record(Stage::CompatibilityEligibility, Outcome::Ineligible);
             return false;
         }
     }
@@ -179,12 +183,23 @@ pub fn can_copy_gesture(origin: Option<POINT>, point: POINT) -> bool {
         });
         Ok(native_content || document)
     });
-    let eligible = match eligible {
-        Ok(eligible) => eligible,
-        Err(UiaFailure::Unavailable(_)) => native_content,
-        Err(UiaFailure::Protected | UiaFailure::Unverified) => false,
+    let (eligible, rejection) = match eligible {
+        Ok(eligible) => (eligible, Outcome::Ineligible),
+        Err(UiaFailure::Unavailable(_)) => (native_content, Outcome::Unavailable),
+        Err(UiaFailure::Protected | UiaFailure::Unverified) => (false, Outcome::Protected),
     };
-    eligible && unsafe { GetForegroundWindow() } == target.foreground
+    let eligible_now = eligible && unsafe { GetForegroundWindow() } == target.foreground;
+    diagnostics::record(
+        Stage::CompatibilityEligibility,
+        if eligible_now {
+            Outcome::Accepted
+        } else if eligible {
+            Outcome::ForegroundChanged
+        } else {
+            rejection
+        },
+    );
+    eligible_now
 }
 
 fn capture(
@@ -1085,6 +1100,7 @@ unsafe fn scoped_chain(
         let step = probe::ancestor_step(native_scope, node.window && node.native == target.root);
         if step == probe::AncestorStep::StopBefore {
             if !scoped {
+                diagnostics::record(Stage::UiaScope, Outcome::Ineligible);
                 return Vec::new();
             }
             break;
@@ -1113,6 +1129,7 @@ unsafe fn scoped_chain(
     } else {
         // A renderer with another PID is accepted only with the HWND ancestry
         // proof above, not just because it is an accessibility descendant.
+        diagnostics::record(Stage::UiaScope, Outcome::Ineligible);
         Vec::new()
     }
 }
@@ -1259,7 +1276,7 @@ unsafe fn text_pattern(node: &UiaNode, warming: bool) -> Option<IUIAutomationTex
         // TextPattern2 inherits the same selection contract. Accept the newer
         // pattern ID too; never substitute caret/whole-document extraction or
         // LegacyIAccessible.Value for an unavailable selection.
-        (node.text_available != Some(false) || node.text_candidate || warming)
+        let pattern = (node.text_available != Some(false) || node.text_candidate || warming)
             .then(|| {
                 node.element
                     .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
@@ -1275,7 +1292,17 @@ unsafe fn text_pattern(node: &UiaNode, warming: bool) -> Option<IUIAutomationTex
                             .map(|pattern| IUIAutomationTextPattern::clone(&pattern))
                     })
                     .flatten()
-            })
+            });
+        if pattern.is_none()
+            && (node.text_candidate
+                || node.text_available == Some(true)
+                || node.text2_available == Some(true))
+        {
+            // Report the final combined result once, rather than both pattern
+            // attempts or every generic bridge node in a provider tree.
+            diagnostics::record(Stage::UiaPattern, Outcome::Unavailable);
+        }
+        pattern
     }
 }
 
@@ -1285,21 +1312,46 @@ unsafe fn selected_text(
     deadline: Instant,
 ) -> Result<Option<String>, UiaFailure> {
     if Instant::now() >= deadline {
+        diagnostics::record(Stage::UiaSelection, Outcome::TimedOut);
         return Ok(None);
     }
     // Unsupported selection must not be interpreted as an entire document or
     // as an instruction to read LegacyIAccessible.Value/Name.
     if unsafe { pattern.SupportedTextSelection() }.ok() == Some(SupportedTextSelection_None) {
+        diagnostics::record(Stage::UiaSelection, Outcome::Skipped);
         return Ok(None);
     }
     if Instant::now() >= deadline {
+        diagnostics::record(Stage::UiaSelection, Outcome::TimedOut);
         return Ok(None);
     }
-    let Ok(ranges) = (unsafe { pattern.GetSelection() }) else {
+    let Ok(ranges) = (unsafe { pattern.GetSelection() }).inspect_err(|error| {
+        diagnostics::record_error(
+            Stage::UiaSelection,
+            Outcome::Unavailable,
+            error.code().0 as u32,
+        );
+    }) else {
         return Ok(None);
     };
-    let count = unsafe { ranges.Length() }.unwrap_or(0);
+    let count = match unsafe { ranges.Length() } {
+        Ok(count) => {
+            if count <= 0 {
+                diagnostics::record(Stage::UiaSelection, Outcome::NoSelection);
+            }
+            count
+        }
+        Err(error) => {
+            diagnostics::record_error(
+                Stage::UiaSelection,
+                Outcome::Unavailable,
+                error.code().0 as u32,
+            );
+            0
+        }
+    };
     if count > 32 {
+        diagnostics::record(Stage::UiaSelection, Outcome::TooLong);
         return Err(UiaFailure::Unavailable(
             "选区过多，请只选择需要翻译的一段文字。".into(),
         ));
@@ -1311,10 +1363,17 @@ unsafe fn selected_text(
     let mut geometry_unavailable = false;
     for index in 0..count.max(0) {
         if Instant::now() >= deadline {
+            diagnostics::record(Stage::UiaSelection, Outcome::TimedOut);
             return Ok(None);
         }
-        let range = unsafe { ranges.GetElement(index) }
-            .map_err(|_| UiaFailure::Unavailable("选区已失效，请重新选择文字。".into()))?;
+        let range = unsafe { ranges.GetElement(index) }.map_err(|error| {
+            diagnostics::record_error(
+                Stage::UiaSelection,
+                Outcome::Unavailable,
+                error.code().0 as u32,
+            );
+            UiaFailure::Unavailable("选区已失效，请重新选择文字。".into())
+        })?;
         if let Some(gesture) = gesture {
             match unsafe { range_matches_gesture(&range, gesture) } {
                 Some(matches) => geometry_matches |= matches,
@@ -1323,18 +1382,39 @@ unsafe fn selected_text(
         }
         selected_ranges.push(range);
     }
+    if gesture.is_some() && count > 0 {
+        diagnostics::record(
+            Stage::UiaGeometry,
+            if geometry_matches {
+                Outcome::Succeeded
+            } else if geometry_unavailable {
+                Outcome::Unavailable
+            } else {
+                Outcome::Ineligible
+            },
+        );
+    }
     if gesture.is_some() && !geometry_matches && !geometry_unavailable {
         return Ok(None);
     }
     for range in selected_ranges {
         if Instant::now() >= deadline {
+            diagnostics::record(Stage::UiaSelection, Outcome::TimedOut);
             return Ok(None);
         }
-        let selected = unsafe { range.GetText((MAX_SELECTION_UNITS + 1) as i32) }
-            .map_err(|_| UiaFailure::Unavailable("无法读取这段选区，请尝试手动复制。".into()))?;
+        let selected =
+            unsafe { range.GetText((MAX_SELECTION_UNITS + 1) as i32) }.map_err(|error| {
+                diagnostics::record_error(
+                    Stage::UiaSelection,
+                    Outcome::Unavailable,
+                    error.code().0 as u32,
+                );
+                UiaFailure::Unavailable("无法读取这段选区，请尝试手动复制。".into())
+            })?;
         let selected = selected.to_string();
         units += selected.encode_utf16().count();
         if units > MAX_SELECTION_UNITS {
+            diagnostics::record(Stage::UiaSelection, Outcome::TooLong);
             return Err(UiaFailure::Unavailable(
                 "选中文字过长，请缩小选区后重试。".into(),
             ));
@@ -1348,6 +1428,9 @@ unsafe fn selected_text(
     }
     let text = text.trim().to_owned();
     if !has_visible_text(&text) {
+        if count > 0 {
+            diagnostics::record(Stage::UiaSelection, Outcome::NoSelection);
+        }
         // An explicitly selected run of spaces/formatting is not a provider
         // failure or a request to translate an ancestor's document contents.
         return if units == 0 {
@@ -1356,6 +1439,7 @@ unsafe fn selected_text(
             Err(UiaFailure::Unavailable(no_selection()))
         };
     }
+    diagnostics::record(Stage::UiaSelection, Outcome::Succeeded);
     Ok(Some(text))
 }
 

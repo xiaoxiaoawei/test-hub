@@ -1,6 +1,6 @@
 # 0.10.2 诊断与验证记录
 
-日期：2026-11-09。分支：`lingoleaf`。用户现场已确认版本 0.10.1、自动划词 / 兼容取词均开启、翻译剪贴板和 Ctrl+Alt+T 能显示，但自动划词从不弹出。此前两项修复没有解释该现场；本轮不再宣称已经确定根因或已经解决。
+日期：2026-11-09。分支：`lingoleaf`。用户现场已确认版本 0.10.1、自动划词 / 兼容取词均开启、翻译剪贴板和 Ctrl+Alt+T 能显示，但自动划词从不弹出。此前两项修复没有解释该现场；本轮随后在原生 Windows 找到并复现了图标层级缺陷，修复已由同一严格用例验证。具体用户机器效果仍待确认。
 
 本版加入本地分段诊断、独立显示测试与显式监听重装，并补真正的 Windows UIA 及监听输入测试。方法见 [划词诊断](selection-diagnostics-0.10.2.md)。旧版本验证保留在相应标签。
 
@@ -8,12 +8,12 @@
 |---|---|
 | 原生 Windows 真实 UIA 集成 | [初始诊断分支 CI](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42547291675) 通过，包含真实系统控件、选区 / 几何 / 密码属性；非浏览器或 Word 实机 |
 | Wine 实际 UIA 探针 | EDIT 走原生路径成功；RichEdit 真 UIA E_NOTIMPL。明确不能把 EDIT 成功等同 UIA 成功 |
-| Linux / Windows 单元与严格检查 | 最终候选待核验 |
+| Linux / Windows 单元与严格检查 | Linux 87 项与 Python 14 项通过；原生 Windows 全测试、严格 Clippy、构建通过 |
 | Wine 真实诊断 UI | 预检通过：真实拖动 → 监听 → 控制器 → 原生取词 → 图标，复制报告无私密 fixture，零 HTTP |
 | 显示自检 | 固定 32 DIP 绿叶；点击不发请求；恢复自定义 48 DIP 方形字母图标、颜色和设置 |
 | 显式恢复 | 暂停 / 手动模式保持到用户点击恢复；恢复草稿、开启自动划词并请求同线程重装，安装成功计数增加 |
 | 更新 helper | 0.10.3 固定夹具替换 / AppReady / 清理及 exit-43 精确回滚成功 |
-| 原生 Windows 完整诊断 UI 执行 | 首次真实输入步骤失败，保留失败；下一次增加固定阶段和数值报告定位，不以编译代替运行 |
+| 原生 Windows 完整诊断 UI 执行 | 修复前连续失败，层级修复后 [13ba3f4 CI](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42549965591) 严格置顶 / 实际命中 / 真实输入全通过 |
 | 正式公开资产 / 旧版升级 | 待发布后验证 |
 | 用户机器根因与恢复 | 尚无本机计数报告，未验证解决；不能由云端通过推断 |
 
@@ -51,4 +51,10 @@
 
 补丁在每次图标绘制后 SetWindowPos(HWND_TOPMOST)，保留 NOMOVE / NOSIZE / NOACTIVATE / NOOWNERZORDER，检查实际错误码。原先丢失置顶位时记录 TopmostRestored；诊断页降低阅读窗口后，对仍可见图标也恢复层级但不重新显示隐藏图标。新的严格 native smoke 检查置顶位及不透明中心实际命中，未放宽点击条件。
 
-新 GNU 层级候选为 1217536 字节，SHA `99aa66bc4bf5008684abf7f2c862f956e9013f3ac9ae5417d42d67217821f5bb`。严格 Wine smoke 通过，但 Wine 旧候选本来就保持置顶，不能据此判定原生修复成功；下一原生结果为决定性验证。
+新 GNU 层级候选为 1217536 字节，SHA `99aa66bc4bf5008684abf7f2c862f956e9013f3ac9ae5417d42d67217821f5bb`。严格 Wine smoke 通过，但 Wine 旧候选本来就保持置顶，不能据此判定原生修复成功；原生结果见下方决定性验证。
+
+## 同一原生用例的修复验证
+
+[13ba3f4 原生 Windows 流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42549965591) 全部通过，包括库测试、严格 Clippy、release 和真实执行的 diagnostics_smoke。两次固定叶片及真正选区图标的 WS_EX_TOPMOST 位、中心 WindowFromPoint 命中均为强断言；没有等待重试图标点击、强制焦点或放宽命中条件。旧 Wine 用例仍通过而原生 Windows 失败的差异现在由明确的 SetWindowPos 层级恢复修复。
+
+这次不是只编译示例：真实鼠标进入 hook → 控制器 → 原生取词 → 图标绘制 / 命中，且自检零 HTTP、报告隐私与原自定义图标恢复均通过。真实系统控件 UIA 测试也通过，仍不能外推所有 Edge / Word / PDF 提供者。最终 tag 和正式公开资产待发布核验。

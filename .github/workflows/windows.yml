@@ -52,6 +52,9 @@ jobs:
             Write-Output "::error title=Native selection diagnostic failure::$annotation"
             throw "Native selection diagnostics failed with exit $diagnosticExit"
           }
+          $diagnosticProof = (($diagnosticOutput -split "`r?`n" | Where-Object { $_ -match 'TopmostRestored|topmost=|CaptureSuccess:|RenderSuccess:|Diagnostics smoke' }) -join "`n")
+          $diagnosticProof = $diagnosticProof.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+          Write-Output "::notice title=Native selection diagnostic passed::$diagnosticProof"
       - name: Verify embedded executable version
         shell: pwsh
         run: |

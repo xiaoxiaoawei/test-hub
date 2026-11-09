@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::selection_text::has_visible_text;
+use crate::{
+    diagnostics::{self, Outcome, Stage},
+    selection_text::has_visible_text,
+};
 
 use windows::{
     core::Interface,
@@ -154,7 +157,11 @@ pub fn can_copy_gesture(origin: Option<POINT>, point: POINT) -> bool {
         let Some(leaf) = chain.first() else {
             return Ok(false);
         };
-        match leaf.element.CurrentIsPassword() {
+        match leaf
+            .element
+            .CurrentIsPassword()
+            .inspect_err(record_uia_password_error)
+        {
             Ok(value) if value.as_bool() => return Err(UiaFailure::Protected),
             Ok(_) if leaf.password == Some(false) => {}
             _ => return Err(UiaFailure::Unverified),
@@ -473,7 +480,10 @@ impl ComApartment {
     fn initialize() -> Result<Self, UiaFailure> {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
             .ok()
-            .map_err(|error| UiaFailure::Unavailable(format!("无法初始化文字读取组件：{error}")))?;
+            .map_err(|error| {
+                record_uia_error(&error);
+                UiaFailure::Unavailable(format!("无法初始化文字读取组件：{error}"))
+            })?;
         Ok(Self)
     }
 }
@@ -509,7 +519,7 @@ impl UiaSession {
             let automation: IUIAutomation =
                 CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
                     .or_else(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))
-                    .map_err(|_| UiaFailure::Unavailable("此窗口暂时无法读取选区。".into()))?;
+                    .map_err(uia_setup_error)?;
             if let Ok(settings) = automation.cast::<IUIAutomation2>() {
                 let _ = settings.SetConnectionTimeout(300);
                 let _ = settings.SetTransactionTimeout(200);
@@ -548,7 +558,16 @@ impl UiaSession {
     }
 }
 
-fn uia_setup_error(_: windows::core::Error) -> UiaFailure {
+fn record_uia_error(error: &windows::core::Error) {
+    diagnostics::record_error(Stage::Capture, Outcome::Unavailable, error.code().0 as u32);
+}
+
+fn record_uia_password_error(error: &windows::core::Error) {
+    diagnostics::record_error(Stage::Capture, Outcome::Protected, error.code().0 as u32);
+}
+
+fn uia_setup_error(error: windows::core::Error) -> UiaFailure {
+    record_uia_error(&error);
     UiaFailure::Unavailable("此窗口暂时无法读取选区。".into())
 }
 
@@ -631,7 +650,11 @@ impl UiaNode {
                     .map(|window| window.0)
                     .unwrap_or(ptr::null_mut()),
                 pid: element.CachedProcessId().unwrap_or(0),
-                password: element.CachedIsPassword().ok().map(|value| value.as_bool()),
+                password: element
+                    .CachedIsPassword()
+                    .inspect_err(record_uia_password_error)
+                    .ok()
+                    .map(|value| value.as_bool()),
                 text_available: cached_bool(&element, UIA_IsTextPatternAvailablePropertyId),
                 text2_available: cached_bool(&element, UIA_IsTextPattern2AvailablePropertyId),
                 text_candidate: kind.is_some_and(|kind| {
@@ -687,13 +710,17 @@ pub fn warm_selection_provider(foreground: isize) {
             if !target.owns_window(WindowFromPoint(point)) {
                 continue;
             }
-            let Ok(element) = session.automation.ElementFromPointBuildCache(
-                windows::Win32::Foundation::POINT {
-                    x: point.x,
-                    y: point.y,
-                },
-                &session.cache,
-            ) else {
+            let Ok(element) = session
+                .automation
+                .ElementFromPointBuildCache(
+                    windows::Win32::Foundation::POINT {
+                        x: point.x,
+                        y: point.y,
+                    },
+                    &session.cache,
+                )
+                .inspect_err(record_uia_error)
+            else {
                 continue;
             };
             let first = UiaNode::cached(element);
@@ -822,13 +849,17 @@ fn capture_uia(
         let mut point_scope = None;
         if let Some(point) = anchor {
             if target.owns_window(WindowFromPoint(point)) {
-                if let Ok(element) = session.automation.ElementFromPointBuildCache(
-                    windows::Win32::Foundation::POINT {
-                        x: point.x,
-                        y: point.y,
-                    },
-                    &session.cache,
-                ) {
+                if let Ok(element) = session
+                    .automation
+                    .ElementFromPointBuildCache(
+                        windows::Win32::Foundation::POINT {
+                            x: point.x,
+                            y: point.y,
+                        },
+                        &session.cache,
+                    )
+                    .inspect_err(record_uia_error)
+                {
                     let first = UiaNode::cached(element);
                     // A directly verified document/text hit should get its
                     // first pattern request before walking provider ancestry.
@@ -909,6 +940,7 @@ fn capture_uia(
             if let Ok(element) = session
                 .automation
                 .GetFocusedElementBuildCache(&session.cache)
+                .inspect_err(record_uia_error)
             {
                 let chain = scoped_chain(
                     target,
@@ -954,6 +986,7 @@ fn capture_uia(
                                 windows::Win32::Foundation::HWND(target.root),
                                 &session.cache,
                             )
+                            .inspect_err(record_uia_error)
                             .ok()
                     })
                     .flatten()
@@ -1005,7 +1038,7 @@ unsafe fn chain_text(
             None if verified_leaf => continue,
             None => return Err(UiaFailure::Unverified),
         }
-        match unsafe { node.element.CurrentIsPassword() } {
+        match unsafe { node.element.CurrentIsPassword() }.inspect_err(record_uia_password_error) {
             Ok(value) if value.as_bool() => return Err(UiaFailure::Protected),
             Ok(_) => verified_leaf = true,
             Err(_) if verified_leaf => continue,
@@ -1167,7 +1200,7 @@ unsafe fn search_subtree(
         };
         if probe_pattern && budget.pattern() {
             if read_text
-                && !matches!(unsafe { node.element.CurrentIsPassword() }, Ok(value) if !value.as_bool())
+                && !matches!(unsafe { node.element.CurrentIsPassword() }.inspect_err(record_uia_password_error), Ok(value) if !value.as_bool())
             {
                 continue;
             }
@@ -1735,3 +1768,7 @@ mod tests {
         assert!(decode_unicode(&bytes).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "selection/native_uia_tests.rs"]
+mod native_uia_tests;

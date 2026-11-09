@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::diagnostics::{self, Counter, Outcome, Stage};
+
 use windows_sys::Win32::{
     Foundation::{GetLastError, HINSTANCE, LPARAM, LRESULT, POINT, WPARAM},
     System::{
@@ -207,8 +209,11 @@ impl WorkerContext {
 struct Control {
     closed: AtomicBool,
     thread_id: AtomicU32,
+    restart_requested: AtomicBool,
     #[cfg(test)]
     timer_ticks: AtomicU32,
+    #[cfg(test)]
+    rebinds: AtomicU32,
 }
 
 thread_local! {
@@ -225,12 +230,14 @@ pub struct MouseHook {
 
 pub fn install(target_window: isize, message: u32) -> Result<MouseHook, String> {
     if target_window == 0 {
+        diagnostics::record(Stage::HookInstall, Outcome::Ineligible);
         return Err("无法安装划词监听：缺少接收窗口。".into());
     }
     if INSTALLED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        diagnostics::record(Stage::HookInstall, Outcome::Busy);
         return Err("已经安装划词监听。".into());
     }
     let control = Arc::new(Control::default());
@@ -253,8 +260,16 @@ pub fn install(target_window: isize, message: u32) -> Result<MouseHook, String> 
             let _ = completed.send(());
         }) {
         Ok(worker) => worker,
-        Err(_) => {
+        Err(error) => {
             INSTALLED.store(false, Ordering::Release);
+            if let Some(code) = error
+                .raw_os_error()
+                .and_then(|code| u32::try_from(code).ok())
+            {
+                diagnostics::record_error(Stage::HookInstall, Outcome::Failed, code);
+            } else {
+                diagnostics::record(Stage::HookInstall, Outcome::Failed);
+            }
             return Err("无法启动划词监听线程。".into());
         }
     };
@@ -266,8 +281,21 @@ pub fn install(target_window: isize, message: u32) -> Result<MouseHook, String> 
     match startup.recv_timeout(INSTALL_TIMEOUT) {
         Ok(Ok(())) => Ok(guard),
         Ok(Err(error)) => Err(error),
-        Err(_) => Err("划词监听启动超时，请重新启动应用。".into()),
+        Err(error) => {
+            diagnostics::record(
+                Stage::HookInstall,
+                match error {
+                    mpsc::RecvTimeoutError::Timeout => Outcome::TimedOut,
+                    mpsc::RecvTimeoutError::Disconnected => Outcome::WorkerStopped,
+                },
+            );
+            Err("划词监听启动超时，请重新启动应用。".into())
+        }
     }
+}
+
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Acquire)
 }
 
 pub fn set_enabled(enabled: bool) {
@@ -276,6 +304,25 @@ pub fn set_enabled(enabled: bool) {
     // covers pause -> resume between two callbacks, so an old down cannot join
     // a later up and accidentally read an unrelated selection.
     ENABLED_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+impl MouseHook {
+    /// Ask the existing worker to rebind once both physical buttons are up.
+    /// This never replaces a running thread or replays an interrupted gesture.
+    pub fn request_restart(&self) -> bool {
+        if self.control.closed.load(Ordering::Acquire)
+            || self.control.thread_id.load(Ordering::Acquire) == 0
+            || self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+        {
+            diagnostics::record(Stage::HookHealth, Outcome::WorkerStopped);
+            return false;
+        }
+        self.control
+            .restart_requested
+            .store(true, Ordering::Release);
+        diagnostics::record(Stage::HookHealth, Outcome::Retrying);
+        true
+    }
 }
 
 impl Drop for MouseHook {
@@ -301,15 +348,18 @@ impl Drop for MouseHook {
 
 struct HookHandle(HHOOK);
 impl HookHandle {
-    fn new() -> Result<Self, String> {
+    fn new(stage: Stage) -> Result<Self, String> {
+        diagnostics::increment(Counter::HookInstallAttempt);
+        diagnostics::record(stage, Outcome::Started);
         let module: HINSTANCE = unsafe { GetModuleHandleW(ptr::null()) };
         let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_callback), module, 0) };
         if hook.is_null() {
-            Err(format!(
-                "无法安装划词监听（系统错误 {}）。",
-                unsafe { GetLastError() }
-            ))
+            let error = unsafe { GetLastError() };
+            diagnostics::record_error(stage, Outcome::Failed, error);
+            Err(format!("无法安装划词监听（系统错误 {}）。", error))
         } else {
+            diagnostics::increment(Counter::HookInstallSuccess);
+            diagnostics::record(stage, Outcome::Succeeded);
             Ok(Self(hook))
         }
     }
@@ -372,7 +422,7 @@ fn run_hook(
                 },
             })
         });
-        let mut hook = match HookHandle::new() {
+        let mut hook = match HookHandle::new(Stage::HookInstall) {
             Ok(hook) => Some(hook),
             Err(error) => {
                 CONTEXT.with(|slot| *slot.borrow_mut() = None);
@@ -382,6 +432,8 @@ fn run_hook(
         };
         let timer = SetTimer(ptr::null_mut(), 0, WATCHDOG_INTERVAL_MS, None);
         if timer == 0 {
+            let error = GetLastError();
+            diagnostics::record_error(Stage::HookHealth, Outcome::Unavailable, error);
             CONTEXT.with(|slot| *slot.borrow_mut() = None);
             let _ = startup.send(Err("无法启动划词监听状态检查。".into()));
             return;
@@ -404,11 +456,19 @@ fn run_hook(
                             context.synchronize_enabled(ENABLED_EPOCH.load(Ordering::Acquire));
                             context.observed.needs_rebind(actual, now)
                         });
-                        if !actual.button_down && now >= next_install && (hook.is_none() || rebind)
+                        if !actual.button_down
+                            && now >= next_install
+                            && (hook.is_none()
+                                || rebind
+                                || control.restart_requested.load(Ordering::Acquire))
                         {
                             // Windows exposes no hook-liveness query. Rebind
-                            // only after sustained independent input mismatch,
-                            // never merely because the mouse has been idle.
+                            // after sustained independent input mismatch or an
+                            // explicit request, never merely due to idle input.
+                            control.restart_requested.store(false, Ordering::Release);
+                            diagnostics::increment(Counter::HookRebind);
+                            #[cfg(test)]
+                            control.rebinds.fetch_add(1, Ordering::Release);
                             drop(hook.take());
                             CONTEXT.with(|slot| {
                                 if let Some(context) = slot.borrow_mut().as_mut() {
@@ -417,7 +477,7 @@ fn run_hook(
                                     context.observed.record(actual.point);
                                 }
                             });
-                            hook = HookHandle::new().ok();
+                            hook = HookHandle::new(Stage::HookHealth).ok();
                             next_install = now + Duration::from_secs(1);
                         }
                     }
@@ -429,6 +489,7 @@ fn run_hook(
         CONTEXT.with(|slot| *slot.borrow_mut() = None);
         KillTimer(ptr::null_mut(), timer);
         drop(hook);
+        diagnostics::record(Stage::HookHealth, Outcome::WorkerStopped);
     }
 }
 
@@ -439,6 +500,12 @@ unsafe extern "system" fn mouse_callback(code: i32, message: WPARAM, data: LPARA
     {
         return unsafe { CallNextHookEx(ptr::null_mut(), code, message, data) };
     }
+    diagnostics::increment(match message as u32 {
+        WM_MOUSEMOVE => Counter::HookMove,
+        WM_LBUTTONDOWN => Counter::HookDown,
+        WM_LBUTTONUP => Counter::HookUp,
+        _ => unreachable!("unobserved hook message filtered above"),
+    });
     let mouse = unsafe { &*(data as *const MSLLHOOKSTRUCT) };
     let point = (mouse.pt.x, mouse.pt.y);
     let enabled = ENABLED.load(Ordering::Acquire);
@@ -474,6 +541,9 @@ unsafe extern "system" fn mouse_callback(code: i32, message: WPARAM, data: LPARA
         GetWindowThreadProcessId(owner, &mut owner_pid);
     }
     let own_window = window_pid == own_pid || owner_pid == own_pid;
+    if message as u32 == WM_LBUTTONDOWN && !own_window {
+        diagnostics::increment(Counter::ExternalDown);
+    }
     let shift = unsafe { GetAsyncKeyState(i32::from(VK_SHIFT)) } < 0;
     let clicks = ClickSettings {
         max_delay: unsafe { GetDoubleClickTime() },
@@ -501,7 +571,12 @@ unsafe extern "system" fn mouse_callback(code: i32, message: WPARAM, data: LPARA
     });
     if let Some((target, notification, notice)) = notification {
         let (x, y) = notice.parameters();
-        unsafe { PostMessageW(target as _, notification, x, y) };
+        let posted = unsafe { PostMessageW(target as _, notification, x, y) };
+        diagnostics::increment(if posted == 0 {
+            Counter::NotifyFailed
+        } else {
+            Counter::NotifyPosted
+        });
     }
     unsafe { CallNextHookEx(ptr::null_mut(), code, message, data) }
 }
@@ -804,6 +879,20 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+        let worker_thread = control.thread_id.load(Ordering::Acquire);
+        let previous_rebinds = control.rebinds.load(Ordering::Acquire);
+        assert!(guard.request_restart());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while control.rebinds.load(Ordering::Acquire) == previous_rebinds
+            || control.restart_requested.load(Ordering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "The existing hook worker did not handle its restart request"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(control.thread_id.load(Ordering::Acquire), worker_thread);
         drop(guard);
         assert!(control.closed.load(Ordering::Acquire));
         let deadline = Instant::now() + Duration::from_secs(2);

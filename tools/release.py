@@ -30,6 +30,7 @@ OPTIONAL_DOCUMENTS = (
     "docs/images/settings-200pct-0.10.0.png",
     "docs/images/selection-leaf-0.10.0.png",
     "docs/design-0.10.0.md",
+    "docs/selection-recovery-0.10.1.md",
 )
 
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)

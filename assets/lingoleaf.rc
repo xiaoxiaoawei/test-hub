@@ -6,8 +6,8 @@
 1 RT_MANIFEST "lingoleaf.manifest"
 
 1 VERSIONINFO
-FILEVERSION 0,10,0,0
-PRODUCTVERSION 0,10,0,0
+FILEVERSION 0,10,1,0
+PRODUCTVERSION 0,10,1,0
 FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 FILEFLAGS 0
 FILEOS VOS_NT_WINDOWS32
@@ -20,11 +20,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "LingoLeaf\0"
             VALUE "FileDescription", "LingoLeaf Selection Translator\0"
-            VALUE "FileVersion", "0.10.0.0\0"
+            VALUE "FileVersion", "0.10.1.0\0"
             VALUE "InternalName", "lingoleaf\0"
             VALUE "OriginalFilename", "lingoleaf.exe\0"
             VALUE "ProductName", "LingoLeaf\0"
-            VALUE "ProductVersion", "0.10.0\0"
+            VALUE "ProductVersion", "0.10.1\0"
         END
     END
     BLOCK "VarFileInfo"

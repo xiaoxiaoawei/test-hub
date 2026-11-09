@@ -56,7 +56,7 @@ mod windows {
         },
     };
 
-    const VERSION: &str = "0.10.1";
+    const VERSION: &str = "0.10.2";
     const PARENT_FILE: &str = "update-smoke-parent.json";
     const PARENT_ARGUMENT: &str = "--update-smoke-parent";
 
@@ -94,7 +94,7 @@ mod windows {
         }
         let [good, bad] = args.as_slice() else {
             return Err(
-                "Pass the good and bad 0.10.1 Windows GUI fixture EXEs as two arguments.".into(),
+                "Pass the good and bad 0.10.2 Windows GUI fixture EXEs as two arguments.".into(),
             );
         };
         let good = PathBuf::from(good)
@@ -238,7 +238,7 @@ mod windows {
                 return Err("The successful candidate unexpectedly rolled back.".into());
             }
             wait_candidate_exit(&data, &target)?;
-            println!("Verified 0.10.1 fixture replacement, startup ack and backup cleanup passed.");
+            println!("Verified 0.10.2 fixture replacement, startup ack and backup cleanup passed.");
         } else {
             wait_until(
                 "the restored parent restart",

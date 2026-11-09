@@ -86,6 +86,9 @@ mod windows {
     mod manual_actions {
         include!("support/selection_manual_0100.rs");
     }
+    mod recovery_actions {
+        include!("support/selection_recovery_0101.rs");
+    }
     const QUESTION_ONE: &str = "What does this word mean?";
     const QUESTION_TWO: &str = "Give a short example.";
     const QUESTION_OLD: &str = "Hold this old answer.";
@@ -253,6 +256,8 @@ mod windows {
             .into_iter()
             .chain(manual_actions::REQUESTS)
             .collect();
+        mock.require_requests(&expected)?;
+        recovery_actions::check(&source, &app, inline, &mock)?;
         mock.require_requests(&expected)?;
         app.stop()?;
         println!("Selection controller passed: one compact HWND, fixed position across continuous selections, stale-progress isolation, in-flight/cache deduplication, and no requests for empty/password selections.");
@@ -1085,6 +1090,10 @@ mod windows {
             null(),
         );
         if edit.is_null() || password.is_null() {
+            DestroyWindow(window);
+            return Err(());
+        }
+        if !recovery_actions::install_source(edit) {
             DestroyWindow(window);
             return Err(());
         }

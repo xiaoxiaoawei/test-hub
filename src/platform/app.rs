@@ -1835,6 +1835,14 @@ unsafe extern "system" fn window_proc(
                 } else if hwnd == app.settings_window {
                     layout_settings(app);
                 } else if hwnd == app.result_window {
+                    if wparam == SIZE_MINIMIZED as usize && app.manual_mode {
+                        // A minimized manual editor must not silently keep the
+                        // global selection listener disabled in every other app.
+                        // Save its draft before automatic results can reuse it.
+                        manual_ui::leave(app);
+                        app.display_pending = true;
+                        conversation_ui::refresh(app);
+                    }
                     layout_result(app);
                 } else if hwnd == app.inline_window {
                     layout_inline(app);
@@ -2553,11 +2561,14 @@ unsafe fn drain_events(app: &mut App) {
                             if job.compatibility_checked && job.copy_retryable {
                                 retry_automatic(app);
                             } else if job.compatibility_checked
-                                || selection::is_no_selection_error(&error)
+                                || (selection::is_no_selection_error(&error) && !app.auto_strong)
                                 || selection::is_protected_error(&error)
                             {
                                 cancel_automatic(app);
                             } else {
+                                // A real drag can finish before a provider has
+                                // committed its range. Retry without displaying
+                                // anything until visible text is confirmed.
                                 retry_automatic(app);
                             }
                         }

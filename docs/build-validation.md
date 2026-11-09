@@ -16,9 +16,9 @@
 | 新回归：最小化、250 ms 迟延、强空白、UI 停顿 | 最终候选真实输入全部通过；6500 ms 强空白零 Show / 零 POST，UI 暂停 1500 ms 后恢复 |
 | 更新 helper 成功 / 回滚 | 0.10.2 固定夹具替换 / ACK / 备份清理与 exit-43 精确恢复并重启通过 |
 | 完整空白负例 | Direct / Click 各 4 项零 Show / 可见采样 / POST，2 项保持窗口状态不变，约 98.59 秒 |
-| 旧 0.10.0 实际升级 | 待本版正式公开资产 |
-| 原生 Windows 无过滤测试 / 构建 / 打包 | [修复源码分支 CI](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42545077200) 通过，标签发行仍待执行 |
-| 正式公开源 | 打包时尚未发布，公开后补记 |
+| 旧 0.10.0 实际升级 | 真实旧 GUI 下载 / 校验 / 重启正式新版成功，配置 468 字节不变 |
+| 原生 Windows 无过滤测试 / 构建 / 打包 | [正式 v0.10.1 标签 CI](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42545959508) 全部通过，186 项无过滤；Linux 与发布任务成功 |
+| 正式公开源 | latest 实际 0.10.1；五资产 / 四 SHA / 14 项 ZIP / 普通请求通过 |
 | Windows 11 / Edge / 混合 DPI / 实际音频发声 | 本轮未执行，兼容层不代替实机 |
 
 ## 已复现的旧版问题
@@ -65,3 +65,25 @@ GNU 候选为 **1202688 字节**，SHA `1791c91157d086cf39d5d30cd0acad42dd7a539e
 两种划词模式各自验证行尾空白、空行、纯空格和换行 / 零宽，mouse-up 后均观察至少 6500 ms，无新 Show、无可见采样、无 POST。正控校准真实选词和点击叶片能产生准确请求；保持模式另验证译文、会话、草稿与位置不变。历史 eager-popup 程序仍被观察器抓到，完整回归约 98.59 秒，4 次本地正控请求。全部自有应用、源窗口与服务退出。
 
 0.10.2 固定更新夹具仅用于临时父程序副本，成功路径完成校验替换、AppReady 和备份清理；启动返回 43 的坏夹具恢复旧 EXE 精确字节并真实重启。没有请求网络或发布夹具，实际旧 0.10.0 升级须在公开后另做。
+
+## 正式公开版本
+
+`v0.10.1` 标签指向 `c58bfcd`，其 [Windows / Linux / 发布流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42545959508) 全部成功。Windows 完整 186 项测试无过滤、严格 Clippy、静态 CRT release、实际嵌入版本检查、打包和发布均通过。标签和已公开资产保持不可变；本节为发布后补记，不覆盖 ZIP 里的打包前记录。
+
+实际匿名下载五项发行资产，四个 payload SHA 校验全部通过。主 EXE 与旧更新器兼容 EXE 字节相同，ZIP 内的 EXE 也完全一致；ZIP CRC、严格 14 项允许清单及标签文档 / 截图比对通过（Markdown 只规范 Windows checkout 换行）。仅含程序、说明、当前修复文档与明确标注的沿用界面预览，不含配置、凭据、测试助手、DLL、源码或日志。普通无特殊缓存头的 latest feed 与稳定 EXE 均 HTTP 200，清单与标签字节一致，实际版本 0.10.1。
+
+正式 MSVC EXE **1174016 字节（约 1.12 MiB）**，仅依赖 Windows 系统 DLL，未增加安装运行时。SHA-256：
+
+```text
+1a97524aedc92310864d0e5cc5ddeaab645496872f3a95121cbedd9722574feb
+```
+
+主下载 [lingoleaf.exe](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe)，ZIP 为 `lingoleaf-windows-x64.zip`。六字段 schema 1 清单仍指向精确版本化兼容副本，旧更新按钮可继续使用。
+
+## 原始 0.10.0 升级正式 0.10.1
+
+原始正式 0.10.0（1153536 字节 / `46092b74fa4061ef94aea447a5f1a14b6b302fe39ab0706a5eb4711102e9378a`）通过真实旧 GUI 发现、下载、校验、确认重启，约 3.79 秒完成。重启前独立核对缓存为正式 1174016 字节与上述 SHA；旧父进程退出 0，新实际 MSVC GUI 前台且 enabled，显示 0.10.1 / 已是最新。目标文件匹配正式资产，AppReady 后 backup、stage、安装票据均为 0，两个自有 GUI 已退出。
+
+468 字节 settings.json 升级前后及退出后逐字节相同，SHA `26c41851a02f6c72d6e080883d7bdad699b39d5999a75de7fb210743d3552cc0`。实际 GUI 核对 Auto → 日语 0 / 3 索引、Direct、37 秒、兼容取词、Nebula 白天 / `#F5F0FC`，图标模态为 Letter / Circle / 48 px / `#D6A575`；默认手动快捷键保持。种子未含朗读 / 热键 / 默认图标标记字段，也未触发保存或重置自定义外观。
+
+该检查为 Wine 本地 GET-only 传输回放实际公开 MSVC 字节，未改清单、URL、版本、哈希、票据、生产保护或 AppReady。三条 GET 是旧 latest、正式兼容 EXE、新 latest，均无认证头；真实匿名 HTTPS 分发由前述独立下载证明。不能据此声称目标 Windows 到 GitHub 的 WinHTTP 联通、Edge、混合 DPI、DWM 或真实音频设备已验收。

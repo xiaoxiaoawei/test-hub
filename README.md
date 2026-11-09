@@ -2,7 +2,7 @@
 
 面向 Windows 的轻量划词翻译工具，使用 Rust 和原生 Win32 界面，不依赖浏览器或 WebView。默认英语译为简体中文，支持多语言、Markdown 译文与问答、在线朗读，以及四套明暗配色模板。
 
-当前代码版本 **0.10.1**，在 `lingoleaf` 分支维护。本次修复手动框最小化后划词不恢复、全局鼠标监听受界面阻塞影响，以及延迟提交的有效选区被过早放弃。根因见 [划词恢复说明](docs/selection-recovery-0.10.1.md)，公开状态与实际结果见 [构建记录](docs/build-validation.md)；代码版本不代表已经进入更新源。
+当前已公开发布 **0.10.1**，已有客户端可直接点击“检查更新”下载并重启，在 `lingoleaf` 分支维护。本版修复手动框最小化后全局划词不恢复、全局监听受界面阻塞影响，以及有效选区延迟提交时过早放弃的问题。根因见 [划词恢复说明](docs/selection-recovery-0.10.1.md)，实际测试、公开资产和旧 0.10.0 升级保留配置的结果见 [构建记录](docs/build-validation.md)。
 
 [**下载已公开最新版 lingoleaf.exe**](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe) · [发行页](https://github.com/xiaoxiaoawei/test-hub/releases)
 

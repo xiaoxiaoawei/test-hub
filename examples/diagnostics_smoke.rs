@@ -241,9 +241,11 @@ mod windows {
             let actual_chip = app.window("轻译")?;
             visible(actual_chip)?;
             require_chip_size(actual_chip, 48)?;
+            require_topmost_hit(actual_chip, "captured leaf before diagnostics")?;
             phase = "Diagnostics.FinalPrivacyCopy";
             checkpoint(phase);
             send(background, WM_COMMAND, 320, 0)?;
+            require_topmost_hit(actual_chip, "captured leaf after diagnostics")?;
             let after = report(diagnostic)?;
             privacy(&after, &base)?;
             for name in ["HookDown", "HookUp", "ExternalDown", "NotifyPosted"] {
@@ -291,6 +293,7 @@ mod windows {
         checkpoint("DisplayTest.Visible");
         window_facts("display test leaf", chip);
         require_chip_size(chip, 32)?;
+        require_topmost_hit(chip, "display test leaf")?;
         let mut rect: RECT = unsafe { zeroed() };
         if unsafe { GetWindowRect(chip, &mut rect) } == 0 {
             return Err("Cannot locate the display-test leaf.".into());
@@ -353,6 +356,30 @@ mod windows {
                 "The popup size does not match {logical_size} logical pixels: {},{}.",
                 rect.right - rect.left,
                 rect.bottom - rect.top
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_topmost_hit(chip: HWND, label: &str) -> Result<(), String> {
+        let exstyle = unsafe { GetWindowLongPtrW(chip, GWL_EXSTYLE) };
+        let topmost = exstyle & WS_EX_TOPMOST as isize != 0;
+        let mut rect: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(chip, &mut rect) } == 0 {
+            return Err("Cannot inspect the leaf's native bounds.".into());
+        }
+        let center = POINT {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        };
+        let hit = unsafe { WindowFromPoint(center) };
+        println!("Leaf z-order facts {label}: exstyle={exstyle:#x} topmost={topmost} center={},{} hit={hit:?} expected_leaf={chip:?}", center.x, center.y);
+        if !topmost {
+            return Err(format!("The {label} lost WS_EX_TOPMOST."));
+        }
+        if hit != chip {
+            return Err(format!(
+                "The {label} center is occluded by another native window."
             ));
         }
         Ok(())
@@ -504,7 +531,9 @@ mod windows {
         let mut info: GUITHREADINFO = unsafe { zeroed() };
         info.cbSize = size_of::<GUITHREADINFO>() as u32;
         let focus_ok = unsafe { GetGUIThreadInfo(thread, &mut info) };
-        println!("Native facts {label}: hwnd={window:?} pid={pid} thread={thread} visible={} enabled={} foreground={foreground:?} foreground_pid={foreground_pid} rect_ok={rect_ok} rect={},{},{},{} dpi={} focus_ok={focus_ok} focus={:?}", unsafe { IsWindowVisible(window) }, unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(window) }, rect.left, rect.top, rect.right, rect.bottom, unsafe { GetDpiForWindow(window) }, info.hwndFocus);
+        let exstyle = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
+        let topmost = exstyle & WS_EX_TOPMOST as isize != 0;
+        println!("Native facts {label}: hwnd={window:?} pid={pid} thread={thread} visible={} enabled={} foreground={foreground:?} foreground_pid={foreground_pid} rect_ok={rect_ok} rect={},{},{},{} dpi={} exstyle={exstyle:#x} topmost={topmost} focus_ok={focus_ok} focus={:?}", unsafe { IsWindowVisible(window) }, unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(window) }, rect.left, rect.top, rect.right, rect.bottom, unsafe { GetDpiForWindow(window) }, info.hwndFocus);
     }
 
     struct Isolation {

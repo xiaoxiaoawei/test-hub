@@ -2458,6 +2458,26 @@ unsafe fn show_chip(app: &mut App, point: POINT) -> Result<(), String> {
     result
 }
 
+unsafe fn restore_chip_order(app: &App, show: bool) -> Result<(), String> {
+    // Demoting an owned reader also demotes its owner/owned windows on Windows.
+    // Creation-time WS_EX_TOPMOST is therefore not a persistent chip invariant.
+    let was_topmost = GetWindowLongPtrW(app.chip, GWL_EXSTYLE) & WS_EX_TOPMOST as isize != 0;
+    let flags = SWP_NOMOVE
+        | SWP_NOSIZE
+        | SWP_NOACTIVATE
+        | SWP_NOOWNERZORDER
+        | if show { SWP_SHOWWINDOW } else { 0 };
+    if SetWindowPos(app.chip, HWND_TOPMOST, 0, 0, 0, 0, flags) == 0 {
+        let code = GetLastError();
+        diagnostics::record_error(DiagStage::Render, DiagOutcome::Failed, code);
+        return Err(format!("划词图标置顶失败（系统错误 {code}）。"));
+    }
+    if !was_topmost {
+        diagnostics::record(DiagStage::Render, DiagOutcome::TopmostRestored);
+    }
+    Ok(())
+}
+
 unsafe fn render_chip(app: &mut App, point: POINT) -> Result<(), String> {
     if !crate::selection_text::has_visible_text(&app.chip_text) {
         return Ok(());
@@ -2490,7 +2510,7 @@ unsafe fn render_chip(app: &mut App, point: POINT) -> Result<(), String> {
         .max(info.rcWork.top);
     popup::update(app.chip, x, y, pixels)?;
     app.chip_deadline = Some(Instant::now() + Duration::from_secs(12));
-    ShowWindow(app.chip, SW_SHOWNOACTIVATE);
+    restore_chip_order(app, true)?;
     if IsWindowVisible(app.chip) == 0 {
         diagnostics::record(DiagStage::Render, DiagOutcome::PopupHidden);
         return Err("图标窗口未能显示，请打开划词诊断。".into());

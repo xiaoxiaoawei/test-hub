@@ -130,6 +130,7 @@ pub enum Outcome {
     Unavailable,
     Skipped,
     PopupHidden,
+    TopmostRestored,
     ForegroundChanged,
     WorkerStopped,
     NotifyDropped,

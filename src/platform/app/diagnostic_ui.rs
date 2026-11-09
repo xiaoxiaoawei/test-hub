@@ -123,8 +123,8 @@ pub(super) unsafe fn report(app: &App) -> String {
         cloaked,
         cloak_result
     );
-    format!("轻译 v{} 划词诊断\r\n自动划词：{}\r\n本次暂停：{}\r\n手动编辑保护：{}\r\n正在屏幕取色：{}\r\n监听开关：{}\r\n监听实例存在：{}\r\n兼容取词：{}\r\n模式：{}\r\n交换鼠标主键：{}\r\n取词任务占用：{}；预热占用：{}；待处理任务：{}\r\n图标当前可见：{}；译文当前可见：{}\r\n{}\r\n{}",
-        env!("CARGO_PKG_VERSION"), yes(app.settings.selection_button), yes(app.selection_paused), yes(app.manual_mode), yes(app.picking_color), yes(mouse::is_enabled()), yes(app.mouse_hook.is_some()), yes(app.settings.compatibility_capture), mode, yes(GetSystemMetrics(SM_SWAPBUTTON) != 0), yes(app.capture_busy), yes(app.warm_busy), yes(app.pending.is_some()), yes(IsWindowVisible(app.chip) != 0), yes(IsWindowVisible(app.inline_window) != 0 || IsWindowVisible(app.result_window) != 0), graphics, diagnostics::snapshot().report())
+    format!("轻译 v{} 划词诊断\r\n自动划词：{}\r\n本次暂停：{}\r\n手动编辑保护：{}\r\n正在屏幕取色：{}\r\n监听开关：{}\r\n监听实例存在：{}\r\n兼容取词：{}\r\n模式：{}\r\n交换鼠标主键：{}\r\n取词任务占用：{}；预热占用：{}；待处理任务：{}\r\n图标当前可见：{}；译文当前可见：{}；图标置顶：{}\r\n{}\r\n{}",
+        env!("CARGO_PKG_VERSION"), yes(app.settings.selection_button), yes(app.selection_paused), yes(app.manual_mode), yes(app.picking_color), yes(mouse::is_enabled()), yes(app.mouse_hook.is_some()), yes(app.settings.compatibility_capture), mode, yes(GetSystemMetrics(SM_SWAPBUTTON) != 0), yes(app.capture_busy), yes(app.warm_busy), yes(app.pending.is_some()), yes(IsWindowVisible(app.chip) != 0), yes(IsWindowVisible(app.inline_window) != 0 || IsWindowVisible(app.result_window) != 0), yes(GetWindowLongPtrW(app.chip, GWL_EXSTYLE) & WS_EX_TOPMOST as isize != 0), graphics, diagnostics::snapshot().report())
 }
 
 pub(super) unsafe fn refresh(app: &mut App) {
@@ -159,6 +159,11 @@ pub(super) unsafe fn show(app: &mut App) {
     layout(app.diagnostic_window);
     ShowWindow(app.diagnostic_window, SW_RESTORE);
     SetForegroundWindow(app.diagnostic_window);
+    // Reader demotion above can propagate through the common owner to a chip
+    // which was already visible. Preserve its stacking without showing a hidden one.
+    if IsWindowVisible(app.chip) != 0 {
+        let _ = restore_chip_order(app, false);
+    }
 }
 
 pub(super) unsafe fn close(app: &mut App) {

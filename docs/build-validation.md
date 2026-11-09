@@ -42,3 +42,13 @@
 ## 原生交互失败保留
 
 初次启用真实 Windows 诊断 smoke 的 [d238374 分支流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42548479537) 中，库测试 / 严格检查 / 构建通过，但交互步骤失败。这是当前未通过项，不移除该步骤或标记通过。后续增加失败前固定阶段、窗口 / 焦点 / 命中元数据和经隐私检查的报告，并以公开错误注解保留，便于判断是否环境或实现问题。
+
+## 原生失败的具体证据与层级修复
+
+[ba3b993 的原生运行](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42549125119) 记录：固定叶片 UpdateLayeredWindow 成功、IsWindowVisible=1、DWM Cloaked=0、尺寸32×32，但中心点 WindowFromPoint 命中下面的诊断编辑框，测试点击不能关闭叶片。监听已收到按下 / 松开，故不是无输入桌面的假设。失败发生在 DisplayTest.Disabled，尚未进入源控件的真实拖动阶段。
+
+[SetWindowPos 官方规则](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos) 明确：置顶窗口被降为非置顶时，其 owners 与 owned windows 也会变为非置顶。设置页自 0.10.0 降低 result_window 层级，而 result / inline / chip 同属后台 main；图标显示只更新像素，没有像译文窗口一样每次重新确立 HWND_TOPMOST。
+
+补丁在每次图标绘制后 SetWindowPos(HWND_TOPMOST)，保留 NOMOVE / NOSIZE / NOACTIVATE / NOOWNERZORDER，检查实际错误码。原先丢失置顶位时记录 TopmostRestored；诊断页降低阅读窗口后，对仍可见图标也恢复层级但不重新显示隐藏图标。新的严格 native smoke 检查置顶位及不透明中心实际命中，未放宽点击条件。
+
+新 GNU 层级候选为 1217536 字节，SHA `99aa66bc4bf5008684abf7f2c862f956e9013f3ac9ae5417d42d67217821f5bb`。严格 Wine smoke 通过，但 Wine 旧候选本来就保持置顶，不能据此判定原生修复成功；下一原生结果为决定性验证。

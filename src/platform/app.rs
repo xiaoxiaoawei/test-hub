@@ -3,7 +3,8 @@ use super::{
     clipboard_copy, icons, mouse, picker, popup, rich_text, selection, selection_events, speech,
     surfaces, symbols, theme, update_install,
 };
-use crate::{cache::TranslationCache, config, mailbox, translation, update};
+use crate::{cache::TranslationCache, config, diagnostics, mailbox, translation, update};
+use diagnostics::{Counter as DiagCounter, Outcome as DiagOutcome, Stage as DiagStage};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
@@ -40,6 +41,8 @@ use windows_sys::Win32::{
 
 #[path = "app/conversation_ui.rs"]
 mod conversation_ui;
+#[path = "app/diagnostic_ui.rs"]
+mod diagnostic_ui;
 #[path = "app/layout_ui.rs"]
 mod layout_ui;
 #[path = "app/manual_ui.rs"]
@@ -114,6 +117,13 @@ const ID_SPEECH_SETTINGS: u16 = 303;
 const ID_SPEECH_APPLY: u16 = 308;
 const ID_SPEECH_CLOSE: u16 = 309;
 const ID_MANUAL_WINDOW: u16 = 315;
+const ID_DIAGNOSTICS: u16 = 320;
+const ID_DIAGNOSTIC_REPORT: u16 = 321;
+const ID_DIAGNOSTIC_REFRESH: u16 = 322;
+const ID_DIAGNOSTIC_COPY: u16 = 323;
+const ID_DIAGNOSTIC_DISPLAY: u16 = 324;
+const ID_DIAGNOSTIC_RESUME: u16 = 325;
+const ID_DIAGNOSTIC_CLOSE: u16 = 326;
 const SPEECH_WIDTH: i32 = 480;
 const SPEECH_HEIGHT: i32 = 424;
 const APPEARANCE_WIDTH: i32 = 440;
@@ -286,6 +296,9 @@ struct App {
     selection_paused: bool,
     appearance_window: HWND,
     appearance_ui: AppearanceUi,
+    diagnostic_window: HWND,
+    diagnostic_icon_test: bool,
+    mouse_hook: Option<mouse::MouseHook>,
     speech_window: HWND,
     speech_ui: SpeechSettingsUi,
     speech_restore_view: Option<bool>,
@@ -480,12 +493,21 @@ unsafe fn run_inner() -> Result<(), String> {
         SPEECH_HEIGHT,
         settings_window,
     );
+    let diagnostic_window = create_window(
+        "轻译 · 划词诊断",
+        WS_EX_TOOLWINDOW,
+        WS_OVERLAPPEDWINDOW,
+        800,
+        620,
+        main,
+    );
     if settings_window.is_null()
         || result_window.is_null()
         || chip.is_null()
         || appearance_window.is_null()
         || inline_window.is_null()
         || speech_window.is_null()
+        || diagnostic_window.is_null()
     {
         return Err("无法创建翻译窗口。".into());
     }
@@ -508,6 +530,7 @@ unsafe fn run_inner() -> Result<(), String> {
     let inline_ui = make_inline(inline_window);
     let appearance_ui = make_appearance(appearance_window);
     let speech_ui = make_speech_settings(speech_window);
+    diagnostic_ui::make(diagnostic_window);
     let (events_tx, events) = mpsc::channel();
     let ui_events = events_tx.clone();
     let (capture_tx, capture_rx) = mpsc::channel::<CaptureWork>();
@@ -522,7 +545,9 @@ unsafe fn run_inner() -> Result<(), String> {
             for work in capture_rx {
                 let mut job = match work {
                     CaptureWork::Warm(foreground) => {
+                        diagnostics::record(DiagStage::Warm, DiagOutcome::Started);
                         selection::warm_selection_provider(foreground);
+                        diagnostics::record(DiagStage::Warm, DiagOutcome::Succeeded);
                         if capture_events.send(Event::Warmed).is_err() {
                             break;
                         }
@@ -531,6 +556,12 @@ unsafe fn run_inner() -> Result<(), String> {
                     }
                     CaptureWork::Capture(job) => job,
                 };
+                let diagnostic_stage = match job.kind {
+                    CaptureKind::Auto => DiagStage::AutoCapture,
+                    CaptureKind::Hotkey => DiagStage::HotkeyCapture,
+                    CaptureKind::Clipboard => DiagStage::ClipboardCapture,
+                };
+                diagnostics::record(diagnostic_stage, DiagOutcome::Started);
                 let cancelled = || worker_capture.load(Ordering::Acquire) != job.generation;
                 let result = if cancelled() {
                     Err("选区已改变，已取消读取。".into())
@@ -566,6 +597,26 @@ unsafe fn run_inner() -> Result<(), String> {
                 } else {
                     selection::capture_selection(true)
                 };
+                diagnostics::record(
+                    diagnostic_stage,
+                    match &result {
+                        Ok(captured) => match captured.source {
+                            "原生文本选区" => DiagOutcome::NativeText,
+                            "UI Automation" => DiagOutcome::UiaText,
+                            "剪贴板" => DiagOutcome::ClipboardText,
+                            "兼容取词" => DiagOutcome::CompatibilityCopy,
+                            "模拟复制" => DiagOutcome::ManualCopy,
+                            _ => DiagOutcome::Succeeded,
+                        },
+                        Err(error) if selection::is_no_selection_error(error) => {
+                            DiagOutcome::NoSelection
+                        }
+                        Err(error) if selection::is_protected_error(error) => {
+                            DiagOutcome::Protected
+                        }
+                        Err(_) => DiagOutcome::Unavailable,
+                    },
+                );
                 if capture_events
                     .send(Event::Captured { job, result })
                     .is_err()
@@ -672,6 +723,14 @@ unsafe fn run_inner() -> Result<(), String> {
     mouse::set_enabled(settings.selection_button);
     let hook = mouse::install(main as isize, WM_SELECTION);
     let accessibility = selection_events::install(main as isize, WM_ACCESSIBILITY);
+    diagnostics::record(
+        DiagStage::SelectionEventsInstall,
+        if accessibility.is_ok() {
+            DiagOutcome::Succeeded
+        } else {
+            DiagOutcome::Failed
+        },
+    );
     let hook_error = hook.as_ref().err().cloned();
     let conversation = conversation_ui::State::new(main, ui_events.clone())?;
     let speech_sender = ui_events.clone();
@@ -699,6 +758,9 @@ unsafe fn run_inner() -> Result<(), String> {
         selection_paused: false,
         appearance_window,
         appearance_ui,
+        diagnostic_window,
+        diagnostic_icon_test: false,
+        mouse_hook: hook.ok(),
         speech_window,
         speech_ui,
         speech_restore_view: None,
@@ -770,6 +832,7 @@ unsafe fn run_inner() -> Result<(), String> {
         layout_inline(app);
         layout_chip(app);
         layout_speech_settings(app.speech_window);
+        diagnostic_ui::layout(app.diagnostic_window);
         theme::apply_window(app.speech_window, CURRENT_THEME.get(), CURRENT_PRESET.get());
         for window in [
             app.main,
@@ -847,11 +910,14 @@ unsafe fn run_inner() -> Result<(), String> {
                 || root == appearance_window
                 || root == inline_window
                 || root == speech_window
+                || root == diagnostic_window
             {
                 if root == inline_window {
                     with_app(|app| close_inline(app));
                 } else if root == result_window {
                     with_app(|app| close_translation(app));
+                } else if root == diagnostic_window {
+                    with_app(|app| diagnostic_ui::close(app));
                 } else if root == speech_window {
                     with_app(|app| speech_ui::close(app));
                 } else if root == appearance_window {
@@ -865,7 +931,8 @@ unsafe fn run_inner() -> Result<(), String> {
                 continue;
             }
         }
-        if IsDialogMessageW(speech_window, &message) == 0
+        if IsDialogMessageW(diagnostic_window, &message) == 0
+            && IsDialogMessageW(speech_window, &message) == 0
             && IsDialogMessageW(settings_window, &message) == 0
             && IsDialogMessageW(result_window, &message) == 0
             && IsDialogMessageW(appearance_window, &message) == 0
@@ -891,11 +958,11 @@ unsafe fn run_inner() -> Result<(), String> {
         }
     }
     drop(accessibility);
-    drop(hook);
     UnregisterHotKey(main, HOTKEY);
     UnregisterHotKey(main, HOTKEY_MANUAL);
     APP.with(|cell| {
-        if let Some(app) = cell.borrow_mut().take() {
+        if let Some(mut app) = cell.borrow_mut().take() {
+            drop(app.mouse_hook.take());
             Shell_NotifyIconW(NIM_DELETE, &app.tray);
             DestroyWindow(app.chip);
             DestroyWindow(app.inline_window);
@@ -903,6 +970,7 @@ unsafe fn run_inner() -> Result<(), String> {
             DestroyWindow(app.settings_window);
             DestroyWindow(app.appearance_window);
             DestroyWindow(app.speech_window);
+            DestroyWindow(app.diagnostic_window);
             DestroyWindow(app.main);
         }
     });
@@ -1670,16 +1738,22 @@ unsafe extern "system" fn window_proc(
                 if automatic_enabled(app) && !app.picking_color {
                     let foreground = GetForegroundWindow();
                     if !app.auto_pressed {
+                        diagnostics::increment(DiagCounter::AppUpRejected);
+                        diagnostics::record(DiagStage::AppUp, DiagOutcome::Stale);
                         handled = true;
                         return;
                     }
                     if app.auto_source_root == 0
                         || GetAncestor(foreground, GA_ROOT) as isize != app.auto_source_root
                     {
+                        diagnostics::increment(DiagCounter::AppUpRejected);
+                        diagnostics::record(DiagStage::AppUp, DiagOutcome::ForegroundChanged);
                         cancel_automatic(app);
                         handled = true;
                         return;
                     }
+                    diagnostics::increment(DiagCounter::AppUpAccepted);
+                    diagnostics::record(DiagStage::AppUp, DiagOutcome::Accepted);
                     app.auto_point = POINT {
                         x: wparam as i32,
                         y: lparam as i32,
@@ -1692,6 +1766,9 @@ unsafe extern "system" fn window_proc(
                     // A gesture is only a probe candidate. Blank drags and
                     // delayed providers must never create a speculative popup.
                     SetTimer(app.main, TIMER_SELECTION, 60, None);
+                } else {
+                    diagnostics::increment(DiagCounter::AppUpRejected);
+                    diagnostics::record(DiagStage::AppUp, diagnostic_ui::disabled_reason(app));
                 }
                 handled = true;
             }
@@ -1727,6 +1804,7 @@ unsafe extern "system" fn window_proc(
                 handled = true;
             }
             WM_TIMER if wparam == TIMER_SELECTION => {
+                diagnostics::increment(DiagCounter::AutoProbeTimer);
                 KillTimer(app.main, TIMER_SELECTION);
                 if automatic_enabled(app)
                     && app
@@ -1813,7 +1891,9 @@ unsafe extern "system" fn window_proc(
                 handled = true;
             }
             WM_CLOSE => {
-                if hwnd == app.inline_window {
+                if hwnd == app.diagnostic_window {
+                    diagnostic_ui::close(app);
+                } else if hwnd == app.inline_window {
                     close_inline(app);
                 } else if hwnd == app.result_window {
                     close_translation(app);
@@ -1830,7 +1910,9 @@ unsafe extern "system" fn window_proc(
                 handled = true;
             }
             WM_SIZE => {
-                if hwnd == app.speech_window {
+                if hwnd == app.diagnostic_window {
+                    diagnostic_ui::layout(hwnd);
+                } else if hwnd == app.speech_window {
                     layout_speech_settings(hwnd);
                 } else if hwnd == app.settings_window {
                     layout_settings(app);
@@ -1876,7 +1958,11 @@ unsafe extern "system" fn window_proc(
                 layout_settings(app);
                 handled = true;
             }
-            WM_GETMINMAXINFO if hwnd == app.result_window || hwnd == app.settings_window => {
+            WM_GETMINMAXINFO
+                if hwnd == app.result_window
+                    || hwnd == app.settings_window
+                    || hwnd == app.diagnostic_window =>
+            {
                 let info = &mut *(lparam as *mut MINMAXINFO);
                 let dpi = dpi(hwnd);
                 info.ptMinTrackSize = POINT {
@@ -1917,6 +2003,8 @@ unsafe extern "system" fn window_proc(
                     layout_inline(app);
                 } else if hwnd == app.speech_window {
                     layout_speech_settings(hwnd);
+                } else if hwnd == app.diagnostic_window {
+                    diagnostic_ui::layout(hwnd);
                 } else {
                     layout_chip(app);
                 }
@@ -1965,6 +2053,10 @@ unsafe extern "system" fn window_proc(
             _ => {}
         }
     });
+    if !handled && message == WM_SELECTION {
+        diagnostics::increment(DiagCounter::UiEventDropped);
+        diagnostics::record(DiagStage::HookNotification, DiagOutcome::NotifyDropped);
+    }
     if handled {
         value
     } else {
@@ -2025,6 +2117,12 @@ unsafe fn command(app: &mut App, id: u16) {
             let visible = !KEY_VISIBLE.get();
             set_api_key_visibility(app, visible);
         }
+        ID_DIAGNOSTICS => diagnostic_ui::show(app),
+        ID_DIAGNOSTIC_REFRESH => diagnostic_ui::refresh(app),
+        ID_DIAGNOSTIC_COPY => diagnostic_ui::copy(app),
+        ID_DIAGNOSTIC_DISPLAY => diagnostic_ui::display_test(app),
+        ID_DIAGNOSTIC_RESUME => diagnostic_ui::resume(app),
+        ID_DIAGNOSTIC_CLOSE => diagnostic_ui::close(app),
         ID_MANUAL_WINDOW => manual_ui::open(app),
         ID_TRANSLATE_INPUT => manual_ui::submit(app, false),
         ID_SPEECH_SETTINGS => speech_ui::show(app, false),
@@ -2106,6 +2204,11 @@ unsafe fn command(app: &mut App, id: u16) {
             Err(error) => translation_status(app, &error),
         },
         ID_TRANSLATE => {
+            if app.diagnostic_icon_test {
+                app.diagnostic_icon_test = false;
+                ShowWindow(app.chip, SW_HIDE);
+                return;
+            }
             ShowWindow(app.chip, SW_HIDE);
             if GetForegroundWindow() as isize != app.chip_foreground {
                 return;
@@ -2233,6 +2336,7 @@ unsafe fn reset_automatic(app: &mut App) {
     if !app.window_pinned && !app.manual_mode {
         ShowWindow(app.result_window, SW_HIDE);
     }
+    app.diagnostic_icon_test = false;
     app.chip_deadline = None;
     app.chip_text.clear();
     app.capture_generation += 1;
@@ -2256,8 +2360,12 @@ unsafe fn reset_automatic(app: &mut App) {
 
 unsafe fn begin_automatic_press(app: &mut App, point: POINT) {
     if !automatic_enabled(app) || app.picking_color {
+        diagnostics::increment(DiagCounter::AppDownRejected);
+        diagnostics::record(DiagStage::AppDown, diagnostic_ui::disabled_reason(app));
         return;
     }
+    diagnostics::increment(DiagCounter::AppDownAccepted);
+    diagnostics::record(DiagStage::AppDown, DiagOutcome::Accepted);
     if !app.window_pinned {
         conversation_ui::reset(app);
     }
@@ -2267,6 +2375,9 @@ unsafe fn begin_automatic_press(app: &mut App, point: POINT) {
     }
     app.auto_origin = Some(point);
     app.auto_source_root = GetAncestor(WindowFromPoint(point), GA_ROOT) as isize;
+    if app.auto_source_root == 0 {
+        diagnostics::record(DiagStage::AppDown, DiagOutcome::Ineligible);
+    }
     app.auto_pressed = true;
 }
 
@@ -2315,6 +2426,25 @@ unsafe fn retry_automatic(app: &mut App) {
 }
 
 unsafe fn show_chip(app: &mut App, point: POINT) -> Result<(), String> {
+    diagnostics::increment(DiagCounter::RenderAttempt);
+    let result = render_chip(app, point);
+    diagnostics::increment(if result.is_ok() {
+        DiagCounter::RenderSuccess
+    } else {
+        DiagCounter::RenderFailed
+    });
+    diagnostics::record(
+        DiagStage::Render,
+        if result.is_ok() {
+            DiagOutcome::Succeeded
+        } else {
+            DiagOutcome::Failed
+        },
+    );
+    result
+}
+
+unsafe fn render_chip(app: &mut App, point: POINT) -> Result<(), String> {
     if !crate::selection_text::has_visible_text(&app.chip_text) {
         return Ok(());
     }
@@ -2347,6 +2477,10 @@ unsafe fn show_chip(app: &mut App, point: POINT) -> Result<(), String> {
     popup::update(app.chip, x, y, pixels)?;
     app.chip_deadline = Some(Instant::now() + Duration::from_secs(12));
     ShowWindow(app.chip, SW_SHOWNOACTIVATE);
+    if IsWindowVisible(app.chip) == 0 {
+        diagnostics::record(DiagStage::Render, DiagOutcome::PopupHidden);
+        return Err("图标窗口未能显示，请打开划词诊断。".into());
+    }
     SetTimer(app.main, TIMER_CHIP, 200, None);
     Ok(())
 }
@@ -2483,9 +2617,12 @@ unsafe fn request_capture(app: &mut App, kind: CaptureKind, point: POINT) {
         clipboard_sequence: GetClipboardSequenceNumber(),
     };
     if app.capture_busy {
+        diagnostics::record(DiagStage::CaptureQueue, DiagOutcome::Busy);
         app.pending = Some(job);
         return;
     }
+    diagnostics::increment(DiagCounter::CaptureQueued);
+    diagnostics::record(DiagStage::CaptureQueue, DiagOutcome::Accepted);
     app.capture_busy = true;
     if app.capture.send(CaptureWork::Capture(job)).is_err() {
         app.capture_busy = false;
@@ -2512,6 +2649,7 @@ unsafe fn drain_events(app: &mut App) {
                 {
                     match result {
                         Ok(captured) if crate::selection_text::has_visible_text(&captured.text) => {
+                            diagnostics::increment(DiagCounter::CaptureSuccess);
                             if captured.text.chars().count() > translation::MAX_TEXT_CHARS {
                                 if job.kind == CaptureKind::Auto {
                                     cancel_automatic(app);
@@ -2541,7 +2679,9 @@ unsafe fn drain_events(app: &mut App) {
                                         if !app.window_pinned {
                                             ShowWindow(app.inline_window, SW_HIDE);
                                         }
-                                        let _ = show_chip(app, job.point);
+                                        if let Err(error) = show_chip(app, job.point) {
+                                            set_text(app.settings_ui.status, &error);
+                                        }
                                     }
                                 }
                             } else if job.kind != CaptureKind::Auto {
@@ -2549,6 +2689,7 @@ unsafe fn drain_events(app: &mut App) {
                             }
                         }
                         Ok(_) => {
+                            diagnostics::increment(DiagCounter::CaptureEmpty);
                             if job.kind == CaptureKind::Auto && app.auto_text.is_none() {
                                 cancel_automatic(app);
                             }
@@ -2558,6 +2699,7 @@ unsafe fn drain_events(app: &mut App) {
                             show_error(app, &error, job.point)
                         }
                         Err(error) => {
+                            diagnostics::increment(DiagCounter::CaptureFailed);
                             if job.compatibility_checked && job.copy_retryable {
                                 retry_automatic(app);
                             } else if job.compatibility_checked
@@ -2933,6 +3075,7 @@ unsafe fn apply_visual_theme(app: &mut App, mode: config::ThemeMode, preset: con
         app.inline_window,
         app.appearance_window,
         app.speech_window,
+        app.diagnostic_window,
     ] {
         theme::apply_window(window, mode, preset);
         EnumChildWindows(window, Some(retheme_child), 0);
@@ -3304,6 +3447,12 @@ unsafe fn tray_menu(app: &App) -> u16 {
             "暂停自动划词"
         })
         .as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_DIAGNOSTICS as usize,
+        wide("划词诊断…").as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_EXIT as usize, wide("退出轻译").as_ptr());

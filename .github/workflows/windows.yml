@@ -40,6 +40,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build release
         run: cargo build --release --locked
+      - name: Run native selection diagnostics
+        run: cargo run --locked --example diagnostics_smoke -- target/release/lingoleaf.exe
       - name: Verify embedded executable version
         shell: pwsh
         run: |

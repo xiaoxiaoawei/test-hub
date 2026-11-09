@@ -2,7 +2,7 @@
 
 面向 Windows 的轻量划词翻译工具，使用 Rust 和原生 Win32 界面，不依赖浏览器或 WebView。默认英语译为简体中文，支持多语言、Markdown 译文与问答、在线朗读，以及四套明暗配色模板。
 
-当前已公开发布 **0.10.1**，已有客户端可直接点击“检查更新”下载并重启，在 `lingoleaf` 分支维护。本版修复手动框最小化后全局划词不恢复、全局监听受界面阻塞影响，以及有效选区延迟提交时过早放弃的问题。根因见 [划词恢复说明](docs/selection-recovery-0.10.1.md)，实际测试、公开资产和旧 0.10.0 升级保留配置的结果见 [构建记录](docs/build-validation.md)。
+当前代码版本 **0.10.2**，在 `lingoleaf` 分支维护。本版增加本机划词分段诊断、显示自检和显式恢复入口，用于定位“剪贴板 / 快捷键可用但自动划词始终无弹窗”的现场问题。使用方法见 [划词诊断](docs/selection-diagnostics-0.10.2.md)，实际验证及公开状态见 [构建记录](docs/build-validation.md)。尚无本机报告时，不把云端通过等同于用户机器已修好。
 
 [**下载已公开最新版 lingoleaf.exe**](https://github.com/xiaoxiaoawei/test-hub/releases/latest/download/lingoleaf.exe) · [发行页](https://github.com/xiaoxiaoawei/test-hub/releases)
 
@@ -12,7 +12,7 @@
 
 ## 界面预览
 
-以下为 0.10.0 的 Wine 原生窗口截图，0.10.1 沿用其布局，空密钥 / 模拟内容；Windows 11 系统圆角和真实声音的验收边界见构建记录。
+以下为 0.10.0 的 Wine 原生窗口截图，0.10.2 沿用其主体布局，空密钥 / 模拟内容；Windows 11 系统圆角和真实声音的验收边界见构建记录。
 
 ![精简翻译服务](docs/images/settings-dark-0.10.0.png)
 

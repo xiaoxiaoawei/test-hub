@@ -136,10 +136,13 @@ pub(crate) unsafe fn update(hwnd: HWND, x: i32, y: i32, pixels: &IconPixels) -> 
         ULW_ALPHA,
     ) == 0
     {
-        return Err(format!(
-            "透明划词图标更新失败（系统错误 {}）。",
-            GetLastError()
-        ));
+        let code = GetLastError();
+        crate::diagnostics::record_error(
+            crate::diagnostics::Stage::Render,
+            crate::diagnostics::Outcome::Failed,
+            code,
+        );
+        return Err(format!("透明划词图标更新失败（系统错误 {code}）。"));
     }
     Ok(())
 }

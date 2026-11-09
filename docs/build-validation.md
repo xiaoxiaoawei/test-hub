@@ -14,7 +14,9 @@
 | 显式恢复 | 暂停 / 手动模式保持到用户点击恢复；恢复草稿、开启自动划词并请求同线程重装，安装成功计数增加 |
 | 更新 helper | 0.10.3 固定夹具替换 / AppReady / 清理及 exit-43 精确回滚成功 |
 | 原生 Windows 完整诊断 UI 执行 | 修复前连续失败，层级修复后 [13ba3f4 CI](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42549965591) 严格置顶 / 实际命中 / 真实输入全通过 |
-| 正式公开资产 / 旧版升级 | 待发布后验证 |
+| 最终标签原生 Windows | [v0.10.2 CI](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42550251859) 全绿，完整测试、严格检查、真实诊断 smoke 与发行步骤通过 |
+| 正式公开资产 | 匿名下载五资产、四项 SHA、15 项 ZIP 严格清单与普通 latest 请求均通过，详见下方 |
+| 0.10.1 → 0.10.2 升级回放 | 原公开旧客户端经 Wine 本地 GET 回放发现 / 下载正式公开新版、校验 / 替换 / 重启成功，468 字节配置逐字节保持，详见下方边界 |
 | 用户机器根因与恢复 | 尚无本机计数报告，未验证解决；不能由云端通过推断 |
 
 ## 已确认的验证盲区
@@ -33,7 +35,7 @@
 
 初始 GNU 预检 SHA `0795adb3efda0009a958b389ac66f027da6e05eaa5138734d8ce7c38d4e53ccb` 的实际诊断 smoke 两次通过。原生 EDIT 的真实拖动观测 HookDown / Up 3、ExternalDown 1、NotifyPosted 2、AppDown / UpAccepted 1、CaptureQueued 1、CaptureSuccess 1，AutoCapture 为 NativeText；RenderSuccess 3，包括两次固定显示和一次真实选区。HookInstallSuccess 3 / Rebind 2，表明显式重装实际完成。零模型 HTTP；报告不包含原文、剪贴板、标题、地址、模型、假密钥和草稿 fixture，恢复后保存的自定义外观不变。
 
-后续候选增加 DWM / DPI 报告与显示自检 60 秒期限，需按最终字节重新确认。这些预检不等于实际用户问题已解决。
+后续候选增加 DWM / DPI 报告与显示自检 60 秒期限；下文最终 GNU 候选的严格 Wine smoke 已重新通过。这些预检不等于实际用户问题已解决。
 
 ## 发布约定
 
@@ -41,7 +43,7 @@
 
 ## 原生交互失败保留
 
-初次启用真实 Windows 诊断 smoke 的 [d238374 分支流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42548479537) 中，库测试 / 严格检查 / 构建通过，但交互步骤失败。这是当前未通过项，不移除该步骤或标记通过。后续增加失败前固定阶段、窗口 / 焦点 / 命中元数据和经隐私检查的报告，并以公开错误注解保留，便于判断是否环境或实现问题。
+初次启用真实 Windows 诊断 smoke 的 [d238374 分支流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42548479537) 中，库测试 / 严格检查 / 构建通过，但交互步骤失败。当时保留该失败，不移除该步骤或标记通过。后续增加失败前固定阶段、窗口 / 焦点 / 命中元数据和经隐私检查的报告，并以公开错误注解保留，便于判断是否环境或实现问题。
 
 ## 原生失败的具体证据与层级修复
 
@@ -57,4 +59,20 @@
 
 [13ba3f4 原生 Windows 流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42549965591) 全部通过，包括库测试、严格 Clippy、release 和真实执行的 diagnostics_smoke。两次固定叶片及真正选区图标的 WS_EX_TOPMOST 位、中心 WindowFromPoint 命中均为强断言；没有等待重试图标点击、强制焦点或放宽命中条件。旧 Wine 用例仍通过而原生 Windows 失败的差异现在由明确的 SetWindowPos 层级恢复修复。
 
-这次不是只编译示例：真实鼠标进入 hook → 控制器 → 原生取词 → 图标绘制 / 命中，且自检零 HTTP、报告隐私与原自定义图标恢复均通过。真实系统控件 UIA 测试也通过，仍不能外推所有 Edge / Word / PDF 提供者。最终 tag 和正式公开资产待发布核验。
+这次不是只编译示例：真实鼠标进入 hook → 控制器 → 原生取词 → 图标绘制 / 命中，且自检零 HTTP、报告隐私与原自定义图标恢复均通过。真实系统控件 UIA 测试也通过，仍不能外推所有 Edge / Word / PDF 提供者。
+
+最终 [v0.10.2 标签流水线](https://github.com/xiaoxiaoawei/test-hub/actions/runs/42550251859) 重新完整通过。公开的成功注解保留两次显示测试与真实选区图标在诊断页前后的 `topmost=true`、中心实际命中一致；`CaptureSuccess: 1`、`RenderSuccess: 3`，以及三次 `Render: TopmostRestored`。标签与公开资产冻结，不随后续验证文档更新改写。
+
+## 正式公开资产核验
+
+已匿名下载 v0.10.2 的五个发行资产。正式 MSVC 主程序为 **1188864 字节**，SHA-256 **`559d9151be974bb49f979a866bc843fc59b7cc6847ea73fb60e9360bd51ab83c`**，是 Windows x64 GUI PE，只依赖 Windows 系统 DLL。它与兼容版本化 EXE、ZIP 内程序逐字节相同，与上文 GNU 本地候选分别记录。
+
+`update.json` 六字段严格校验通过，版本、大小与 SHA 对应正式 EXE；四项 SHA256SUMS 全部相符。ZIP 为严格允许的 15 项，无重复或额外文件、CRC 通过，文档与冻结标签源码一致（仅容许 Markdown checkout 换行差异）。不带特殊请求头的普通 latest 清单和 EXE 均返回 HTTP 200，与标签资产逐字节相同。
+
+## 原公开 0.10.1 客户端升级回放
+
+旧程序取自原公开发行，1174016 字节、SHA-256 `1a97524aedc92310864d0e5cc5ddeaab645496872f3a95121cbedd9722574feb`。在隔离配置与目录中运行，旧 GUI 确认发现 0.10.2、下载完成后再次核验大小与 SHA，点击重启更新。新进程实际启动为 0.10.2，GUI 可用且前台，更新状态显示已是最新，最终程序与上文真实公开 MSVC 字节相同。
+
+原有 468 字节配置完全相同（前后 SHA-256 `26c41851a02f6c72d6e080883d7bdad699b39d5999a75de7fb210743d3552cc0`）；另在新 GUI 确认自动检测 → 日语、直接翻译、兼容取词、37 秒超时、星云紫白天模式及自定义圆形字母 48 DIP / `#D6A575` 均保留。AppReady 成功路径完成，backup / stage / ticket 残留均为 0，无回滚，测试进程正常退出。
+
+此回放在 Wine 使用仅 GET 的本地传输夹具，送入未改动的真实公开清单与 MSVC EXE，没有更改更新校验、令牌或替换保护；它验证旧客户端 GUI 及替换重启流程，不是原生 Windows 直接访问 GitHub 的 WinHTTP HTTPS 测试。真实匿名 GitHub HTTPS 五资产与普通 latest 请求由上一节独立验证。测试使用空密钥，没有调用翻译或朗读。

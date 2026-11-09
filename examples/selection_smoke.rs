@@ -786,17 +786,51 @@ mod windows {
         {
             return Err("Cannot point at the owned question editor.".into());
         }
-        let mut clicks: [INPUT; 2] = unsafe { zeroed() };
-        for (event, flags) in clicks
-            .iter_mut()
-            .zip([MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP])
-        {
-            event.r#type = INPUT_MOUSE;
-            event.Anonymous.mi.dwFlags = flags;
+        let sample = |stage: &str| {
+            let mut info: GUITHREADINFO = unsafe { zeroed() };
+            info.cbSize = size_of::<GUITHREADINFO>() as u32;
+            unsafe {
+                GetGUIThreadInfo(GetWindowThreadProcessId(parent, null_mut()), &mut info);
+            }
+            println!("Native question click {stage}: foreground_matches={}, focus_is_input={}, focus={:?}, input_enabled={}, disabled_style={}, readonly={}, ask_enabled={}, parent_enabled={}, hit_is_input={}", unsafe{GetForegroundWindow()}==parent, info.hwndFocus==input, info.hwndFocus, unsafe{IsWindowEnabled(input)}, unsafe{GetWindowLongPtrW(input,GWL_STYLE)} & WS_DISABLED as isize != 0, unsafe{GetWindowLongPtrW(input,GWL_STYLE)} & ES_READONLY as isize != 0, unsafe{IsWindowEnabled(GetDlgItem(parent,ASK))}, unsafe{IsWindowEnabled(parent)}, unsafe{WindowFromPoint(POINT{x:(rect.left+rect.right)/2,y:(rect.top+rect.bottom)/2})}==input);
+        };
+        let actual_click = || -> Result<(), String> {
+            let point = POINT {
+                x: (rect.left + rect.right) / 2,
+                y: (rect.top + rect.bottom) / 2,
+            };
+            if unsafe { WindowFromPoint(point) } != input {
+                return Err("The owned question editor is obscured.".into());
+            }
+            let mut click: INPUT = unsafe { zeroed() };
+            click.r#type = INPUT_MOUSE;
+            click.Anonymous.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+            if unsafe { SendInput(1, &click, size_of::<INPUT>() as i32) } != 1 {
+                return Err("Cannot press the owned question editor.".into());
+            }
+            thread::sleep(Duration::from_millis(30));
+            sample("after_30ms_down");
+            click.Anonymous.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+            if unsafe { SendInput(1, &click, size_of::<INPUT>() as i32) } != 1 {
+                return Err("Cannot release the owned question editor.".into());
+            }
+            sample("after_up");
+            Ok(())
+        };
+        // Wine/Openbox can use the first physical click only to activate a
+        // no-activate popup. Establish that explicit foreground precondition
+        // with real input, then independently test the editor click. No SetFocus
+        // or SetForegroundWindow makes either assertion succeed.
+        if unsafe { GetForegroundWindow() } != parent {
+            sample("before_activation_only_click");
+            actual_click()?;
+            wait_for("native popup activation before editing", || {
+                Ok(unsafe { GetForegroundWindow() } == parent)
+            })?;
+            println!("Native popup activated by a physical click; the next distinct click must focus the question editor.");
         }
-        if unsafe { SendInput(2, clicks.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
-            return Err("Cannot click the owned question editor.".into());
-        }
+        sample("before_field_click");
+        actual_click()?;
         wait_for("question editor activation after a real click", || {
             let mut info: GUITHREADINFO = unsafe { zeroed() };
             info.cbSize = size_of::<GUITHREADINFO>() as u32;
@@ -805,6 +839,14 @@ mod windows {
                     GetGUIThreadInfo(GetWindowThreadProcessId(parent, null_mut()), &mut info)
                 } != 0
                 && info.hwndFocus == input)
+        }).map_err(|error| {
+            let foreground=unsafe{GetForegroundWindow()};
+            let mut pid=0;
+            unsafe{GetWindowThreadProcessId(foreground,&mut pid)};
+            let mut info:GUITHREADINFO=unsafe{zeroed()};info.cbSize=size_of::<GUITHREADINFO>() as u32;
+            unsafe{GetGUIThreadInfo(GetWindowThreadProcessId(parent,null_mut()),&mut info)};
+            let point=POINT{x:(rect.left+rect.right)/2,y:(rect.top+rect.bottom)/2};
+            format!("{error}; parent={parent:?}, input={input:?}, rect={},{},{},{}, input_visible={}, foreground={foreground:?}/pid{pid}, focus={:?}, hit={:?}, status={:?}",rect.left,rect.top,rect.right,rect.bottom,unsafe{IsWindowVisible(input)},info.hwndFocus,unsafe{WindowFromPoint(point)},text(parent,254))
         })?;
         Ok(())
     }

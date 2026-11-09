@@ -195,15 +195,40 @@ fn movement(point: POINT, flags: u32) -> Result<(), String> {
     }
     Ok(())
 }
+fn caret_point(edit: HWND, offset: usize) -> Result<POINT, String> {
+    let packed = send(edit, EM_POSFROMCHAR, offset, 0)? as isize;
+    if packed == -1 {
+        return Err("Cannot locate the native recovery caret boundary.".into());
+    }
+    let mut point = POINT {
+        x: (packed as u16 as i16) as i32,
+        y: ((packed as u32 >> 16) as u16 as i16) as i32 + 5,
+    };
+    const EM_CHARFROMPOS: u32 = 0xD7;
+    let hit = send(
+        edit,
+        EM_CHARFROMPOS,
+        0,
+        ((point.x as u32 & 0xffff) | ((point.y as u32 & 0xffff) << 16)) as isize,
+    )?;
+    if hit & 0xffff != offset {
+        return Err(format!(
+            "Native caret round trip returned {}, expected {offset}.",
+            hit & 0xffff
+        ));
+    }
+    if unsafe { ClientToScreen(edit, &mut point) } == 0 {
+        return Err("Cannot map the native recovery caret.".into());
+    }
+    Ok(point)
+}
 fn actual_drag(source: &Source, blank: bool) -> Result<(), String> {
     source.focus(false)?;
     let edit = source.edit as HWND;
-    let mut first = character(edit, if blank { 10 } else { 5 })?;
-    let mut last = character(edit, 10)?;
-    first.x += if blank { 40 } else { 1 };
-    first.y += 6;
-    last.x += if blank { 160 } else { 1 };
-    last.y += 6;
+    let mut first = caret_point(edit, if blank { 10 } else { 5 })?;
+    let mut last = caret_point(edit, 10)?;
+    first.x += if blank { 40 } else { 0 };
+    last.x += if blank { 160 } else { 0 };
     let owned = |point| unsafe { WindowFromPoint(point) == edit };
     for step in 0..=14 {
         let point = POINT {

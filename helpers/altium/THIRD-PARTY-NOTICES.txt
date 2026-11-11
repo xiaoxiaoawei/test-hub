@@ -1,0 +1,18 @@
+OriginalCircuit.AltiumSharp 1.0.2
+Copyright 2020-2023 Original Circuit Limited.
+NuGet package metadata declares MIT; the upstream repository also contains historical Apache-2.0 notices. Both license texts are included under licenses/.
+Package: https://www.nuget.org/packages/OriginalCircuit.AltiumSharp/1.0.2
+Source: https://github.com/issus/AltiumSharp
+
+OpenMcdf 2.4.1
+Copyright 2010-2024 Federico Blaseotto.
+MPL-2.0. This dependency is used unmodified as a separate assembly.
+Corresponding source: https://github.com/ironfede/openmcdf/tree/03ef8cb7a735cdf569886d6c8b21809be3bc38e6
+Package: https://www.nuget.org/packages/OpenMcdf/2.4.1
+
+Microsoft System.Drawing.Common 7.0.0, Microsoft.Win32.SystemEvents 7.0.0,
+System.Text.Encoding.CodePages 7.0.0 and their framework dependencies
+Copyright Microsoft Corporation and contributors. MIT.
+Source: https://github.com/dotnet/runtime
+
+The Package Studio adapter source is newly written. No component from the inspected PackageTool installation is redistributed.

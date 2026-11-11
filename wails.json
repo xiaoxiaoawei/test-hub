@@ -1,0 +1,11 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "PackageStudio",
+  "outputfilename": "PackageStudio",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {"name": "Package Studio"},
+  "info": {"productName": "封装工坊", "productVersion": "0.3.0", "companyName": "Package Studio", "comments": "器件封装转换工具"}
+}

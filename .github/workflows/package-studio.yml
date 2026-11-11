@@ -1,0 +1,163 @@
+name: Package Studio Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['package-studio-v*']
+    paths-ignore: ['updates/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-studio-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check version and release gates
+        run: |
+          python tools/release.py check
+          python -m unittest discover -s tools -p 'test_*.py'
+      - name: Test parsers, exporters and updater
+        run: go test ./internal/...
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python tools/release.py check --tag $env:RELEASE_TAG
+      - name: Build Windows GUI with embedded version and adapters
+        run: ./build.ps1
+      - name: Collect dependency licenses
+        run: python tools/notices.py
+      - name: Package and verify
+        run: |
+          python tools/release.py package
+          python tools/release.py verify
+          python tools/smoke.py build/PackageStudio/PackageStudio.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-studio-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/package-studio-v')
+    needs: [core, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: package-studio-publish
+      queue: max
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: feed
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-studio-windows-x64
+          path: source/dist
+      - name: Verify tag is main source and artifact is intact
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          git -C ../feed merge-base --is-ancestor "$RELEASE_SHA" HEAD
+          python tools/release.py check --tag "$RELEASE_TAG"
+          python tools/release.py verify
+      - name: Publish or resume immutable product release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; its assets must match this build before resuming.'
+          else
+            gh release create "$RELEASE_TAG" dist/package-studio-windows-x64.zip dist/update.json dist/SHA256SUMS.txt --verify-tag --latest=false --title "封装工坊 $RELEASE_TAG" --notes-file dist/release-notes.md
+          fi
+      - name: Verify published downloads before promoting feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir published
+          gh release download "$RELEASE_TAG" --dir published --pattern 'package-studio-windows-x64.zip' --pattern 'update.json' --pattern 'SHA256SUMS.txt'
+          python tools/release.py compare-assets --out dist --other published
+      - name: Publish separate stable update feed on main
+        run: |
+          set -euo pipefail
+          git -C ../feed config user.name 'github-actions[bot]'
+          git -C ../feed config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for attempt in 1 2 3; do
+            if ! git -C ../feed fetch origin main; then
+              echo "Feed fetch failed (attempt $attempt of 3)." >&2
+              continue
+            fi
+            # This checkout contains only the generated feed commit. Regenerate
+            # from current main so monotonic checks see the remote feed, rather
+            # than rebasing an old JSON replacement over a newer release.
+            git -C ../feed reset --hard origin/main
+            python tools/release.py promote --manifest published/update.json --root ../feed
+            git -C ../feed add updates/package-studio/stable.json
+            if git -C ../feed diff --cached --quiet; then
+              echo 'Stable feed already contains the verified release.'
+              exit 0
+            fi
+            git -C ../feed commit -m 'chore: publish Package Studio stable update feed'
+            if git -C ../feed push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Feed push failed (attempt $attempt of 3); retrying against current main." >&2
+          done
+          echo 'Release assets exist, but the stable feed was not published after 3 attempts.' >&2
+          exit 1

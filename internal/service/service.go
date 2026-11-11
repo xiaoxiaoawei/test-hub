@@ -19,7 +19,7 @@ import (
 	"packagestudio/internal/eda"
 )
 
-var Version = "0.6.0"
+var Version = "0.6.1"
 
 type Settings struct {
 	NativeConfig     eda.Config `json:"nativeConfig"`

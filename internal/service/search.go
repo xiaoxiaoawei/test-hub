@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -50,11 +51,16 @@ type SearchResult struct {
 type searchSnapshot struct {
 	result    SearchResult
 	createdAt time.Time
+	order     uint64
 	request   *searchRequest
 	pending   bool
 }
 
 type searchRequest struct{ started time.Time }
+
+// Wall-clock resolution can give several writes the same createdAt. Keep a
+// separate write order so bounded-cache eviction never depends on map iteration.
+var searchSnapshotOrder atomic.Uint64
 
 // SearchParts performs one explicitly requested lookup against EasyEDA Pro's
 // public website search. This is not LCSC's separately approved partner API.
@@ -204,7 +210,7 @@ func (s *Service) SearchParts(ctx context.Context, query string, page int) (Sear
 		s.searchMu.Unlock()
 		return SearchResult{}, context.Canceled
 	}
-	s.searchSnapshots[query] = searchSnapshot{result: result, createdAt: time.Now(), request: request}
+	s.searchSnapshots[query] = searchSnapshot{result: result, createdAt: time.Now(), order: searchSnapshotOrder.Add(1), request: request}
 	published = true
 	s.searchMu.Unlock()
 	return searchPage(result, page), nil
@@ -227,17 +233,27 @@ func (s *Service) beginSearch(query string) *searchRequest {
 	}
 	if len(s.searchSnapshots) >= searchCacheEntries {
 		oldestKey := ""
-		var oldest time.Time
+		var oldest searchSnapshot
 		for key, snapshot := range s.searchSnapshots {
-			if oldestKey == "" || snapshot.createdAt.Before(oldest) {
-				oldestKey, oldest = key, snapshot.createdAt
+			if oldestKey == "" || olderSearchSnapshot(key, snapshot, oldestKey, oldest) {
+				oldestKey, oldest = key, snapshot
 			}
 		}
 		delete(s.searchSnapshots, oldestKey)
 	}
 	request := &searchRequest{started: now}
-	s.searchSnapshots[query] = searchSnapshot{createdAt: now, request: request, pending: true}
+	s.searchSnapshots[query] = searchSnapshot{createdAt: now, order: searchSnapshotOrder.Add(1), request: request, pending: true}
 	return request
+}
+
+func olderSearchSnapshot(key string, snapshot searchSnapshot, otherKey string, other searchSnapshot) bool {
+	if !snapshot.createdAt.Equal(other.createdAt) {
+		return snapshot.createdAt.Before(other.createdAt)
+	}
+	if snapshot.order != other.order {
+		return snapshot.order < other.order
+	}
+	return key < otherKey
 }
 
 func searchPage(snapshot SearchResult, page int) SearchResult {

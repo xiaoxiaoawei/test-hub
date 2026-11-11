@@ -246,6 +246,88 @@ func TestSearchSnapshotExpiryCacheBoundAndFailedRefresh(t *testing.T) {
 	}
 }
 
+func TestSearchSameTimestampEvictionPreservesCacheWriteOrder(t *testing.T) {
+	s := mockSearchService(t, func(*http.Request) (*http.Response, error) {
+		return searchResponse(200, `{"code":0,"result":{"total":0,"productList":[]}}`), nil
+	})
+	stamp := time.Now()
+	var lastOrder uint64
+	write := func(query string) {
+		t.Helper()
+		if _, err := s.SearchParts(context.Background(), query, 1); err != nil {
+			t.Fatal(err)
+		}
+		cached := s.searchSnapshots[query]
+		if cached.order <= lastOrder {
+			t.Fatal("cache writes must receive increasing order")
+		}
+		lastOrder = cached.order
+		// Simulate a coarse clock: every successful result has exactly the same
+		// timestamp. Query names deliberately run opposite to insertion order.
+		cached.createdAt = stamp
+		s.searchSnapshots[query] = cached
+	}
+	for i := searchCacheEntries; i > 0; i-- {
+		write(fmt.Sprintf("model-%02d", i))
+	}
+	// Refreshing the oldest entry makes it newest even under a tied timestamp.
+	write(fmt.Sprintf("model-%02d", searchCacheEntries))
+	for i := searchCacheEntries - 1; i > 0; i-- {
+		write(fmt.Sprintf("new-model-%02d", i))
+		if len(s.searchSnapshots) != searchCacheEntries {
+			t.Fatalf("unbounded cache: %d", len(s.searchSnapshots))
+		}
+		if _, ok := s.searchSnapshots[fmt.Sprintf("model-%02d", i)]; ok {
+			t.Fatalf("same-time snapshot model-%02d was not evicted in write order", i)
+		}
+		if _, ok := s.searchSnapshots[fmt.Sprintf("model-%02d", searchCacheEntries)]; !ok {
+			t.Fatal("refreshed snapshot was evicted before older writes")
+		}
+	}
+}
+
+func TestSearchSameTimestampPendingReservationsEvictInOrder(t *testing.T) {
+	s := &Service{}
+	stamp := time.Now()
+	var lastOrder uint64
+	for i := 0; i <= searchCacheEntries; i++ {
+		query := fmt.Sprintf("pending-%02d", searchCacheEntries-i)
+		request := s.beginSearch(query)
+		cached := s.searchSnapshots[query]
+		if !cached.pending || cached.request != request || cached.order <= lastOrder {
+			t.Fatal("pending search lost its generation or write order")
+		}
+		lastOrder = cached.order
+		cached.createdAt = stamp
+		s.searchSnapshots[query] = cached
+	}
+	if len(s.searchSnapshots) != searchCacheEntries {
+		t.Fatal("pending searches exceeded the cache bound")
+	}
+	if _, ok := s.searchSnapshots[fmt.Sprintf("pending-%02d", searchCacheEntries)]; ok {
+		t.Fatal("oldest same-time pending search was not evicted")
+	}
+	if _, ok := s.searchSnapshots["pending-00"]; !ok {
+		t.Fatal("newest pending search was evicted")
+	}
+}
+
+func TestSearchSnapshotEvictionOrderingUsesAgeThenSequenceThenKey(t *testing.T) {
+	stamp := time.Now()
+	older := searchSnapshot{createdAt: stamp.Add(-time.Second), order: 99}
+	newer := searchSnapshot{createdAt: stamp, order: 1}
+	if !olderSearchSnapshot("z", older, "a", newer) || olderSearchSnapshot("a", newer, "z", older) {
+		t.Fatal("sequence overrode snapshot age")
+	}
+	first, second := searchSnapshot{createdAt: stamp, order: 1}, searchSnapshot{createdAt: stamp, order: 2}
+	if !olderSearchSnapshot("z", first, "a", second) || olderSearchSnapshot("a", second, "z", first) {
+		t.Fatal("query order overrode tied-time write sequence")
+	}
+	if !olderSearchSnapshot("a", first, "z", first) || olderSearchSnapshot("z", first, "a", first) {
+		t.Fatal("identical age and order did not use a stable final key")
+	}
+}
+
 func TestSearchLateOlderRefreshCannotReplaceOrDeleteNewSnapshot(t *testing.T) {
 	for _, olderFails := range []bool{false, true} {
 		t.Run(fmt.Sprintf("olderFails=%v", olderFails), func(t *testing.T) {

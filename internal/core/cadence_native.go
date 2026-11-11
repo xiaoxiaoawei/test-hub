@@ -47,6 +47,12 @@ func CadenceEntryNames(parts []Part) []string {
 // generated script package. Capture append must receive a copied OLB at the
 // returned CaptureLibrary path; the original user library is never opened here.
 func PrepareCadenceNative(batch string, parts []Part, nonce string, appendCapture bool, unitsPerInch float64) (CadenceNativePlan, error) {
+	return PrepareCadenceNativeWithModelAssociation(batch, parts, nonce, appendCapture, unitsPerInch, false)
+}
+
+// PrepareCadenceNativeWithModelAssociation opts into native STEP execution. The
+// default plan builds/readbacks 2D libraries and retains separate prepared jobs.
+func PrepareCadenceNativeWithModelAssociation(batch string, parts []Part, nonce string, appendCapture bool, unitsPerInch float64, associateModels bool) (CadenceNativePlan, error) {
 	plan := CadenceNativePlan{Nonce: nonce, Entries: CadenceEntryNames(parts), Allegro: []CadenceNativeAllegro{}}
 	if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(nonce) {
 		return plan, errors.New("Cadence native nonce无效")
@@ -112,6 +118,9 @@ func PrepareCadenceNative(batch string, parts []Part, nonce string, appendCaptur
 		if strings.Count(string(skill), needle) != 1 {
 			return plan, errors.New("Allegro构建脚本保存点无效")
 		}
+		if associateModels && job.ModelFile != "" {
+			skill = []byte(strings.Replace(string(skill), needle, cadenceModelMapping(filepath.Base(job.ModelFile))+needle, 1))
+		}
 		tag := fmt.Sprintf("    axlDBCreatePropDictEntry(\"PACKAGE_STUDIO_NONCE\" \"string\" \"designs\")\n    axlDBAddProp(axlDBGetDesign() list(\"PACKAGE_STUDIO_NONCE\" %s))\n", skillString(nonce))
 		skillText := strings.Replace(string(skill), needle, tag+needle, 1) + "\nprocedure(psNativeBuildReport() let((r) r=outfile(\"native-build.tsv.tmp\" \"w\") fprintf(r \"protocol\\tpackage-studio.cadence/1\\nphase\\tbuild\\nnonce\\t%s\\ncomplete\\t1\\n\" axlDBGetDesign()->prop->PACKAGE_STUDIO_NONCE) close(r) unless(renameFile(\"native-build.tsv.tmp\" \"native-build.tsv\") error(\"Cannot publish complete build report\"))))\n"
 		if err = os.WriteFile(path, []byte(skillText), 0600); err != nil {
@@ -120,13 +129,17 @@ func PrepareCadenceNative(batch string, parts []Part, nonce string, appendCaptur
 		if err = put(job.Script, "skill load(\"build.il\")\nskill psBuildPackage()\nskill psNativeBuildReport()\nexit\n"); err != nil {
 			return plan, err
 		}
-		if err = put(job.Directory+"/native-readback.il", allegroNativeReadback(job, nonce, false)); err != nil {
+		readbackJob := job
+		if !associateModels {
+			readbackJob.ModelFile = ""
+		}
+		if err = put(job.Directory+"/native-readback.il", allegroNativeReadback(readbackJob, nonce, false)); err != nil {
 			return plan, err
 		}
 		if err = put(native.ReadbackScript, "skill load(\"native-readback.il\")\nskill psNativeReadback()\nexit\n"); err != nil {
 			return plan, err
 		}
-		if err = put(job.Directory+"/native-compiled.il", allegroNativeReadback(job, nonce, true)); err != nil {
+		if err = put(job.Directory+"/native-compiled.il", allegroNativeReadback(readbackJob, nonce, true)); err != nil {
 			return plan, err
 		}
 		if err = put(native.CompiledScript, "skill load(\"native-compiled.il\")\nskill psNativeReadback()\nexit\n"); err != nil {
@@ -271,9 +284,12 @@ foreach psDevice [lindex $psPackageData 2] {
 
 func allegroNativeReadback(job CadenceAllegroJob, nonce string, compiled bool) string {
 	var b strings.Builder
-	b.WriteString("; Independent native readback. Run only in the private batch process.\nprocedure(psNativeReadback()\n let((design nativeNonce r placed entry pins)\n")
+	b.WriteString("; Independent native readback. Run only in the private batch process.\nprocedure(psNativeReadback()\n let((design nativeNonce r placed entry pins modelFile modelTransform modelAttachment)\n")
 	if compiled {
 		b.WriteString("  unless(axlOpenDesign(?design \"placement-check.brd\" ?mode \"n\" ?noMru t) error(\"Cannot create isolated placement check\"))\n  axlSetVariable(\"padpath\" \".\")\n  axlSetVariable(\"psmpath\" \".\")\n")
+		if job.ModelFile != "" {
+			b.WriteString("  axlSetVariable(\"steppath\" \".\")\n")
+		}
 		fmt.Fprintf(&b, "  placed=car(axlDBCreateSymbol(list(%s \"package\") list(0.0 0.0)))\n  unless(placed error(\"Compiled PSM cannot be loaded/placed\"))\n  entry=placed->name\n  pins=placed->pins\n  nativeNonce=%s\n  r=outfile(\"native-compiled.tsv.tmp\" \"w\")\n", skillString(job.Entry), skillString(nonce))
 	} else {
 		fmt.Fprintf(&b, "  unless(axlOpenDesignForBatch(%s \"wf\") error(\"Cannot reopen staged DRA\"))\n  design=axlDBGetDesign()\n  nativeNonce=design->prop->PACKAGE_STUDIO_NONCE\n  unless(nativeNonce==%s error(\"DRA nonce mismatch\"))\n  entry=axlGetDrawingName()\n  pins=design->pins\n  axlSetVariable(\"padpath\" \".\")\n", skillString(job.Entry+".dra"), skillString(nonce))
@@ -284,6 +300,10 @@ func allegroNativeReadback(job CadenceAllegroJob, nonce string, compiled bool) s
 			}
 		}
 		b.WriteString("  r=outfile(\"native-readback.tsv.tmp\" \"w\")\n")
+	}
+	if job.ModelFile != "" {
+		b.WriteString("  unless(r error(\"Cannot write model readback report\"))\n")
+		b.WriteString(cadenceModelReadback(compiled, job.Entry))
 	}
 	phase := "readback"
 	if compiled {

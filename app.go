@@ -93,9 +93,9 @@ func (a *App) ChooseNativePath(kind string) (string, error) {
 		return "", errors.New("请在桌面程序中浏览 EDA 路径")
 	}
 	switch kind {
-	case "padsRoot", "allegroDirectory":
+	case "padsRoot", "allegroDirectory", "padsReuseDirectory":
 		return wruntime.OpenDirectoryDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择 EDA 安装或库目录"})
-	case "captureExe", "allegroExe":
+	case "captureExe", "allegroExe", "padsModelExe":
 		return wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择 EDA 可执行文件", Filters: []wruntime.FileFilter{{DisplayName: "EDA 可执行文件", Pattern: "*.exe"}}})
 	case "captureLibrary":
 		return wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择已有 Capture 库", Filters: []wruntime.FileFilter{{DisplayName: "Capture Library", Pattern: "*.olb"}}})

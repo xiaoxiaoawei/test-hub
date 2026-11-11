@@ -81,8 +81,16 @@ generated Basic and inventory/log evidence. Copied CAD executables, native
 library copies, templates and INI settings are excluded. No diagnostic is uploaded.
 The temporary SDK workspace itself is removed.
 
-The helper closes only its owned process after Basic completes. Its exact
-flush/exit behavior and whether a version resolves `common/config.ini` relative
+The helper requests a normal close of only its owned process after Basic
+completes, then requires actual exit with code zero. A missing closable window,
+nonzero exit, timeout or required forced kill rejects the output; a DONE marker
+alone is insufficient. Forced termination is reserved for failure cleanup.
+The owned CAD uses normal window startup and Basic makes its own window visible
+after the guarded operation, because .NET cannot discover a hidden main window
+for orderly closing. The helper console remains hidden. The PID written inside
+Basic must equal the exact Process.Start PID; launcher redirection is refused.
+Private-window and save/flush behavior still require real SDK acceptance rather
+than silently accepting killed processes. Whether a version resolves `common/config.ini` relative
 to the private executable or original `SDD_HOME` still need real SDK acceptance.
 Independent reopen and unchanged-file hash checks must reject missing or changed
 data; they do not justify broadening the version scope.
@@ -92,8 +100,10 @@ Windows Mark-of-the-Web, and enterprise/system policy may refuse an unsigned
 helper. In that case native export reports an error. The adapter does not change
 execution policy, remove security metadata or modify system settings to bypass it.
 
-STEP files remain independent attachments. **Reuse/3DModels association is not
-implemented** and is never inferred from the existence of a STEP file.
+The separate modern **Reuse/3DModels candidate adapter** is documented in
+[MODELS.md](MODELS.md). It is independent of this Classic 9.4 four-file adapter.
+STEP attachments alone do not prove an association. Native 2D plus native modern
+3D in one request is refused until they can share one verified transaction.
 
 ## Protocol and acceptance checks
 

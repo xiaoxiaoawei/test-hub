@@ -6,6 +6,7 @@ function BasicString([string]$value) {
 
 function New-StudioPADSBasic($Job,$Library,[string]$Role,[bool]$First,[string]$PrivateExe,[string]$Record,[string]$Base) {
  $builder=New-Object Text.StringBuilder
+ [void]$builder.AppendLine('Declare Function GetCurrentProcessId Lib "kernel32" () As Long')
  [void]$builder.AppendLine('Sub DumpItems(ByVal lib As Object, ByVal label As String, ByVal channel As Integer)')
  [void]$builder.AppendLine('  Dim kind As Integer, entry As Object, collection As Object, counted As Long')
  [void]$builder.AppendLine('  For kind = 0 To 3')
@@ -25,6 +26,7 @@ function New-StudioPADSBasic($Job,$Library,[string]$Role,[bool]$First,[string]$P
  [void]$builder.AppendLine(('  If LCase(Application.FullName) <> LCase('+(BasicString $privateExe)+') Then Err.Raise 2002, , "Unexpected CAD executable"'))
  [void]$builder.AppendLine('  stream = FreeFile')
  [void]$builder.AppendLine(('  Open '+(BasicString $record)+' For Output As #stream'))
+ [void]$builder.AppendLine('  Print #stream, "PID|" & CStr(GetCurrentProcessId())')
  [void]$builder.AppendLine('  Print #stream, "VERSION|" & Application.Version')
  [void]$builder.AppendLine(('  Set lib = Application.Libraries('+(BasicString ([IO.Path]::GetFileName($base)))+')'))
  [void]$builder.AppendLine('  If lib Is Nothing Then Err.Raise 2003, , "Private staging library unavailable"')
@@ -57,7 +59,7 @@ function New-StudioPADSBasic($Job,$Library,[string]$Role,[bool]$First,[string]$P
  [void]$builder.AppendLine('  DumpItems lib, "AFTER", stream')
  [void]$builder.AppendLine(('  Print #stream, '+(BasicString ('DONE|'+$job.nonce))))
  [void]$builder.AppendLine('  Close #stream')
- [void]$builder.AppendLine('  Application.Visible = False')
+ [void]$builder.AppendLine('  Application.Visible = True')
  [void]$builder.AppendLine('  Exit Sub')
  [void]$builder.AppendLine('Failed:')
  [void]$builder.AppendLine('  On Error Resume Next')

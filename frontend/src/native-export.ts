@@ -1,12 +1,13 @@
 import type { ExportMetadata, NativeConfig } from './types';
 
 export function defaultNativeConfig():NativeConfig {
- return {enabled:false,libraryMode:'new',padsRoot:'',padsSymbolLibrary:'',padsFootprintLibrary:'',captureExe:'',allegroExe:'',allegroProduct:'',captureLibrary:'',allegroDirectory:'',captureUnitsPerInch:100};
+ return {enabled:false,libraryMode:'new',padsRoot:'',padsSymbolLibrary:'',padsFootprintLibrary:'',captureExe:'',allegroExe:'',allegroProduct:'',captureLibrary:'',allegroDirectory:'',captureUnitsPerInch:100,modelAssociationMode:'prepare',padsModelExe:'',padsReuseDirectory:''};
 }
 export function normalizeNativeConfig(value?:Partial<NativeConfig>):NativeConfig {
  const defaults=defaultNativeConfig();const result={...defaults,...value};
  result.enabled=value?.enabled===true;result.libraryMode=value?.libraryMode==='append'?'append':'new';
- for(const key of ['padsRoot','padsSymbolLibrary','padsFootprintLibrary','captureExe','allegroExe','allegroProduct','captureLibrary','allegroDirectory'] as const)result[key]=typeof result[key]==='string'?result[key]:'';
+ result.modelAssociationMode=value?.modelAssociationMode==='native'?'native':'prepare';
+ for(const key of ['padsRoot','padsSymbolLibrary','padsFootprintLibrary','captureExe','allegroExe','allegroProduct','captureLibrary','allegroDirectory','padsModelExe','padsReuseDirectory'] as const)result[key]=typeof result[key]==='string'?result[key]:'';
  if(!Number.isFinite(result.captureUnitsPerInch) || result.captureUnitsPerInch<=0)result.captureUnitsPerInch=100;
  return result;
 }

@@ -20,8 +20,8 @@ onMounted(()=>void refresh());onBeforeUnmount(()=>{alive=false;generation++;});
 </script>
 <template>
  <div class="native-export-options">
-  <label class="checkbox-label native-enable"><input type="checkbox" :checked="modelValue.enabled" :disabled="disabled" @change="set('enabled',($event.target as HTMLInputElement).checked)"><span>由本机 EDA 生成原生库<br><small>待实际 EDA 验证</small></span></label>
-  <p v-if="target==='pads'" class="field-hint">原生生成仅支持 PADS Classic 9.4 / 32 位 SDK（待实机验证）。</p>
+  <label class="checkbox-label native-enable"><input type="checkbox" :checked="modelValue.enabled" :disabled="disabled" @change="set('enabled',($event.target as HTMLInputElement).checked)"><span>由本机 EDA 生成 2D 原生库<br><small>待实际 EDA 验证</small></span></label>
+  <p v-if="target==='pads'" class="field-hint">2D 原生库生成仅支持 PADS Classic 9.4 / 32 位 SDK（待实机验证）；3D 引擎在下方另选。</p>
   <p class="field-hint" v-if="!modelValue.enabled">当前输出{{target==='pads'?' PADS ASCII 导入包':' Cadence 脚本包'}}，可保留后手工执行。</p>
   <template v-if="modelValue.enabled">
    <div class="native-environment-heading"><strong>本机引擎</strong><button class="text-button" :disabled="loading || disabled" @click="refresh"><Icon name="refresh" :size="13"/>{{loading?'检测中':'重新检测'}}</button></div>
@@ -43,7 +43,7 @@ onMounted(()=>void refresh());onBeforeUnmount(()=>{alive=false;generation++;});
     <template v-else><label v-if="includeSymbol" class="native-field">现有 Capture 库<span class="native-path-row"><input :value="modelValue.captureLibrary" :disabled="disabled" placeholder="现有 .olb 文件" @input="set('captureLibrary',inputValue($event))"><button class="secondary-button compact" :disabled="disabled || !!choosing" @click="browse('captureLibrary')">选择</button></span></label><label v-if="includeFootprint" class="native-field">现有 Allegro 库目录<span class="native-path-row"><input :value="modelValue.allegroDirectory" :disabled="disabled" placeholder="包含封装与焊盘的现有库目录" @input="set('allegroDirectory',inputValue($event))"><button class="secondary-button compact" :disabled="disabled || !!choosing" @click="browse('allegroDirectory')">选择</button></span></label></template>
     <p class="field-hint">关闭占用目标库的 EDA 后追加，同名条目冲突会停止。</p>
    </template>
-   <p class="field-hint">3D 如有提供仅作为附件交付，不代表已完成 Reuse 或原生模型关联。</p>
+   <p class="field-hint">3D 模型由下方的关联选项设置，实际状态见导出结果。</p>
    <p v-for="warning in environment?.warnings || []" :key="warning" class="native-warning">{{warning}}</p>
   </template>
   <p v-if="error" class="native-error" role="alert">{{error}}</p>

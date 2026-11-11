@@ -46,7 +46,7 @@ func TestNativeSettingsAndOldDefaults(t *testing.T) {
 		t.Fatal("native enabled by default")
 	}
 	cfg.NativeConfig = eda.Config{Enabled: true, LibraryMode: "append", PADSRoot: "selected", CaptureLibrary: "library"}
-	if _, e = s.SaveSettings(cfg); e != nil {
+	if cfg, e = s.SaveSettings(cfg); e != nil {
 		t.Fatal(e)
 	}
 	s, e = New(root)

@@ -5,6 +5,9 @@ package eda
 import "packagestudio/internal/core"
 
 type Config struct {
+	ModelAssociationMode string  `json:"modelAssociationMode"`
+	PADSModelExe         string  `json:"padsModelExe"`
+	PADSReuseDirectory   string  `json:"padsReuseDirectory"`
 	Enabled              bool    `json:"enabled"`
 	LibraryMode          string  `json:"libraryMode"`
 	PADSRoot             string  `json:"padsRoot"`

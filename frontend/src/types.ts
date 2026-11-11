@@ -19,9 +19,10 @@ export interface UpdateDownloadResult {path:string;version:string;verified:boole
 export interface PartSearchItem {lcscId:string;name:string;manufacturer:string;package:string;description:string;sourceUrl:string}
 export interface PartSearchResult {query:string;page:number;pageSize:number;total:number;hasMore:boolean;items:PartSearchItem[];source:string;limit?:number;truncated?:boolean;message?:string}
 
-export interface NativeConfig {enabled:boolean;libraryMode:'new'|'append';padsRoot:string;padsSymbolLibrary:string;padsFootprintLibrary:string;captureExe:string;allegroExe:string;allegroProduct:string;captureLibrary:string;allegroDirectory:string;captureUnitsPerInch:number}
-export type NativePathKind='padsRoot'|'padsSymbolLibrary'|'padsFootprintLibrary'|'captureExe'|'allegroExe'|'captureLibrary'|'allegroDirectory';
+export interface NativeConfig {enabled:boolean;libraryMode:'new'|'append';padsRoot:string;padsSymbolLibrary:string;padsFootprintLibrary:string;captureExe:string;allegroExe:string;allegroProduct:string;captureLibrary:string;allegroDirectory:string;captureUnitsPerInch:number;modelAssociationMode:'prepare'|'native';padsModelExe:string;padsReuseDirectory:string}
+export type NativePathKind='padsRoot'|'padsSymbolLibrary'|'padsFootprintLibrary'|'captureExe'|'allegroExe'|'captureLibrary'|'allegroDirectory'|'padsModelExe'|'padsReuseDirectory';
 export interface NativeInstallation {id:string;product:string;root:string;executable:string;version:string;architecture:string;source:string;ready:boolean;runtimeVerified:boolean;message?:string}
 export interface NativeEnvironment {pads:NativeInstallation[];cadence:NativeInstallation[];warnings:string[]}
-export interface ExportMetadata {artifactType?:string;nativeGenerated?:boolean;runtimeVerified?:boolean;backupDirectory?:string;validationStatus?:string}
+export interface ExportMetadata {artifactType?:string;nativeGenerated?:boolean;runtimeVerified?:boolean;backupDirectory?:string;validationStatus?:string;modelAssociations?:ModelAssociation[]}
+export interface ModelAssociation {partId:string;entry:string;target:string;modelFile?:string;modelSha256?:string;modelName?:string;status:'prepared'|'associated'|'unavailable'|'unsupported';verified:boolean;geometryVerified?:boolean;expectedBBoxMm?:number[];actualBBoxMm?:number[];message?:string}
 export interface PartListResult {fileName:string;ids:string[];duplicates:number;totalRows:number;warnings:string[]}

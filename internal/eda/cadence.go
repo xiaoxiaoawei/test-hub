@@ -63,6 +63,17 @@ func exportCadence(ctx context.Context, request Request, runner cadenceRunner) (
 	if len(request.Parts) == 0 || !request.IncludeSymbol && !request.IncludeFootprint {
 		return result, errors.New("请选择器件及至少一种导出内容")
 	}
+	if request.Config.ModelAssociationMode != "" && request.Config.ModelAssociationMode != "prepare" && request.Config.ModelAssociationMode != "native" {
+		return result, errors.New("Cadence模型关联模式必须为prepare或native")
+	}
+	associateModels := request.IncludeModel && request.Config.ModelAssociationMode == "native"
+	if request.IncludeModel && !request.IncludeFootprint {
+		for _, part := range request.Parts {
+			if part.Model != nil && part.Model.Path != "" {
+				return result, errors.New("Capture OLB不能独立关联STEP；请同时选择Allegro PCB封装进行原生模型关联")
+			}
+		}
+	}
 	if err = directPath(request.OutputDirectory); err != nil {
 		return result, err
 	}
@@ -150,42 +161,15 @@ func exportCadence(ctx context.Context, request Request, runner cadenceRunner) (
 		return result, err
 	}
 	batch := generated.Directory
-	if request.IncludeModel && !request.IncludeFootprint {
-		names := core.CadenceEntryNames(parts)
-		for i, part := range parts {
-			if part.Model == nil || part.Model.Path == "" {
-				continue
-			}
-			ext := strings.ToLower(filepath.Ext(part.Model.Path))
-			if ext != ".step" && ext != ".stp" {
-				return result, errors.New("Cadence独立模型仅支持STEP/STP")
-			}
-			if e := cadenceRegularFile(part.Model.Path); e != nil {
-				return result, e
-			}
-			info, statErr := os.Stat(part.Model.Path)
-			if statErr != nil {
-				return result, statErr
-			}
-			if info.Size() > 128*1024*1024 {
-				return result, errors.New("STEP模型超过128MiB")
-			}
-			dir := filepath.Join(batch, "step")
-			if e := os.MkdirAll(dir, 0700); e != nil {
-				return result, e
-			}
-			if e := copyExclusive(part.Model.Path, filepath.Join(dir, names[i]+ext)); e != nil {
-				return result, e
-			}
-			result.Warnings = append(result.Warnings, "STEP已独立复制；没有自动关联Cadence 3D模型，请在目标软件核对朝向和比例。")
-		}
+	if request.IncludeModel && request.IncludeFootprint {
+		result.ModelAssociations = append([]core.ModelAssociation(nil), generated.ModelAssociations...)
 	}
 	var entropy [32]byte
 	if _, err = rand.Read(entropy[:]); err != nil {
 		return result, err
 	}
 	nonce := hex.EncodeToString(entropy[:])
-	plan, err := core.PrepareCadenceNative(batch, parts, nonce, mode == "append" && request.IncludeSymbol, request.Config.CaptureUnitsPerInch)
+	plan, err := core.PrepareCadenceNativeWithModelAssociation(batch, parts, nonce, mode == "append" && request.IncludeSymbol, request.Config.CaptureUnitsPerInch, associateModels)
 	if err != nil {
 		return result, err
 	}
@@ -207,7 +191,7 @@ func exportCadence(ctx context.Context, request Request, runner cadenceRunner) (
 	// All target-name conflicts are checked before starting any EDA process.
 	if mode == "append" && request.IncludeFootprint {
 		for _, job := range plan.Allegro {
-			for _, rel := range job.ExpectedFiles {
+			for _, rel := range cadencePublicationFiles(job.CadenceAllegroJob) {
 				dst := filepath.Join(request.Config.AllegroDirectory, filepath.Base(rel))
 				if err = directPath(dst); err != nil {
 					return result, err
@@ -254,6 +238,11 @@ func exportCadence(ctx context.Context, request Request, runner cadenceRunner) (
 	}
 	for i, job := range plan.Allegro {
 		dir := filepath.Join(batch, filepath.FromSlash(job.Directory))
+		if job.ModelFile != "" {
+			if e := cadenceVerifyModelSource(batch, job.CadenceAllegroJob); e != nil {
+				return result, e
+			}
+		}
 		for _, phase := range []struct{ script, report, kind string }{{job.Script, job.BuildReport, "build"}, {job.ReadbackScript, job.ReadbackReport, "readback"}, {job.CompiledScript, job.CompiledReport, "readback-psm"}} {
 			args := []string{"-nograph", "-s", filepath.Base(phase.script)}
 			if request.Config.AllegroProduct != "" {
@@ -272,6 +261,16 @@ func exportCadence(ctx context.Context, request Request, runner cadenceRunner) (
 				if err = verifyAllegroInventory(rows, parts[i], job.Entry); err != nil {
 					return result, err
 				}
+				if associateModels && job.ModelFile != "" {
+					if err = verifyCadenceModelReadback(rows, job.CadenceAllegroJob, phase.kind == "readback-psm"); err != nil {
+						return result, err
+					}
+				}
+			}
+		}
+		if job.ModelFile != "" {
+			if err = cadenceVerifyModelSource(batch, job.CadenceAllegroJob); err != nil {
+				return result, err
 			}
 		}
 		for _, rel := range job.ExpectedFiles {
@@ -329,7 +328,7 @@ func exportCadence(ctx context.Context, request Request, runner cadenceRunner) (
 		}
 	}
 	for _, job := range plan.Allegro {
-		for _, rel := range job.ExpectedFiles {
+		for _, rel := range cadencePublicationFiles(job.CadenceAllegroJob) {
 			dst := filepath.Join(artifact, "native", filepath.FromSlash(rel))
 			if mode == "append" {
 				dst = filepath.Join(request.Config.AllegroDirectory, filepath.Base(rel))
@@ -355,7 +354,28 @@ func exportCadence(ctx context.Context, request Request, runner cadenceRunner) (
 	result.NativeGenerated = true
 	result.RuntimeVerified = true
 	result.ValidationStatus = "engine-readback-verified"
+	for i := range result.ModelAssociations {
+		association := &result.ModelAssociations[i]
+		if association.Status != "prepared" {
+			continue
+		}
+		dst := filepath.Join(artifact, "native", "allegro", association.Entry, association.ModelName)
+		if mode == "append" {
+			dst = filepath.Join(request.Config.AllegroDirectory, association.ModelName)
+		}
+		association.ModelFile = dst
+		if !associateModels {
+			continue
+		}
+		association.Status = "associated"
+		association.Verified = true
+		association.GeometryVerified = false
+		association.Message = "所选EDA独立重开DRA/PSM，回读STEP文件名、identity变换及facet附件；未取得目标3D几何包围盒，朝向/高度/尺度仍须在目标EDA核对。"
+	}
 	for _, warning := range generated.Warnings {
+		if associateModels && strings.Contains(warning, "模型关联脚本尚未执行") {
+			continue
+		}
 		if strings.Contains(warning, "当前交付为 Cadence 中间") || strings.Contains(warning, "未发现标准安装") || strings.Contains(warning, "Capture Tcl 已生成，尚未") {
 			continue
 		}

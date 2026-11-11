@@ -19,7 +19,7 @@ import (
 	"packagestudio/internal/eda"
 )
 
-var Version = "0.5.0"
+var Version = "0.6.0"
 
 type Settings struct {
 	NativeConfig     eda.Config `json:"nativeConfig"`
@@ -115,6 +115,16 @@ func (s *Service) GetBootstrap() Bootstrap {
 var lcscPattern = regexp.MustCompile(`(?i)^C[0-9]{2,12}$`)
 
 func (s *Service) FetchPart(ctx context.Context, lcscID string) (core.Part, error) {
+	p, err := s.fetchPartSource(ctx, lcscID)
+	if err != nil {
+		return core.Part{}, err
+	}
+	if err = s.put(p); err != nil {
+		return core.Part{}, err
+	}
+	return p, nil
+}
+func (s *Service) fetchPartSource(ctx context.Context, lcscID string) (core.Part, error) {
 	id := strings.ToUpper(strings.TrimSpace(lcscID))
 	if !lcscPattern.MatchString(id) {
 		return core.Part{}, errors.New("请输入有效的立创 C 编号，例如 C25804")
@@ -143,9 +153,6 @@ func (s *Service) FetchPart(ctx context.Context, lcscID string) (core.Part, erro
 	}
 	p, err := core.ParseEasyEDA(raw, id)
 	if err != nil {
-		return core.Part{}, err
-	}
-	if err = s.put(p); err != nil {
 		return core.Part{}, err
 	}
 	return p, nil
@@ -201,6 +208,9 @@ func (s *Service) RemovePart(partID string) error {
 	return nil
 }
 func normalizeSettings(settings Settings) Settings {
+	if settings.NativeConfig.ModelAssociationMode != "native" {
+		settings.NativeConfig.ModelAssociationMode = "prepare"
+	}
 	if settings.NativeConfig.LibraryMode != "append" {
 		settings.NativeConfig.LibraryMode = "new"
 	}
@@ -249,6 +259,15 @@ func (s *Service) ExportPartsContext(ctx context.Context, req ExportRequest) (re
 	if req.NativeConfig.Enabled && req.NativeConfig.LibraryMode != "" && req.NativeConfig.LibraryMode != "new" && req.NativeConfig.LibraryMode != "append" {
 		return core.ExportResult{}, errors.New("无效的原生库模式")
 	}
+	// Older clients keep a checked model flag when footprint export is disabled.
+	// Preserve symbol-only behavior and avoid any model download/engine calls.
+	req.IncludeModel = req.IncludeModel && req.IncludeFootprint
+	if req.NativeConfig.ModelAssociationMode != "" && req.NativeConfig.ModelAssociationMode != "prepare" && req.NativeConfig.ModelAssociationMode != "native" {
+		return core.ExportResult{}, errors.New("未知的3D模型关联模式")
+	}
+	if req.IncludeModel && req.Target == "cadence" && req.NativeConfig.ModelAssociationMode == "native" && !req.NativeConfig.Enabled {
+		return core.ExportResult{}, errors.New("Cadence 本机模型关联需要先启用原生库导出")
+	}
 	if strings.TrimSpace(req.OutputDirectory) == "" {
 		return core.ExportResult{}, errors.New("请先选择导出目录")
 	}
@@ -293,6 +312,14 @@ func (s *Service) ExportPartsContext(ctx context.Context, req ExportRequest) (re
 		model := *parts[i].Model
 		parts[i].Model = &model
 		parts[i].Model.Path = ""
+		if req.IncludeModel && req.IncludeFootprint && (req.Target == "pads" || req.Target == "cadence") {
+			prepared, err := s.prepareAssociationModel(ctx, parts[i])
+			if err != nil {
+				return core.ExportResult{}, fmt.Errorf("%s 的3D自动关联准备失败：%w", parts[i].Name, err)
+			}
+			parts[i].Model = prepared
+			continue
+		}
 		if req.IncludeModel && req.IncludeFootprint && model.UUID != "" {
 			modelCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 			path, err := s.downloadModel(modelCtx, model.UUID, "step")
@@ -325,10 +352,18 @@ func (s *Service) ExportPartsContext(ctx context.Context, req ExportRequest) (re
 		return exportAltium(parts, req)
 	}
 	if req.Target == "pads" {
-		return core.ExportPADS(parts, req.OutputDirectory, req.LibraryName, req.IncludeSymbol, req.IncludeFootprint)
+		result, exportErr = core.ExportPADS(parts, req.OutputDirectory, req.LibraryName, req.IncludeSymbol, req.IncludeFootprint)
+		if exportErr != nil || !req.IncludeModel {
+			return result, exportErr
+		}
+		return eda.ExportPADSModels(ctx, eda.Request{Parts: parts, OutputDirectory: req.OutputDirectory, LibraryName: req.LibraryName, IncludeSymbol: req.IncludeSymbol, IncludeFootprint: req.IncludeFootprint, IncludeModel: req.IncludeModel, Config: req.NativeConfig}, result)
 	}
 	if req.Target == "cadence" {
-		return core.ExportCadence(parts, req.OutputDirectory, req.LibraryName, req.IncludeSymbol, req.IncludeFootprint)
+		result, exportErr = core.ExportCadence(parts, req.OutputDirectory, req.LibraryName, req.IncludeSymbol, req.IncludeFootprint)
+		if !req.IncludeModel {
+			result.ModelAssociations = nil
+		}
+		return result, exportErr
 	}
 	return core.ExportKiCad(parts, req.OutputDirectory, req.LibraryName, req.IncludeSymbol, req.IncludeFootprint)
 }

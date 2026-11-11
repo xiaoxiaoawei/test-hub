@@ -95,6 +95,9 @@ func exportPADSNative(ctx context.Context, req Request, deps padsDependencies) (
 	if req.Config.LibraryMode == "" {
 		req.Config.LibraryMode = "new"
 	}
+	if req.IncludeModel && req.Config.ModelAssociationMode == "native" {
+		return result, errors.New("原生 2D 库与现代 Reuse 暂不支持同批原子提交；请使用 ASCII + Reuse 关联单独导出")
+	}
 	if !req.Config.Enabled {
 		return result, errors.New("请先启用本机 EDA 原生集成；PADS ASCII 导出与原生库生成是不同操作")
 	}
@@ -301,6 +304,52 @@ func exportPADSNative(ctx context.Context, req Request, deps padsDependencies) (
 	if err = ctx.Err(); err != nil {
 		return result, err
 	}
+	if req.IncludeModel && req.IncludeFootprint {
+		prepareReq := req
+		prepareReq.OutputDirectory = stage
+		prepareReq.Config.ModelAssociationMode = "prepare"
+		prepared, e := ExportPADSModels(ctx, prepareReq, ascii)
+		if e != nil {
+			return result, fmt.Errorf("PADS 模型关联包准备失败，原生库尚未发布：%w", e)
+		}
+		ascii = prepared
+		result.ModelAssociations = append([]core.ModelAssociation{}, prepared.ModelAssociations...)
+		relocate := func(items []core.ModelAssociation) error {
+			for i := range items {
+				if items[i].ModelFile == "" {
+					continue
+				}
+				rel, e := filepath.Rel(ascii.Directory, items[i].ModelFile)
+				if e != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					return errors.New("PADS prepared 模型路径超出批次")
+				}
+				items[i].ModelFile = filepath.Join(destination, "interchange", rel)
+			}
+			return nil
+		}
+		if e = relocate(result.ModelAssociations); e != nil {
+			return result, e
+		}
+		for _, file := range ascii.Files {
+			if filepath.Base(file) != "associations.json" {
+				continue
+			}
+			raw, e := os.ReadFile(file)
+			if e != nil {
+				return result, e
+			}
+			var items []core.ModelAssociation
+			if e = json.Unmarshal(raw, &items); e != nil {
+				return result, e
+			}
+			if e = relocate(items); e != nil {
+				return result, e
+			}
+			if e = padsWriteJSON(file, items); e != nil {
+				return result, e
+			}
+		}
+	}
 	result.Warnings = append(result.Warnings, ascii.Warnings...)
 	result.Warnings = append(result.Warnings, converted.Warnings...)
 	result.Warnings = append(result.Warnings, verified.Warnings...)
@@ -316,7 +365,7 @@ func exportPADSNative(ctx context.Context, req Request, deps padsDependencies) (
 		}
 		updates = append(updates, FileUpdate{StagedPath: file, Destination: filepath.Join(destination, "interchange", rel)})
 	}
-	report := map[string]any{"generator": "Package Studio", "artifactType": "pads-native-library", "nativeGenerated": true, "runtimeVerified": true, "validationStatus": "native-names-counts-readback", "sdk": sdk, "conversion": converted, "verification": verified, "warnings": result.Warnings}
+	report := map[string]any{"generator": "Package Studio", "artifactType": "pads-native-library", "nativeGenerated": true, "runtimeVerified": true, "validationStatus": "native-names-counts-readback", "sdk": sdk, "conversion": converted, "verification": verified, "warnings": result.Warnings, "modelAssociations": result.ModelAssociations}
 	raw, _ := json.MarshalIndent(report, "", "  ")
 	reportPath := filepath.Join(stage, "native-validation.json")
 	if err = os.WriteFile(reportPath, raw, 0644); err != nil {
@@ -676,7 +725,7 @@ func padsSaveFailure(stage, output string) (string, []string, error) {
 		}
 		name := entry.Name()
 		ext := strings.ToLower(filepath.Ext(name))
-		allowed := strings.HasPrefix(name, "request-") && ext == ".json" || strings.HasPrefix(name, "response-") && ext == ".json" || strings.HasPrefix(name, "helper-") && ext == ".log" || name == "studio.bas" || name == "inventory.txt" || name == "conversion-report.json" || name == "layer-mapping.json" || ext == ".d" || ext == ".c" || ext == ".p"
+		allowed := strings.HasPrefix(name, "request-") && ext == ".json" || strings.HasPrefix(name, "response-") && ext == ".json" || strings.HasPrefix(name, "helper-") && ext == ".log" || strings.HasPrefix(name, "models-") && (ext == ".json" || ext == ".log") || name == "models.bas" || name == "readback.txt" || name == "studio.bas" || name == "inventory.txt" || name == "conversion-report.json" || name == "layer-mapping.json" || ext == ".d" || ext == ".c" || ext == ".p"
 		if !allowed || len(files) >= 64 {
 			return nil
 		}

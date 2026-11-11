@@ -285,6 +285,7 @@ func parseSymbol(doc object, unit int, p *Part) {
 }
 
 func parseFootprint(doc object, p *Part) {
+	modelsSeen := 0
 	head := obj(doc["head"])
 	ox, oy := num(head["x"]), num(head["y"])
 	p.Footprint.Name = str(parameters(doc)["package"])
@@ -379,20 +380,18 @@ func parseFootprint(doc object, p *Part) {
 			if json.Unmarshal([]byte(strings.TrimPrefix(raw, "SVGNODE~")), &node) == nil {
 				attrs := obj(node["attrs"])
 				uuid := str(attrs["uuid"])
-				if uuid != "" {
-					p.Model = &Model{UUID: uuid, ScaleX: 1, ScaleY: 1, ScaleZ: 1}
-					origin := numberPattern.FindAllString(str(attrs["c_origin"]), -1)
-					if len(origin) >= 2 {
-						p.Model.X = (num(origin[0]) - ox) * easyUnit
-						p.Model.Y = -(num(origin[1]) - oy) * easyUnit
+				is3D := str(attrs["c_etype"]) == "outline3D" || str(attrs["layerid"]) == "19" || str(node["layerid"]) == "19"
+				if uuid != "" && is3D {
+					modelsSeen++
+					var warning string
+					p.Model, warning = parseSourceModel(attrs, ox, oy)
+					if warning != "" {
+						p.Warnings = append(p.Warnings, warning)
 					}
-					rot := numberPattern.FindAllString(str(attrs["c_rotation"]), -1)
-					if len(rot) >= 3 {
-						p.Model.RotationX = -num(rot[0])
-						p.Model.RotationY = -num(rot[1])
-						p.Model.RotationZ = -num(rot[2])
+					if modelsSeen > 1 {
+						p.Model.PlacementConvention = "unsupported-multiple-models"
+						p.Warnings = append(p.Warnings, "封装包含多个3D模型节点；当前自动关联不合并多个来源，请先核对。")
 					}
-					p.Model.Z = num(attrs["z"]) * easyUnit
 				}
 			}
 		default:

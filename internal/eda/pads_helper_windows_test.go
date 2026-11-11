@@ -77,6 +77,7 @@ $body=New-StudioPADSBasic $job $symbol 'logic' $true 'private.exe' 'inventory.tx
 if($body.Contains('GetLibraryItems(1,') -or $body.Contains('GetLibraryItems(3,') -or $body.Contains('GetLibraryItems(0, "")')) {throw 'Null symbol-only categories produced an empty-name query.'}
 if(-not $body.Contains('GetLibraryItems(2, "PART_U1")') -or -not $body.Contains('ImportLibraryItems2("symbol.c", 2)') -or -not $body.Contains('ImportLibraryItems2("symbol.p", 2)')) {throw 'Symbol-only expected queries/imports missing.'}
 if($body.IndexOf('Private INI guard') -gt $body.IndexOf('Set lib =')) {throw 'Library access preceded private configuration guard.'}
+if(-not $body.Contains('"PID|" & CStr(GetCurrentProcessId())') -or -not $body.Contains('Application.Visible = True')) {throw 'Owned process identity or normal window closing is not available.'}
 $footprint=[pscustomobject]@{expected=[pscustomobject]@{parts=@('PART');decals=@('PART');symbols=$null;drawings=$null};pcb='footprint.d';schematic='';partTypes='footprint.p';partTypeEngine='layout'}
 $body=New-StudioPADSBasic $job $footprint 'layout' $true 'private.exe' 'inventory.txt' 'library'
 if($body.Contains('GetLibraryItems(2,') -or $body.Contains('GetLibraryItems(3,') -or $body.Contains('GetLibraryItems(1, "")')) {throw 'Null footprint-only categories produced an empty-name query.'}

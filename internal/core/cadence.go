@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +26,10 @@ type CadenceAllegroJob struct {
 	Script           string   `json:"script"`
 	CompletionMarker string   `json:"completionMarker"`
 	ExpectedFiles    []string `json:"expectedFiles"`
+	ModelFile        string   `json:"modelFile,omitempty"`
+	ModelSHA256      string   `json:"modelSha256,omitempty"`
+	ModelScript      string   `json:"modelScript,omitempty"`
+	ModelSkill       string   `json:"modelSkill,omitempty"`
 }
 type CadenceManifest struct {
 	Schema              string              `json:"schema"`
@@ -57,6 +60,9 @@ func ExportCadence(parts []Part, outputDirectory, libraryName string, includeSym
 		return result, errors.New("请选择完整的导出目录路径")
 	}
 	for _, p := range parts {
+		if !includeFootprint && p.Model != nil && p.Model.Path != "" {
+			return result, errors.New("Cadence STEP关联需要同时导出Allegro PCB封装，Capture OLB无法独立关联STEP")
+		}
 		if err := ValidatePart(p, includeSymbol, includeFootprint); err != nil {
 			return result, fmt.Errorf("%s：%w", p.Name, err)
 		}
@@ -101,6 +107,27 @@ func ExportCadence(parts []Part, outputDirectory, libraryName string, includeSym
 			}
 			warnings = append(warnings, w...)
 			rel := filepath.Join("allegro", entry)
+			association := ModelAssociation{PartID: p.ID, Entry: entry, Target: "Cadence", Status: "unavailable", Message: "器件没有可用的 STEP 模型。"}
+			if p.Model != nil && p.Model.Path != "" {
+				model, e := prepareCadenceModel(stage, job.Directory, p, entry)
+				if e != nil {
+					return result, fmt.Errorf("%s：%w", p.Name, e)
+				}
+				job.ModelFile, job.ModelSHA256 = model.ModelFile, model.ModelSHA256
+				job.ModelSkill = job.Directory + "/" + entry + ".step-map.il"
+				job.ModelScript = job.Directory + "/" + entry + ".step-map.scr"
+				association = model
+				association.ModelFile = filepath.Join(dest, filepath.FromSlash(model.ModelFile))
+				result.Files = append(result.Files, association.ModelFile)
+				if err = put(filepath.FromSlash(job.ModelSkill), []byte(cadencePreparedModelJob(entry, filepath.Base(job.ModelFile)))); err != nil {
+					return result, err
+				}
+				if err = put(filepath.FromSlash(job.ModelScript), []byte("skill load("+skillString(filepath.Base(job.ModelSkill))+")\nskill psAssociatePreparedModel()\nexit\n")); err != nil {
+					return result, err
+				}
+				warnings = append(warnings, "Allegro STEP 已准备为毫米和局部原点的 identity 映射；模型关联脚本尚未执行，不能据脚本认定模型已关联或几何正确。")
+			}
+			result.ModelAssociations = append(result.ModelAssociations, association)
 			if err = put(filepath.Join(rel, "build.il"), []byte(skill)); err != nil {
 				return result, err
 			}
@@ -109,43 +136,6 @@ func ExportCadence(parts []Part, outputDirectory, libraryName string, includeSym
 			}
 			manifest.Allegro = append(manifest.Allegro, job)
 			manifest.ExpectedNativeFiles = append(manifest.ExpectedNativeFiles, job.ExpectedFiles...)
-		}
-		if includeFootprint && p.Model != nil && p.Model.Path != "" {
-			ext := strings.ToLower(filepath.Ext(p.Model.Path))
-			if ext != ".step" && ext != ".stp" {
-				warnings = append(warnings, "Cadence 模型复制仅支持 STEP/STP："+p.Name)
-				continue
-			}
-			src, err := os.Open(p.Model.Path)
-			if err != nil {
-				return result, err
-			}
-			info, err := src.Stat()
-			if err != nil || !info.Mode().IsRegular() || info.Size() > 128*1024*1024 {
-				src.Close()
-				return result, errors.New("STEP 模型必须为不超过128 MiB的普通文件")
-			}
-			rel := filepath.Join("step", entry+ext)
-			if err = os.MkdirAll(filepath.Dir(filepath.Join(stage, rel)), 0755); err != nil {
-				src.Close()
-				return result, err
-			}
-			dst, err := os.Create(filepath.Join(stage, rel))
-			if err != nil {
-				src.Close()
-				return result, err
-			}
-			_, cpErr := io.Copy(dst, src)
-			closeErr := dst.Close()
-			src.Close()
-			if cpErr != nil {
-				return result, cpErr
-			}
-			if closeErr != nil {
-				return result, closeErr
-			}
-			result.Files = append(result.Files, filepath.Join(dest, rel))
-			warnings = append(warnings, "STEP 已独立复制；尚未自动关联 Allegro 3D 模型，请在目标软件中手动关联并核对朝向。")
 		}
 	}
 	if includeSymbol {
@@ -245,8 +235,14 @@ The expected files in cadence-manifest.json are targets, not existing outputs.
    solder/paste openings, silk, placement bounds and copper layers. Run DRC.
 7. Open the generated .olb in Capture and place every unit into a NEW design;
    inspect pin endpoints, numbering, names, electrical types and PCB Footprint.
-8. STEP files under step/ are independent copies. Link/align them in Allegro and
-   verify Pin 1, rotation, height and model scale. No automated 3D association.
+8. Prepared STEP files sit beside their Allegro drawing with a hashed safe name.
+   The separate <entry>.step-map.scr job is NOT run by the 2D build/runner.
+   Run it later only in a NEW batch process if association is intended.
+   The identity mapping uses only that process's steppath. Add each
+   model directory to the target machine's steppath when reopening elsewhere.
+   Scripts alone do not prove a mapping or 3D geometry. Verify Pin 1, rotation,
+   height and scale in the target EDA. Allegro 16.6 without axlStepSet is unsupported;
+   no global unsupported-prototype switch or user-session UI replay is enabled.
 
 Source evidence used for the independently written generator:
 Cadence MakePadstackInAllegroSkill.pdf (2018), hosted by Cadence Community.

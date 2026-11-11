@@ -25,7 +25,7 @@ try {
   Get-ChildItem -LiteralPath 'frontend\dist' | Copy-Item -Destination 'uiassets' -Recurse -Force
   & $GoExe run github.com/tc-hib/go-winres@v0.3.3 make --arch amd64
   if ($LASTEXITCODE -ne 0) { throw 'PE resource generation failed' }
-  & $GoExe test ./...
+  & $GoExe test -count=1 ./...
   if ($LASTEXITCODE -ne 0) { throw 'Go tests failed' }
   & $GoExe build -tags 'desktop,production' -trimpath -ldflags '-s -w -H windowsgui' -o (Join-Path $releaseDir 'PackageStudio.exe') .
   if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }

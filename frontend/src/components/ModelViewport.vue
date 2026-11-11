@@ -57,7 +57,7 @@ function parseOBJ(raw:string,name:string,real:boolean,token:number){
  if(!parsed.meshes){disposeObject(parsed.object);throw new Error('OBJ 文件没有网格几何。');}
  if(!alive || !loadGuard.isCurrent(token)){disposeObject(parsed.object);return;}
  const next=new THREE.Group();next.add(parsed.object);replaceGroup(next);modelName.value=name;
- caption.value=real?'嘉立创 / EasyEDA 原始 OBJ · 保留源材质与颜色 · Z 轴向上。':'本地 OBJ · 保留内嵌材质，未包含的外部贴图不加载。';
+ caption.value=real?'嘉立创 / EasyEDA 原始 OBJ 预览（非最终 EDA 装配对位）· 保留源材质与颜色 · Z 轴向上。':'本地 OBJ · 保留内嵌材质，未包含的外部贴图不加载。';
  if(!parsed.embedded)caption.value+=' 此文件未提供内嵌材质，采用文件默认颜色。';
  if(parsed.skippedTextures)caption.value+=' 外部纹理未包含在文件中。';
  error.value='';

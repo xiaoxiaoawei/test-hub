@@ -100,17 +100,23 @@ type Symbol struct {
 	Bounds    Bounds    `json:"bounds"`
 }
 type Model struct {
-	Path      string  `json:"path"`
-	UUID      string  `json:"uuid,omitempty"`
-	X         float64 `json:"x"`
-	Y         float64 `json:"y"`
-	Z         float64 `json:"z"`
-	RotationX float64 `json:"rotationX"`
-	RotationY float64 `json:"rotationY"`
-	RotationZ float64 `json:"rotationZ"`
-	ScaleX    float64 `json:"scaleX"`
-	ScaleY    float64 `json:"scaleY"`
-	ScaleZ    float64 `json:"scaleZ"`
+	Prepared            bool      `json:"prepared,omitempty"`
+	ExpectedBBoxMM      []float64 `json:"expectedBBoxMm,omitempty"`
+	BBoxToleranceMM     float64   `json:"bboxToleranceMm,omitempty"`
+	PlacementConvention string    `json:"placementConvention,omitempty"`
+	SourceWidthMM       float64   `json:"sourceWidthMm,omitempty"`
+	SourceHeightMM      float64   `json:"sourceHeightMm,omitempty"`
+	Path                string    `json:"path"`
+	UUID                string    `json:"uuid,omitempty"`
+	X                   float64   `json:"x"`
+	Y                   float64   `json:"y"`
+	Z                   float64   `json:"z"`
+	RotationX           float64   `json:"rotationX"`
+	RotationY           float64   `json:"rotationY"`
+	RotationZ           float64   `json:"rotationZ"`
+	ScaleX              float64   `json:"scaleX"`
+	ScaleY              float64   `json:"scaleY"`
+	ScaleZ              float64   `json:"scaleZ"`
 }
 type Part struct {
 	ID           string    `json:"id"`
@@ -128,14 +134,32 @@ type Part struct {
 	Model        *Model    `json:"model,omitempty"`
 }
 type ExportResult struct {
-	Directory        string   `json:"directory"`
-	Files            []string `json:"files"`
-	Warnings         []string `json:"warnings"`
-	ArtifactType     string   `json:"artifactType,omitempty"`
-	NativeGenerated  bool     `json:"nativeGenerated,omitempty"`
-	RuntimeVerified  bool     `json:"runtimeVerified,omitempty"`
-	BackupDirectory  string   `json:"backupDirectory,omitempty"`
-	ValidationStatus string   `json:"validationStatus,omitempty"`
+	Directory         string             `json:"directory"`
+	Files             []string           `json:"files"`
+	Warnings          []string           `json:"warnings"`
+	ArtifactType      string             `json:"artifactType,omitempty"`
+	NativeGenerated   bool               `json:"nativeGenerated,omitempty"`
+	RuntimeVerified   bool               `json:"runtimeVerified,omitempty"`
+	BackupDirectory   string             `json:"backupDirectory,omitempty"`
+	ValidationStatus  string             `json:"validationStatus,omitempty"`
+	ModelAssociations []ModelAssociation `json:"modelAssociations,omitempty"`
+}
+
+// ModelAssociation describes a model-to-footprint relationship separately from
+// native library generation. A prepared script is not an EDA-verified mapping.
+type ModelAssociation struct {
+	PartID           string    `json:"partId"`
+	Entry            string    `json:"entry"`
+	Target           string    `json:"target"`
+	ModelFile        string    `json:"modelFile,omitempty"`
+	ModelSHA256      string    `json:"modelSha256,omitempty"`
+	Status           string    `json:"status"`
+	Verified         bool      `json:"verified"`
+	Message          string    `json:"message,omitempty"`
+	ModelName        string    `json:"modelName,omitempty"`
+	ExpectedBBoxMM   []float64 `json:"expectedBBoxMm,omitempty"`
+	ActualBBoxMM     []float64 `json:"actualBBoxMm,omitempty"`
+	GeometryVerified bool      `json:"geometryVerified"`
 }
 
 func emptyPart() Part {

@@ -45,14 +45,16 @@ function TextFile([string]$path,[string]$text) {
  [IO.File]::WriteAllText((Inside $path),$text,$encoding)
 }
 . (Join-Path $PSScriptRoot 'basic.ps1')
+. (Join-Path $PSScriptRoot 'process.ps1')
 function EmptyItems {return @{parts=(New-Object Collections.ArrayList);decals=(New-Object Collections.ArrayList);symbols=(New-Object Collections.ArrayList);drawings=(New-Object Collections.ArrayList)}}
-function ReadInventory([string]$path) {
- $before=EmptyItems;$after=EmptyItems;$done=$false;$version=''
+function ReadInventory([string]$path,[int]$ExpectedPID) {
+ $before=EmptyItems;$after=EmptyItems;$done=$false;$version='';$pidSeen=$false
  $lines=[IO.File]::ReadAllLines((Inside $path),[Text.Encoding]::Default)
  if($lines.Length -gt 800005) {throw 'PADS inventory is too large.'}
  foreach($line in $lines) {
   $row=$line.Split('|')
   if($row[0] -eq 'ERROR') {throw ('PADS SDK error: '+($row[1..($row.Length-1)] -join '|'))}
+  if($row[0] -eq 'PID') {if($pidSeen -or $row.Length -ne 2){throw 'Invalid or duplicate PADS owner PID.'};Confirm-StudioPADSPID ([string]$row[1]) $ExpectedPID;$pidSeen=$true;continue}
   if($row[0] -eq 'VERSION' -and $row.Length -eq 2) {$version=$row[1];continue}
   if($line -eq ('DONE|'+$job.nonce)) {$done=$true;continue}
   if($row[0] -notin @('BEFORE','AFTER')) {continue}
@@ -60,7 +62,7 @@ function ReadInventory([string]$path) {
   $name=@('parts','decals','symbols','drawings')[[int]$row[1]]
   if($row[0] -eq 'BEFORE') {[void]$before[$name].Add($row[2])} else {[void]$after[$name].Add($row[2])}
  }
- if(-not $done -or $version -notmatch '(^|[^0-9])9\.4([^0-9]|$)') {throw 'PADS SDK did not finish a supported 9.4 readback.'}
+ if(-not $done -or -not $pidSeen -or $version -notmatch '(^|[^0-9])9\.4([^0-9]|$)') {throw 'PADS SDK did not finish a supported 9.4 readback.'}
  return @{before=$before;after=$after}
 }
 
@@ -94,7 +96,7 @@ function RunCAD($library,[string]$role,[bool]$first) {
  $record=Inside (Join-Path $programs 'inventory.txt');$script=Inside (Join-Path $programs 'studio.bas')
  TextFile $script (New-StudioPADSBasic $job $library $role $first $privateExe $record $base)
  $start=New-Object Diagnostics.ProcessStartInfo
- $start.FileName=$privateExe;$start.WorkingDirectory=$programs;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
+ $start.FileName=$privateExe;$start.WorkingDirectory=$programs;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.WindowStyle=[Diagnostics.ProcessWindowStyle]::Normal
  # Do not send a document filename before the in-process guards: a version may
  # forward it to an existing session. Library automation needs no active design.
  $start.Arguments='"/s'+$script+'"'
@@ -110,12 +112,13 @@ function RunCAD($library,[string]$role,[bool]$first) {
    if($process.HasExited) {break};Start-Sleep -Milliseconds 100
   }
   if(-not (Test-Path -LiteralPath $record)) {throw 'Private PADS startup produced no guarded inventory; dependencies/INI/CLI are not compatible.'}
-  $inventory=ReadInventory $record
+  $inventory=ReadInventory $record $process.Id
+  Complete-StudioPADSProcess $process
   return $inventory
  } finally {
   # Only the process handle returned for our private executable is affected.
   # No taskkill by image name, ROT attachment or current-user CAD is used.
-  if($null -ne $process) {try {if(-not $process.HasExited) {[void]$process.CloseMainWindow();if(-not $process.WaitForExit(1500)) {$process.Kill();$process.WaitForExit()}}} finally {$process.Dispose()}}
+  if($null -ne $process) {try {if(-not $process.HasExited) {$process.Kill();if(-not $process.WaitForExit(5000)) {throw 'Owned PADS cleanup did not finish.'}}} finally {$process.Dispose()}}
  }
 }
 

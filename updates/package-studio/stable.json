@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "product": "package-studio",
-  "version": "0.4.0",
-  "download_url": "https://github.com/xiaoxiaoawei/test-hub/releases/download/package-studio-v0.4.0/package-studio-windows-x64.zip",
-  "notes_url": "https://github.com/xiaoxiaoawei/test-hub/releases/tag/package-studio-v0.4.0",
-  "sha256": "31bb010dcc3506bcf73003d60111d49b2fbec1faa3fb6c35e3768f29a409c108",
-  "size": 6150598,
-  "published_at": "2026-11-11T08:24:31Z",
-  "release_notes": "- 新增在线型号搜索，显示型号、立创编号、厂家和封装，可选择器件加入工作台；保留 C 编号批量获取。\n- 新增工作区分隔线拖动，调整左右栏、上下展示区和 2D/3D 并排比例，支持键盘微调与双击复位。\n- 自动记忆布局，并在窗口尺寸变化时限制各展示区的最小宽高；旧版主题、器件与导出历史继续保留。"
+  "version": "0.5.0",
+  "download_url": "https://github.com/xiaoxiaoawei/test-hub/releases/download/package-studio-v0.5.0/package-studio-windows-x64.zip",
+  "notes_url": "https://github.com/xiaoxiaoawei/test-hub/releases/tag/package-studio-v0.5.0",
+  "sha256": "907e62f3db4b48015cfa37c3a138183e15cab4de93e8279f8d99f54bbffef544",
+  "size": 6308631,
+  "published_at": "2026-11-11T09:40:26Z",
+  "release_notes": "- 新增 TXT/CSV 清单导入：预览 C 编号、去重、识别立创编号列，再由用户确认加入；支持 UTF-8、UTF-16 和 GB18030 文本。\n- 改进立创旧版 OBJ 内联材质兼容，修复透明度、模型切换异步覆盖和缩放后调整区域导致视图重置；切换 2D 后保留三维视角，支持本地内嵌资源 GLB。\n- 新增 PADS/Cadence 本机原生集成入口、安装检测和新建／已有库追加设置；PADS 原生候选适配限定 Classic 9.4 / 32 位 SDK。默认继续输出中间格式，缺少目标软件或版本不兼容时原生模式明确失败。\n- 原生追加采用独立暂存、目标引擎回读、备份、冲突检查和失败回滚；不自动登记全局库。STEP 保留为附件，PADS Reuse／Cadence 3D 自动关联未承诺完成。\n- **原生集成待 EDA 实机验证**：本开发环境没有 PADS、Capture 或 Allegro。本次验收覆盖解析、协议、失败保护、事务和界面；模拟测试不代表目标 EDA、许可证、单位、图形或 3D 关联兼容性已验收。请在已授权的目标 EDA 版本回读确认后使用原生库。"
 }

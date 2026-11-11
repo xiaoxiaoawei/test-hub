@@ -16,3 +16,5 @@ export interface ExportResult { directory:string; files:string[]; warnings:strin
 export interface LogEntry { id:number; time:string; message:string; level:'info'|'success'|'error'|'warn' }
 export interface UpdateInfo {currentVersion:string;latestVersion:string;available:boolean;releaseNotes:string;publishedAt:string;downloadUrl:string;releaseUrl:string;sha256:string;size:number;message?:string}
 export interface UpdateDownloadResult {path:string;version:string;verified:boolean}
+export interface PartSearchItem {lcscId:string;name:string;manufacturer:string;package:string;description:string;sourceUrl:string}
+export interface PartSearchResult {query:string;page:number;pageSize:number;total:number;hasMore:boolean;items:PartSearchItem[];source:string;limit?:number;truncated?:boolean;message?:string}

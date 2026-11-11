@@ -75,6 +75,13 @@ func (a *App) FetchPart(lcscID string) (core.Part, error) {
 	}
 	return a.service.FetchPart(ctx, lcscID)
 }
+func (a *App) SearchParts(query string, page int) (service.SearchResult, error) {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return a.service.SearchParts(ctx, query, page)
+}
 func (a *App) ImportPartJSON(raw string) (core.Part, error) { return a.service.ImportPartJSON(raw) }
 func (a *App) RemovePart(partID string) error               { return a.service.RemovePart(partID) }
 func (a *App) ExportParts(req service.ExportRequest) (core.ExportResult, error) {

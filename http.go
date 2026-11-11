@@ -71,6 +71,15 @@ func serveHTTP(addr string, app *App) error {
 				callErr = app.RevealGeneratedFile(req.Path)
 				result = true
 			}
+		case "POST /api/parts/search":
+			var req struct {
+				Query string `json:"query"`
+				Page  int    `json:"page"`
+			}
+			callErr = decode(&req)
+			if callErr == nil {
+				result, callErr = app.service.SearchParts(r.Context(), req.Query, req.Page)
+			}
 		case "POST /api/parts/fetch":
 			var req struct {
 				LCSCID string `json:"lcscID"`

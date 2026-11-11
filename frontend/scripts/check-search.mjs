@@ -1,0 +1,36 @@
+import assert from 'node:assert/strict';
+import { classifySearchInput, createLatestRequestRunner, createSearchPageCache, reconcileSearchSelection, toggleSearchSelection } from '../src/search.ts';
+const ids=classifySearchInput(' c23922, C25804\nC23922；C5556 ');
+assert.equal(ids.kind,'ids');assert.deepEqual(ids.ids,['C23922','C25804','C5556']);
+for(const model of ['STM32F030C8T6','RC0603FR-0710KL','C23922 STM32F030C8T6','MC8','TPS5430','C23922x','C8','C1','C1234567890123'])assert.equal(classifySearchInput(model).kind,'keyword',model);
+assert.equal(classifySearchInput('   ').kind,'empty');
+const pageIds=['C23922','C25804','C5556'];
+assert.deepEqual(reconcileSearchSelection([],pageIds,[]),[],'Search results must not auto-select the first item.');
+assert.deepEqual(toggleSearchSelection([],'C23922',pageIds,[]),['C23922']);
+assert.deepEqual(toggleSearchSelection(['C23922'],'C25804',pageIds,[]),['C23922','C25804']);
+assert.deepEqual(toggleSearchSelection(['C23922','C25804'],'C23922',pageIds,[]),['C25804']);
+assert.deepEqual(toggleSearchSelection([],'C23922',pageIds,['C23922']),[],'Already-added geometry must not be added again by result selection.');
+assert.deepEqual(reconcileSearchSelection(['c23922','C23922','C25804'],pageIds,['C25804']),['C23922']);
+assert.deepEqual(reconcileSearchSelection(['C23922'],['C11111'],[]),[],'Changing pages must discard selections from the previous page.');
+function deferred(){let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};}
+const runner=createLatestRequestRunner();const old=deferred(),fresh=deferred();const applied=[];const errors=[];let oldSignal;let settled=0;
+const handlers={success:value=>applied.push(value),error:error=>errors.push(error),settled:()=>settled++};
+const first=runner.run(signal=>{oldSignal=signal;return old.promise;},handlers);
+const second=runner.run(()=>fresh.promise,handlers);assert.equal(oldSignal.aborted,true);
+fresh.resolve('new results');await second;old.resolve('obsolete results');await first;
+assert.deepEqual(applied,['new results']);assert.equal(settled,1);assert.deepEqual(errors,[]);
+const rejected=deferred(),current=deferred();const oldRequest=runner.run(()=>rejected.promise,handlers);const currentRequest=runner.run(()=>current.promise,handlers);
+rejected.reject(new Error('old network error'));await oldRequest;current.resolve('current page');await currentRequest;assert.deepEqual(errors,[]);assert.equal(applied.at(-1),'current page');
+const canceled=deferred();const canceledRequest=runner.run(()=>canceled.promise,handlers);runner.cancel();canceled.resolve('closed dialog');await canceledRequest;assert.equal(applied.includes('closed dialog'),false);
+await runner.run(async()=>{throw new Error('current failure');},handlers);assert.equal(errors.length,1);assert.equal(errors[0].message,'current failure');
+console.log('Search classification, superseded-response, cancellation and error tests passed.');
+
+const pages=createSearchPageCache();
+pages.begin('STM32');pages.put('STM32',1,{ids:['C23922']});pages.put('STM32',2,{ids:['C25804']});
+assert.deepEqual(pages.get('STM32',1),{ids:['C23922']});
+assert.deepEqual(pages.get('STM32',2),{ids:['C25804']});
+assert.equal(pages.get('other',1),undefined);
+pages.begin('STM32');assert.equal(pages.get('STM32',1),undefined);
+pages.put('old query',1,{ids:['C12345']});assert.equal(pages.get('STM32',1),undefined);
+pages.put('STM32',1,{ids:['C23922']});pages.clear();assert.equal(pages.get('STM32',1),undefined);
+console.log('Current-session page cache and explicit refresh checks passed.');

@@ -33,7 +33,7 @@ jobs:
           python tools/release.py check
           python -m unittest discover -s tools -p 'test_*.py'
       - name: Test parsers, exporters and updater
-        run: go test ./internal/...
+        run: go test -race ./internal/...
 
   windows:
     runs-on: windows-latest

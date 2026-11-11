@@ -18,7 +18,7 @@ import (
 	"packagestudio/internal/core"
 )
 
-var Version = "0.3.0"
+var Version = "0.4.0"
 
 type Settings struct {
 	OutputDirectory  string `json:"outputDirectory"`
@@ -49,15 +49,17 @@ type ExportRequest struct {
 	IncludeModel     bool     `json:"includeModel"`
 }
 type Service struct {
-	mu           sync.RWMutex
-	exportMu     sync.Mutex
-	dataDir      string
-	settings     Settings
-	parts        map[string]core.Part
-	client       *http.Client
-	history      []ExportHistoryEntry
-	updateMu     sync.Mutex
-	updateClient *updateClientState
+	mu              sync.RWMutex
+	searchMu        sync.Mutex
+	searchSnapshots map[string]searchSnapshot
+	exportMu        sync.Mutex
+	dataDir         string
+	settings        Settings
+	parts           map[string]core.Part
+	client          *http.Client
+	history         []ExportHistoryEntry
+	updateMu        sync.Mutex
+	updateClient    *updateClientState
 }
 
 func New(dataDir string) (*Service, error) {

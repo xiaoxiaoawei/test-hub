@@ -7,11 +7,13 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import urllib.error
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("exe", type=Path)
+    p.add_argument("--online-search", help="Optional live source check, e.g. STM32F030C8T6 (not run in CI)")
     args = p.parse_args()
     exe = args.exe.resolve()
     with tempfile.TemporaryDirectory(prefix="package-studio-smoke-") as tmp:
@@ -38,6 +40,14 @@ def main():
                 raise RuntimeError("binary did not start")
             expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
             assert boot["version"] == expected
+            # Exercise the HTTP search route without making CI depend on an external source.
+            try:
+                request("/api/parts/search", {"query": "", "page": 1})
+            except urllib.error.HTTPError as error:
+                assert error.code == 400
+                assert json.load(error)["error"]
+            else:
+                raise AssertionError("empty model query was accepted")
             part = boot["parts"][0]
             for target in ("kicad", "pads", "cadence"):
                 assert boot["capabilities"][target]
@@ -51,6 +61,13 @@ def main():
             assert len(history) == 3
             persisted = json.loads((root / "data/settings.json").read_text(encoding="utf-8"))
             assert persisted["exportTarget"] == "cadence"
+            if args.online_search:
+                result = request("/api/parts/search", {"query": args.online_search, "page": 1})
+                assert result["items"], "live model search returned no candidates"
+                match = next((x for x in result["items"] if x["name"].casefold() == args.online_search.casefold()), result["items"][0])
+                fetched = request("/api/parts/fetch", {"lcscID": match["lcscId"]})
+                assert fetched["footprint"]["pads"] and fetched["symbol"]["pins"]
+                print("Live model search and geometry fetch passed:", args.online_search, match["lcscId"])
             print("Windows binary smoke passed:", expected, "KiCad/PADS/Cadence, settings, history")
         finally:
             process.terminate()

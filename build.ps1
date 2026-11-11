@@ -9,8 +9,8 @@ try {
   try {
     npm.cmd ci
     if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed' }
-    npm.cmd run test:model
-    if ($LASTEXITCODE -ne 0) { throw 'Model material regression failed' }
+    npm.cmd run test:ui
+    if ($LASTEXITCODE -ne 0) { throw 'Frontend regression checks failed' }
     npm.cmd run build
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
   } finally { Pop-Location }

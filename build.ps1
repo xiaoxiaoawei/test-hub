@@ -32,6 +32,14 @@ try {
   $version=(Get-Content -LiteralPath VERSION -Raw).Trim()
   $pe=(Get-Item -LiteralPath (Join-Path $releaseDir 'PackageStudio.exe')).VersionInfo
   if ($pe.FileVersion -ne "$version.0" -or $pe.ProductVersion -ne $version) { throw 'Embedded Windows version does not match VERSION' }
+  foreach ($adapter in @('pads','cadence')) {
+    $helperDir=Join-Path $PSScriptRoot "helpers\$adapter"
+    if (Test-Path -LiteralPath $helperDir) {
+      $adapterDir=Join-Path $releaseDir "adapters\$adapter"
+      New-Item -ItemType Directory -Path $adapterDir -Force | Out-Null
+      Get-ChildItem -LiteralPath $helperDir -File | Where-Object { $_.Extension -in @('.ps1','.cs','.md','.bas') } | Copy-Item -Destination $adapterDir
+    }
+  }
   if (-not $SkipAltium -and (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     dotnet restore helpers/altium/PackageStudio.Altium.csproj -r win-x64 --locked-mode
     if ($LASTEXITCODE -ne 0) { throw 'Altium dependency lock verification failed' }

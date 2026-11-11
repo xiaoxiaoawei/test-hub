@@ -128,9 +128,14 @@ type Part struct {
 	Model        *Model    `json:"model,omitempty"`
 }
 type ExportResult struct {
-	Directory string   `json:"directory"`
-	Files     []string `json:"files"`
-	Warnings  []string `json:"warnings"`
+	Directory        string   `json:"directory"`
+	Files            []string `json:"files"`
+	Warnings         []string `json:"warnings"`
+	ArtifactType     string   `json:"artifactType,omitempty"`
+	NativeGenerated  bool     `json:"nativeGenerated,omitempty"`
+	RuntimeVerified  bool     `json:"runtimeVerified,omitempty"`
+	BackupDirectory  string   `json:"backupDirectory,omitempty"`
+	ValidationStatus string   `json:"validationStatus,omitempty"`
 }
 
 func emptyPart() Part {

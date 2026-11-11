@@ -12,17 +12,22 @@ import (
 )
 
 type ExportHistoryEntry struct {
-	ID        string   `json:"id"`
-	Timestamp string   `json:"timestamp"`
-	Target    string   `json:"target"`
-	PartIDs   []string `json:"partIds"`
-	PartNames []string `json:"partNames"`
-	PartCount int      `json:"partCount"`
-	Status    string   `json:"status"`
-	Directory string   `json:"directory"`
-	Files     []string `json:"files"`
-	Warnings  []string `json:"warnings"`
-	Error     string   `json:"error,omitempty"`
+	ArtifactType     string   `json:"artifactType,omitempty"`
+	NativeGenerated  bool     `json:"nativeGenerated,omitempty"`
+	RuntimeVerified  bool     `json:"runtimeVerified,omitempty"`
+	BackupDirectory  string   `json:"backupDirectory,omitempty"`
+	ValidationStatus string   `json:"validationStatus,omitempty"`
+	ID               string   `json:"id"`
+	Timestamp        string   `json:"timestamp"`
+	Target           string   `json:"target"`
+	PartIDs          []string `json:"partIds"`
+	PartNames        []string `json:"partNames"`
+	PartCount        int      `json:"partCount"`
+	Status           string   `json:"status"`
+	Directory        string   `json:"directory"`
+	Files            []string `json:"files"`
+	Warnings         []string `json:"warnings"`
+	Error            string   `json:"error,omitempty"`
 }
 
 func cloneHistory(history []ExportHistoryEntry) []ExportHistoryEntry {
@@ -55,6 +60,11 @@ func (s *Service) recordExport(req ExportRequest, result core.ExportResult, expo
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
 	entry := ExportHistoryEntry{ID: fmt.Sprintf("export-%d", now.UnixNano()), Timestamp: now.Format(time.RFC3339Nano), Target: req.Target, Status: "success", Directory: result.Directory, Files: append([]string{}, result.Files...), Warnings: append([]string{}, result.Warnings...), PartIDs: []string{}, PartNames: []string{}}
+	entry.ArtifactType = result.ArtifactType
+	entry.NativeGenerated = result.NativeGenerated
+	entry.RuntimeVerified = result.RuntimeVerified
+	entry.BackupDirectory = result.BackupDirectory
+	entry.ValidationStatus = result.ValidationStatus
 	if entry.Target == "" {
 		entry.Target = "kicad"
 	}

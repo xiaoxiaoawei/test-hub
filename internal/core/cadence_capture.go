@@ -18,12 +18,27 @@ func capturePoint(x, y float64) string { return fmt.Sprintf("[psPoint %s %s]", f
 // pp.215,287-291,334-336,599,726. Pin enum values are resolved from the running
 // Capture's own exported DboValue constants; numeric enum values are not guessed.
 func renderCadenceCapture(parts []Part, entries []string, libraryName string) (string, []string, error) {
+	return renderCadenceCaptureMode(parts, entries, libraryName, "", false)
+}
+
+func renderCadenceCaptureMode(parts []Part, entries []string, libraryName, nonce string, appendLibrary bool) (string, []string, error) {
 	warnings := []string{"Capture Tcl 已生成，尚未在目标 Cadence 版本执行；必须在 Capture 中回读所有单元并执行 ERC。", "Capture 默认采用100 DBU/inch兼容尺度（0.254mm/DBU），该默认尚未在本机文档/运行时验证；请在目标版核对网格和引脚长度，可用 -CaptureUnitsPerInch 覆盖。", "Capture 引脚类型从目标版本的 DboValue_* 常量解析；如该版本未公开相应常量，脚本会明确失败而不会使用猜测的枚举值。"}
 	warnings = append(warnings, "Capture 图形线宽、字体和引脚号位置采用目标工具默认设置；请在目标版本中核对显示效果。")
 	var b strings.Builder
 	b.WriteString(capturePrelude)
 	fmt.Fprintf(&b, "\nset psOutput [file join $psDirectory %s]\n", tclString(libraryName+".olb"))
-	b.WriteString("if {[file exists $psOutput]} {error \"Capture library already exists; use a fresh batch\"}\nset psCode [catch {\n set psSession [DboTclHelper_sCreateSession]\n set psStatus [DboState]\n set psLibrary [psObject [$psSession CreateLib [DboTclHelper_sMakeCString $psOutput] $psStatus] $psStatus CreateLib]\n")
+	if appendLibrary {
+		b.WriteString("if {![file exists $psOutput]} {error \"Staged Capture library is missing\"}\nset psCode [catch {\n set psSession [DboTclHelper_sCreateSession]\n set psStatus [DboState]\n set psLibrary [psObject [$psSession GetLib [DboTclHelper_sMakeCString $psOutput] $psStatus] $psStatus GetLib]\n")
+	} else {
+		b.WriteString("if {[file exists $psOutput]} {error \"Capture library already exists; use a fresh batch\"}\nset psCode [catch {\n set psSession [DboTclHelper_sCreateSession]\n set psStatus [DboState]\n set psLibrary [psObject [$psSession CreateLib [DboTclHelper_sMakeCString $psOutput] $psStatus] $psStatus CreateLib]\n")
+	}
+	if nonce != "" {
+		b.WriteString(" set psBefore [psLibraryInventory $psLibrary $psStatus]\n set psBeforeFile [open [file join $psDirectory before-inventory.tcldata] w]\n fconfigure $psBeforeFile -encoding utf-8\n puts $psBeforeFile [list $psBefore]\n close $psBeforeFile\n")
+		// Check all conflicts before making the first change to the staged copy.
+		for _, entry := range entries {
+			fmt.Fprintf(&b, " if {[$psLibrary PackageExists [DboTclHelper_sMakeCString %s] $psStatus]} {error %s}\n psState $psStatus PackageExists\n", tclString(entry), tclString("Package already exists; append refuses conflicts: "+entry))
+		}
+	}
 	for pi, p := range parts {
 		units := p.Symbol.Units
 		if units < 1 {
@@ -38,6 +53,9 @@ func renderCadenceCapture(parts []Part, entries []string, libraryName string) (s
 			ref = "U"
 		}
 		fmt.Fprintf(&b, " set psPackage [psObject [$psLibrary NewPackage [DboTclHelper_sMakeCString %s] $psStatus] $psStatus NewPackage]\n $psPackage SetReferenceTemplate [DboTclHelper_sMakeCString %s]\n $psPackage SetPCBFootprint [DboTclHelper_sMakeCString %s]\n", tclString(entry), tclString(ref+"?"), tclString(entry))
+		if nonce != "" {
+			fmt.Fprintf(&b, " psState [$psPackage SetEffectivePropStringValue [DboTclHelper_sMakeCString \"PackageStudioNonce\"] [DboTclHelper_sMakeCString %s]] SetNonce\n", tclString(nonce))
+		}
 		for u := 1; u <= units; u++ {
 			unitName := fmt.Sprintf("%s_UNIT%d", entry, u)
 			designator := ""

@@ -2,9 +2,16 @@ import * as THREE from 'three';
 import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 
+// glTF uses Y-up. Keep the file's own scene transforms intact and rotate only
+// a wrapper so our Z-up camera's top view still looks down onto its top face.
+export function wrapGLBForZUp(object:THREE.Object3D){
+ const wrapper=new THREE.Group();wrapper.rotation.x=Math.PI/2;wrapper.add(object);return wrapper;
+}
+
 // EasyEDA places colour-only MTL records inside its OBJ stream, between
 // newmtl/endmtl. Extract these records before giving geometry to OBJLoader.
-// Its exported d=0 colour records are opaque (rather than standard MTL dissolve).
+// Inline EasyEDA colour records describe opaque solids; their d/Tr fields do
+// not carry standard MTL dissolve semantics. Local standard MTL keeps them.
 export function parseMaterialOBJ(raw:string,easyedaSource:boolean){
  const geometry:string[]=[];const material:string[]=[];let inMaterial=false;let embedded=false;let skippedTextures=false;
  for(const line of raw.split(/\r?\n/)){
@@ -13,7 +20,9 @@ export function parseMaterialOBJ(raw:string,easyedaSource:boolean){
   if(text==='endmtl'){inMaterial=false;continue;}
   if(inMaterial){
    if(/^(map_|bump\b|disp\b|decal\b|refl\b)/i.test(text)){skippedTextures=true;continue;}
-   if(easyedaSource && /^d\s+0(?:\.0*)?\s*$/.test(text))material.push('d 1');else material.push(text);
+   if(easyedaSource && /^d\s+/i.test(text))material.push('d 1');
+   else if(easyedaSource && /^Tr\s+/i.test(text))material.push('Tr 0');
+   else material.push(text);
   }else if(!/^mtllib\s/.test(text))geometry.push(line);
  }
  const loader=new OBJLoader();

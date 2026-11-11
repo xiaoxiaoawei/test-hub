@@ -1,16 +1,17 @@
 {
   "name": "package-studio-ui",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test:model": "node --experimental-strip-types scripts/check-model.mjs",
+    "test:model": "node --experimental-strip-types scripts/check-model.mjs && node --experimental-strip-types scripts/check-model-state.mjs",
     "test:search": "node --experimental-strip-types scripts/check-search.mjs",
     "test:layout": "node --experimental-strip-types scripts/check-layout.mjs",
-    "test:ui": "npm run test:model && npm run test:search && npm run test:layout"
+    "test:ui": "npm run test:model && npm run test:search && npm run test:layout && npm run test:import",
+    "test:import": "node --experimental-strip-types scripts/check-import.mjs"
   },
   "dependencies": {
     "vue": "^3.5.0",

@@ -11,6 +11,7 @@ import (
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"packagestudio/internal/core"
+	"packagestudio/internal/eda"
 	"packagestudio/internal/service"
 	"packagestudio/internal/updater"
 )
@@ -83,9 +84,34 @@ func (a *App) SearchParts(query string, page int) (service.SearchResult, error) 
 	return a.service.SearchParts(ctx, query, page)
 }
 func (a *App) ImportPartJSON(raw string) (core.Part, error) { return a.service.ImportPartJSON(raw) }
-func (a *App) RemovePart(partID string) error               { return a.service.RemovePart(partID) }
+func (a *App) ParsePartList(fileName, raw string) (service.PartListResult, error) {
+	return a.service.ParsePartList(fileName, raw)
+}
+func (a *App) NativeEnvironment() eda.Environment { return a.service.NativeEnvironment() }
+func (a *App) ChooseNativePath(kind string) (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("请在桌面程序中浏览 EDA 路径")
+	}
+	switch kind {
+	case "padsRoot", "allegroDirectory":
+		return wruntime.OpenDirectoryDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择 EDA 安装或库目录"})
+	case "captureExe", "allegroExe":
+		return wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择 EDA 可执行文件", Filters: []wruntime.FileFilter{{DisplayName: "EDA 可执行文件", Pattern: "*.exe"}}})
+	case "captureLibrary":
+		return wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择已有 Capture 库", Filters: []wruntime.FileFilter{{DisplayName: "Capture Library", Pattern: "*.olb"}}})
+	case "padsSymbolLibrary", "padsFootprintLibrary":
+		return wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择已有 PADS 四件套入口", Filters: []wruntime.FileFilter{{DisplayName: "PADS Library (.pt9)", Pattern: "*.pt9"}}})
+	default:
+		return "", errors.New("不支持的路径类型")
+	}
+}
+func (a *App) RemovePart(partID string) error { return a.service.RemovePart(partID) }
 func (a *App) ExportParts(req service.ExportRequest) (core.ExportResult, error) {
-	return a.service.ExportParts(req)
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return a.service.ExportPartsContext(ctx, req)
 }
 func (a *App) SaveSettings(s service.Settings) (service.Settings, error) {
 	return a.service.SaveSettings(s)

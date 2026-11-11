@@ -40,6 +40,11 @@ def main():
                 raise RuntimeError("binary did not start")
             expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
             assert boot["version"] == expected
+            parsed = request("/api/parts/list/parse", {"fileName": "sample.csv", "raw": "Designator,MPN,LCSC Part #\nC12,STM32F103C8T6,C25804\nC34,LM358,c25804"})
+            assert parsed["ids"] == ["C25804"] and parsed["duplicates"] == 1
+            env = request("/api/native/environment", {})
+            assert isinstance(env["pads"], list) and isinstance(env["cadence"], list)
+            assert all(not item["runtimeVerified"] for item in env["pads"] + env["cadence"])
             # Exercise the HTTP search route without making CI depend on an external source.
             try:
                 request("/api/parts/search", {"query": "", "page": 1})
@@ -59,6 +64,23 @@ def main():
                 assert all(Path(f).is_file() for f in result["files"])
             history = request("/api/history")
             assert len(history) == 3
+            assert history[0]["artifactType"] == "intermediate" and not history[0].get("nativeGenerated", False)
+            # An explicitly selected missing engine must fail without fallback
+            # or mutation of an existing library. This is not native EDA QA.
+            existing = root / "existing.olb"
+            existing.write_bytes(b"smoke-test-existing-library")
+            for target in ("pads", "cadence"):
+                native = dict(enabled=True, libraryMode="append", padsRoot=str(root / "missing-pads"),
+                              padsSymbolLibrary=str(existing), padsFootprintLibrary=str(existing),
+                              captureExe=str(root / "missing-Capture.exe"), allegroExe=str(root / "missing-allegro.exe"),
+                              captureLibrary=str(existing), allegroDirectory=str(root / "existing-allegro"))
+                try:
+                    request("/api/export", dict(partIds=[part["id"]], outputDirectory=str(root / "exports"), libraryName="CI-native", includeSymbol=True, includeFootprint=True, includeModel=False, target=target, nativeConfig=native))
+                except urllib.error.HTTPError as error:
+                    assert error.code == 400 and json.load(error)["error"]
+                else:
+                    raise AssertionError("missing EDA engine returned success")
+                assert existing.read_bytes() == b"smoke-test-existing-library"
             persisted = json.loads((root / "data/settings.json").read_text(encoding="utf-8"))
             assert persisted["exportTarget"] == "cadence"
             if args.online_search:

@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import { decodePartList, partListBatches } from '../src/part-list.ts';
+import { defaultNativeConfig, normalizeNativeConfig, generatedLabel, generatedMessage, validationLabel } from '../src/native-export.ts';
+const source='编号,型号\r\nC23922,STM32F030C8T6';const utf8=new TextEncoder().encode(source);
+assert.equal(decodePartList(utf8).text,source);
+assert.equal(decodePartList(new Uint8Array([0xef,0xbb,0xbf,...utf8])).text,source);
+function utf16(text,bigEndian,bom=true){const bytes=[];if(bom)bytes.push(...(bigEndian?[0xfe,0xff]:[0xff,0xfe]));for(let i=0;i<text.length;i++){const code=text.charCodeAt(i);bytes.push(...(bigEndian?[code>>8,code&255]:[code&255,code>>8]));}return new Uint8Array(bytes);}
+for(const be of [true,false])for(const bom of [true,false])assert.equal(decodePartList(utf16(source,be,bom)).text,source);
+const gb18030=new Uint8Array([0xb1,0xe0,0xba,0xc5,0x0a,...new TextEncoder().encode('C23922')]);assert.equal(decodePartList(gb18030).text,'编号\nC23922');assert.equal(decodePartList(gb18030).encoding,'gb18030');
+assert.throws(()=>decodePartList(new Uint8Array([0xff,0xfe,0x41])),/编码/);
+const ids=Array.from({length:500},(_,index)=>`C${index+100}`);const batches=partListBatches(ids);
+assert.equal(batches.length,10);assert.ok(batches.every(batch=>batch.length===50));assert.deepEqual(batches.flat(),ids);
+assert.deepEqual(partListBatches(['c23922','C23922']),[['C23922']]);
+assert.throws(()=>partListBatches(['STM32F030C8T6']),/无效/);assert.throws(()=>partListBatches(['C8']),/无效/);
+assert.throws(()=>partListBatches([...ids,'C99999']),/500/);assert.throws(()=>partListBatches(ids,51),/50/);
+assert.equal(defaultNativeConfig().enabled,false);assert.equal(normalizeNativeConfig({libraryMode:'wrong',captureUnitsPerInch:NaN}).libraryMode,'new');
+assert.equal(normalizeNativeConfig({captureUnitsPerInch:NaN}).captureUnitsPerInch,100);
+assert.match(generatedLabel('cadence',{artifactType:'intermediate'}),/脚本/);
+assert.match(generatedMessage('pads',3,{artifactType:'intermediate'}),/ASCII/);
+assert.match(generatedLabel('pads',{nativeGenerated:true,runtimeVerified:false}),/待/);
+assert.match(generatedLabel('pads',{nativeGenerated:true,runtimeVerified:true}),/回读/);
+assert.doesNotMatch(validationLabel({validationStatus:'format-checked'}),/回读完成/);
+assert.doesNotMatch(validationLabel({nativeGenerated:false,runtimeVerified:true}),/回读完成/,'Both native output and its readback must be present before reporting engine verification.');
+assert.match(validationLabel({validationStatus:'awaiting-eda'}),/等待/);
+console.log('List encoding, bounded serial batches and truthful native-result states passed.');

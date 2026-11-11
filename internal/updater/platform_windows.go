@@ -65,13 +65,22 @@ func verifyEmbeddedVersion(path, version string) error {
 		return fmt.Errorf("无法读取程序版本：%v", e)
 	}
 	root, _ := windows.UTF16PtrFromString("\\")
-	var ptr uintptr
+	var ptr unsafe.Pointer
 	var length uint32
 	ok, _, e = query.Call(uintptr(unsafe.Pointer(&data[0])), uintptr(unsafe.Pointer(root)), uintptr(unsafe.Pointer(&ptr)), uintptr(unsafe.Pointer(&length)))
 	if ok == 0 || length < 52 {
 		return fmt.Errorf("程序版本结构无效：%v", e)
 	}
-	fixed := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), 52)
+	// VerQueryValue returns a pointer inside data. Derive a checked offset and
+	// keep reading through the owning slice instead of reconstructing a Go
+	// pointer from a uintptr after the syscall.
+	start := uintptr(unsafe.Pointer(&data[0]))
+	address := uintptr(ptr)
+	if address < start || address-start > uintptr(len(data)-52) {
+		return errors.New("程序版本结构越界")
+	}
+	offset := int(address - start)
+	fixed := data[offset : offset+52]
 	if binary.LittleEndian.Uint32(fixed) != 0xfeef04bd {
 		return errors.New("程序版本签名无效")
 	}

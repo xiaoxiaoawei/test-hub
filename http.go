@@ -96,11 +96,30 @@ func serveHTTP(addr string, app *App) error {
 			if callErr == nil {
 				result, callErr = app.ImportPartJSON(req.Raw)
 			}
+		case "POST /api/parts/list/parse":
+			var req struct {
+				FileName string `json:"fileName"`
+				Raw      string `json:"raw"`
+			}
+			callErr = decode(&req)
+			if callErr == nil {
+				result, callErr = app.ParsePartList(req.FileName, req.Raw)
+			}
+		case "POST /api/native/environment":
+			result = app.NativeEnvironment()
+		case "POST /api/dialog/native-path":
+			var req struct {
+				Kind string `json:"kind"`
+			}
+			callErr = decode(&req)
+			if callErr == nil {
+				result, callErr = app.ChooseNativePath(req.Kind)
+			}
 		case "POST /api/export":
 			var req service.ExportRequest
 			callErr = decode(&req)
 			if callErr == nil {
-				result, callErr = app.ExportParts(req)
+				result, callErr = app.service.ExportPartsContext(r.Context(), req)
 			}
 		case "PUT /api/settings":
 			var req service.Settings

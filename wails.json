@@ -7,5 +7,5 @@
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
   "author": {"name": "Package Studio"},
-  "info": {"productName": "封装工坊", "productVersion": "0.4.0", "companyName": "Package Studio", "comments": "器件封装转换工具"}
+  "info": {"productName": "封装工坊", "productVersion": "0.5.0", "companyName": "Package Studio", "comments": "器件封装转换工具"}
 }

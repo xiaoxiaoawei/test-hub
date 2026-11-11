@@ -16,21 +16,23 @@ import (
 	"time"
 
 	"packagestudio/internal/core"
+	"packagestudio/internal/eda"
 )
 
-var Version = "0.4.0"
+var Version = "0.5.0"
 
 type Settings struct {
-	OutputDirectory  string `json:"outputDirectory"`
-	Theme            string `json:"theme"`
-	LibraryName      string `json:"libraryName"`
-	IncludeSymbol    bool   `json:"includeSymbol"`
-	IncludeFootprint bool   `json:"includeFootprint"`
-	IncludeModel     bool   `json:"includeModel"`
-	OpenAfterExport  bool   `json:"openAfterExport"`
-	ExportTarget     string `json:"exportTarget"`
-	PreviewContent   string `json:"previewContent"`
-	PreviewLayout    string `json:"previewLayout"`
+	NativeConfig     eda.Config `json:"nativeConfig"`
+	OutputDirectory  string     `json:"outputDirectory"`
+	Theme            string     `json:"theme"`
+	LibraryName      string     `json:"libraryName"`
+	IncludeSymbol    bool       `json:"includeSymbol"`
+	IncludeFootprint bool       `json:"includeFootprint"`
+	IncludeModel     bool       `json:"includeModel"`
+	OpenAfterExport  bool       `json:"openAfterExport"`
+	ExportTarget     string     `json:"exportTarget"`
+	PreviewContent   string     `json:"previewContent"`
+	PreviewLayout    string     `json:"previewLayout"`
 }
 type Bootstrap struct {
 	Settings     Settings             `json:"settings"`
@@ -40,13 +42,14 @@ type Bootstrap struct {
 	History      []ExportHistoryEntry `json:"history"`
 }
 type ExportRequest struct {
-	PartIDs          []string `json:"partIds"`
-	OutputDirectory  string   `json:"outputDirectory"`
-	LibraryName      string   `json:"libraryName"`
-	IncludeSymbol    bool     `json:"includeSymbol"`
-	IncludeFootprint bool     `json:"includeFootprint"`
-	Target           string   `json:"target"`
-	IncludeModel     bool     `json:"includeModel"`
+	NativeConfig     eda.Config `json:"nativeConfig"`
+	PartIDs          []string   `json:"partIds"`
+	OutputDirectory  string     `json:"outputDirectory"`
+	LibraryName      string     `json:"libraryName"`
+	IncludeSymbol    bool       `json:"includeSymbol"`
+	IncludeFootprint bool       `json:"includeFootprint"`
+	Target           string     `json:"target"`
+	IncludeModel     bool       `json:"includeModel"`
 }
 type Service struct {
 	mu              sync.RWMutex
@@ -198,6 +201,9 @@ func (s *Service) RemovePart(partID string) error {
 	return nil
 }
 func normalizeSettings(settings Settings) Settings {
+	if settings.NativeConfig.LibraryMode != "append" {
+		settings.NativeConfig.LibraryMode = "new"
+	}
 	if settings.Theme != "dark" {
 		settings.Theme = "light"
 	}
@@ -226,6 +232,9 @@ func (s *Service) SaveSettings(settings Settings) (Settings, error) {
 	return settings, nil
 }
 func (s *Service) ExportParts(req ExportRequest) (result core.ExportResult, exportErr error) {
+	return s.ExportPartsContext(context.Background(), req)
+}
+func (s *Service) ExportPartsContext(ctx context.Context, req ExportRequest) (result core.ExportResult, exportErr error) {
 	defer func() {
 		if err := s.recordExport(req, result, exportErr); err != nil && exportErr == nil {
 			result.Warnings = append(result.Warnings, "导出文件已生成，但历史记录保存失败："+err.Error())
@@ -233,6 +242,12 @@ func (s *Service) ExportParts(req ExportRequest) (result core.ExportResult, expo
 	}()
 	if req.Target != "" && req.Target != "kicad" && req.Target != "altium" && req.Target != "pads" && req.Target != "cadence" {
 		return core.ExportResult{}, errors.New("不支持的导出目标")
+	}
+	if req.NativeConfig.Enabled && req.Target != "pads" && req.Target != "cadence" {
+		return core.ExportResult{}, errors.New("原生集成仅适用于 PADS 或 Cadence")
+	}
+	if req.NativeConfig.Enabled && req.NativeConfig.LibraryMode != "" && req.NativeConfig.LibraryMode != "new" && req.NativeConfig.LibraryMode != "append" {
+		return core.ExportResult{}, errors.New("无效的原生库模式")
 	}
 	if strings.TrimSpace(req.OutputDirectory) == "" {
 		return core.ExportResult{}, errors.New("请先选择导出目录")
@@ -268,6 +283,9 @@ func (s *Service) ExportParts(req ExportRequest) (result core.ExportResult, expo
 	}
 	s.exportMu.Lock()
 	defer s.exportMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return core.ExportResult{}, err
+	}
 	for i := range parts {
 		if parts[i].Model == nil {
 			continue
@@ -276,8 +294,8 @@ func (s *Service) ExportParts(req ExportRequest) (result core.ExportResult, expo
 		parts[i].Model = &model
 		parts[i].Model.Path = ""
 		if req.IncludeModel && req.IncludeFootprint && model.UUID != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-			path, err := s.downloadModel(ctx, model.UUID, "step")
+			modelCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			path, err := s.downloadModel(modelCtx, model.UUID, "step")
 			cancel()
 			if err != nil {
 				return core.ExportResult{}, fmt.Errorf("%s 的 STEP 模型下载失败：%w", parts[i].Name, err)
@@ -285,6 +303,24 @@ func (s *Service) ExportParts(req ExportRequest) (result core.ExportResult, expo
 			parts[i].Model.Path = path
 		}
 	}
+	if req.NativeConfig.Enabled {
+		nativeReq := eda.Request{Parts: parts, OutputDirectory: req.OutputDirectory, LibraryName: req.LibraryName, IncludeSymbol: req.IncludeSymbol, IncludeFootprint: req.IncludeFootprint, IncludeModel: req.IncludeModel, Config: req.NativeConfig}
+		if req.Target == "pads" {
+			return eda.ExportPADS(ctx, nativeReq)
+		}
+		return eda.ExportCadence(ctx, nativeReq)
+	}
+	defer func() {
+		if exportErr == nil {
+			if req.Target == "pads" || req.Target == "cadence" {
+				result.ArtifactType = "intermediate"
+				result.ValidationStatus = "awaiting-eda"
+			} else {
+				result.ArtifactType = "library"
+				result.ValidationStatus = "format-checked"
+			}
+		}
+	}()
 	if req.Target == "altium" {
 		return exportAltium(parts, req)
 	}

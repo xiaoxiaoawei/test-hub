@@ -89,19 +89,9 @@ func ExportCadence(parts []Part, outputDirectory, libraryName string, includeSym
 	}
 	manifest := CadenceManifest{Schema: "package-studio.cadence/1", Status: "scripts-only", Library: libraryName, Created: time.Now().UTC().Format(time.RFC3339), Allegro: []CadenceAllegroJob{}, ExpectedNativeFiles: []string{}, Candidates: DetectCadenceTools()}
 	warnings := []string{"当前交付为 Cadence 中间脚本包；尚未运行目标 EDA 引擎，未生成正式 .pad/.dra/.psm/.olb 库。"}
-	entries := make([]string, len(parts))
-	used := map[string]bool{}
+	entries := CadenceEntryNames(parts)
 	for i, p := range parts {
-		entry := cadenceName(p.Name)
-		if used[strings.ToLower(entry)] {
-			entry = cadenceName(p.Name + "_" + p.ID)
-		}
-		base := entry
-		for n := 2; used[strings.ToLower(entry)]; n++ {
-			entry = fmt.Sprintf("%s_%d", base, n)
-		}
-		used[strings.ToLower(entry)] = true
-		entries[i] = entry
+		entry := entries[i]
 		warnings = append(warnings, p.Warnings...)
 		warnings = append(warnings, pinMappingWarnings(p)...)
 		if includeFootprint {

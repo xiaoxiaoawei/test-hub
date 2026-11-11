@@ -14,10 +14,15 @@ assert.equal(moved.right,initial.right);assert.ok(moved.left+360+moved.right+2*D
 assert.equal(moveDivider(initial,'right',20,geometry).right,initial.right-20);
 assert.equal(moveDivider(initial,'queue',20,geometry).queue,initial.queue+20);
 assert.equal(moveDivider(initial,'tasks',20,geometry).tasks,initial.tasks-20);
+const largestTasks=moveDivider(initial,'tasks',-10000,geometry);
+assert.equal(geometry.centerHeight-DIVIDER_SIZE-largestTasks.tasks,400,'Dragging tasks must preserve the preview header, toolbar and a usable canvas.');
+const minimumWindow=clampLayout({}, {...geometry,viewportHeight:668,centerHeight:589});
+assert.equal(minimumWindow.tasks,180,'The native minimum window must retain the default task height.');
+assert.ok(589-DIVIDER_SIZE-minimumWindow.tasks>=400);
 assert.ok(Math.abs(moveDivider(initial,'canvas',70,geometry).canvas-65)<.00001);
 assert.deepEqual(moveDivider(initial,'canvas',NaN,geometry),initial);
 
-for(const width of [0,12,100,500,900,1040,1600]) for(const height of [0,6,100,300,800]) {
+for(const width of [0,12,100,500,900,1040,1600]) for(const height of [0,6,100,300,500,552,800]) {
   const g={...geometry,workspaceWidth:width,leftHeight:height,centerHeight:height,previewWidth:width,workspaceGap:8,leftGap:8,centerGap:8,previewGap:1};
   const v=clampLayout({left:9999,right:9999,queue:9999,tasks:9999,canvas:100},g);
   assert.ok(Object.values(v).every(Number.isFinite));
@@ -25,11 +30,16 @@ for(const width of [0,12,100,500,900,1040,1600]) for(const height of [0,6,100,30
   assert.ok(v.left+v.right<=Math.max(0,width-2*DIVIDER_SIZE-32)+.001);
   assert.ok(v.queue<=Math.max(0,height-DIVIDER_SIZE-16)+.001);
   assert.ok(v.tasks<=Math.max(0,height-DIVIDER_SIZE-16)+.001);
+  const centerAvailable=Math.max(0,height-DIVIDER_SIZE-16);
+  const centerScale=Math.min(1,centerAvailable/(400+130));
+  assert.ok(v.tasks>=130*centerScale-.001);
+  assert.ok(centerAvailable-v.tasks>=400*centerScale-.001,'Small hosts must scale both vertical minima together.');
   if(width>0) assert.ok(v.canvas/100*width<=Math.max(0,width-DIVIDER_SIZE-2)+.001);
 }
 const shrunk=clampLayout({left:700,right:700,queue:700,tasks:700,canvas:95},{...geometry,workspaceWidth:1024,leftHeight:500,centerHeight:500,previewWidth:400});
 assert.ok(shrunk.left>=240 && shrunk.right>=276 && shrunk.left+shrunk.right<=1024-12-360+.001);
-assert.ok(shrunk.queue>=220 && shrunk.queue<=354);assert.ok(shrunk.tasks>=130 && shrunk.tasks<=274);
+assert.ok(shrunk.queue>=220 && shrunk.queue<=354);
+assert.ok(Math.abs(shrunk.tasks-(500-DIVIDER_SIZE)*130/(400+130))<.001);
 assert.ok(shrunk.canvas<=53.5);
 
 for(const raw of [null,'','invalid','null','[]','42','{"version":2,"values":{"left":400}}','{"version":1,"values":[]}','x'.repeat(5000)]) assert.deepEqual(decodeLayoutStorage(raw),{});

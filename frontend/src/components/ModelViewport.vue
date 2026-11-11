@@ -22,7 +22,8 @@ function fit(resetOrientation=true){
  // Leave room for the toolbar and caption. The horizontal FOV is the limiting
  // factor in a narrow split pane, even when its vertical space is generous.
  const horizontalSpace=Math.max(.15,(viewportWidth-36)/Math.max(1,viewportWidth));
- const verticalSpace=Math.max(.15,(viewportHeight-110)/Math.max(1,viewportHeight));
+ const overlaySpace=viewportWidth<250?150:110;
+ const verticalSpace=Math.max(.15,(viewportHeight-overlaySpace)/Math.max(1,viewportHeight));
  const usableHalfFOV=Math.min(Math.atan(Math.tan(verticalHalfFOV)*verticalSpace),Math.atan(Math.tan(horizontalHalfFOV)*horizontalSpace));
  const distance=radius/Math.sin(Math.max(.0001,usableHalfFOV))*1.08;
  const presetDirection=viewPreset.value==='top'?new THREE.Vector3(0,-.001,1):new THREE.Vector3(.3,-.6,1.8);

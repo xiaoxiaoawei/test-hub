@@ -52,7 +52,7 @@ export function clampLayout(input:Partial<LayoutValues>,g:LayoutGeometry,active?
   }
   const left=verticalLimits(g.leftHeight,g.leftGap ?? 0,220,140);
   v.queue=clamp(v.queue,left.first,left.available-left.second);
-  const center=verticalLimits(g.centerHeight,g.centerGap ?? 0,220,130);
+  const center=verticalLimits(g.centerHeight,g.centerGap ?? 0,400,130);
   v.tasks=clamp(v.tasks,center.second,center.available-center.first);
   const preview=positive(g.previewWidth);
   if(preview>0) {
